@@ -30,6 +30,10 @@ typedef struct ggml_backend *        ggml_backend_t;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 typedef struct ggml_backend_sched *  ggml_backend_sched_t;
 
+namespace transcribe {
+struct CoreMLEncoder;
+}
+
 namespace transcribe::qwen3_asr {
 
 void apply_family_invariants(transcribe_model & model);
@@ -95,6 +99,10 @@ struct QwenAsrModel final : public transcribe_model {
 };
 
 struct QwenAsrSession final : public transcribe_session {
+    // Optional Core ML audio encoder (TRANSCRIBE_QWEN3_ASR_COREML_MODEL);
+    // null keeps the ggml encoder.
+    CoreMLEncoder * coreml_encoder = nullptr;
+
     transcribe::causal_lm::KvCache kv_cache;
 
     // Batched KV cache for offline transcribe_run_batch (n_batch slabs).

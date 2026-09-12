@@ -76,3 +76,50 @@ All Qwen3-ASR variants support:
 What's not supported (consistent across the family): translation,
 real-time streaming, VAD, speaker diarization, timestamps. See the
 family doc for the full runtime contract.
+
+## Apple Neural Engine encoder (optional)
+
+Qwen3-ASR uses the [shared Core ML encoder runtime](../coreml.md) for its
+audio encoder; the Qwen3 LM decoder stays on ggml. Build with
+`-DTRANSCRIBE_COREML=ON`. Core ML uses `CPUAndNeuralEngine`, which excludes
+the GPU but permits CPU operations where needed.
+
+Create the companion from the same Handy GGUF used for inference. The
+converter dequantizes the encoder tensors and exports the chunked conv
+subsampler, the sinusoidal positions, the bidirectional blocks, and the
+LN/proj head, so the output is already in the LM width:
+
+```bash
+uv run --python 3.11 scripts/convert-qwen3-asr-gguf-to-coreml.py \
+  models/qwen3-asr-0.6b/Qwen3-ASR-0.6B-Q8_0.gguf \
+  --output models/qwen3-asr-0.6b/Qwen3-ASR-0.6B-Q8_0-encoder.mlpackage --compile
+
+TRANSCRIBE_QWEN3_ASR_COREML_MODEL=models/qwen3-asr-0.6b/Qwen3-ASR-0.6B-Q8_0-encoder.mlmodelc \
+  build/bin/transcribe-cli -m models/qwen3-asr-0.6b/Qwen3-ASR-0.6B-Q8_0.gguf \
+  --backend cpu --threads 2 --language en samples/jfk.wav
+```
+
+The default capacity is 1500 mel frames (15 seconds, a multiple of the
+100-frame conv chunk); shorter inputs mask the padded rows out of the
+attention keys and longer inputs explicitly fall back to the ggml encoder
+without truncation. `--max-frames` exports a different capacity. Batch
+requests use the serial per-utterance path when this encoder is enabled. The
+companion uses FP16 computation, so transcripts can differ from ggml. The
+runtime checks variant and tensor shapes but does not recompute the GGUF
+checksum; keep each companion paired with the exact GGUF used to create it.
+Invalid paths, mismatched variants, and prediction failures return errors.
+Unset the environment variable to use the ggml encoder.
+
+Verified with `qwen3-asr-0.6b` Q8_0 on `samples/jfk.wav`: identical
+transcript, `enc.proj.out` within `tests/tolerances/qwen3_asr.json`
+(max 2.5e-2, mean 1.1e-3), finite output on the Core ML CPU path, and
+matching output on a 3 s clip, a 1500-frame clip, the 1502-frame fallback,
+a 22 s fallback, session reuse, and a two-item batch. The compute plan places
+454 of 467 assigned operations on the Neural Engine. Encoder time on jfk
+(Apple M2 Pro, 4 threads, Q8_0) went from 518 ms on ggml CPU to 34 ms; the LM
+decode is unchanged. A 64-clip LibriSpeech screen (32 test-clean, 32
+test-other speakers, English hint) measured 2.16% WER on ggml and 2.37% on
+Core ML, +0.20 pp with a paired 95% bootstrap interval of [0.0, 0.56] pp;
+five hypotheses changed on rare proper nouns and invented words, and seven
+more differed only in punctuation. `qwen3-asr-1.7b` converts through the same path but has
+not been exercised here.

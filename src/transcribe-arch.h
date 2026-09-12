@@ -135,4 +135,9 @@ struct Arch {
 // family matches.
 const Arch * find_arch(const char * name);
 
+// Core ML companion path for a session: params->coreml_encoder_path when the
+// caller's struct carries it and it is non-empty, otherwise the family's
+// environment variable. nullptr means "use the ggml encoder".
+const char * session_coreml_encoder_path(const transcribe_session_params * params, const char * env_name);
+
 }  // namespace transcribe

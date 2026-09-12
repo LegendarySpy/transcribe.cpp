@@ -24,7 +24,7 @@ EXCLUDE_RE='^(ggml/|src/third_party/|src/transcribe-unicode-data\.cpp$)'
 cd "$(git rev-parse --show-toplevel)"
 
 CF=(uvx "clang-format@${CF_VERSION}")
-EXTS=('*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' '*.hxx')
+EXTS=('*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' '*.hxx' '*.m' '*.mm')
 
 # Our tracked C/C++, vendored/verbatim paths removed.
 ours_all() {

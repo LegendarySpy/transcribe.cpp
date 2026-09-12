@@ -296,6 +296,12 @@ pub struct SessionOptions {
     pub kv_type: crate::types::KvType,
     /// Optional decoder context cap in tokens; 0 = model maximum.
     pub n_ctx: i32,
+    /// Optional compiled Core ML encoder companion (`.mlmodelc`) derived from
+    /// the loaded GGUF, for families with a Core ML adapter. `None` keeps the
+    /// ggml encoder (the family's `TRANSCRIBE_<FAMILY>_COREML_MODEL`
+    /// environment variable still applies). Requires the `coreml` feature;
+    /// otherwise session init fails with an error.
+    pub coreml_encoder_path: Option<std::path::PathBuf>,
 }
 
 impl Default for SessionOptions {
@@ -304,6 +310,7 @@ impl Default for SessionOptions {
             n_threads: 0,
             kv_type: crate::types::KvType::Auto,
             n_ctx: 0,
+            coreml_encoder_path: None,
         }
     }
 }

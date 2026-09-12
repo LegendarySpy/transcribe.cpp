@@ -18,6 +18,7 @@
 //!   `dynamic-backends` -> the above + TRANSCRIBE_GGML_BACKEND_DL=ON (+ x86:
 //!                         GGML_CPU_ALL_VARIANTS=ON, TRANSCRIBE_X86_CONSERVATIVE=ON)
 //!   `metal`            -> TRANSCRIBE_METAL=ON   (Apple targets only; no-op elsewhere)
+//!   `coreml`           -> TRANSCRIBE_COREML=ON  (Apple targets only; no-op elsewhere)
 //!   `vulkan`           -> TRANSCRIBE_VULKAN=ON
 //!   `cuda`             -> TRANSCRIBE_CUDA=ON
 //!   `rocm`             -> TRANSCRIBE_HIP=ON
@@ -183,6 +184,9 @@ fn main() {
         } else {
             cfg.define("TRANSCRIBE_METAL", "OFF");
         }
+    }
+    if is_apple && feature("COREML") {
+        cfg.define("TRANSCRIBE_COREML", "ON");
     }
     if feature("VULKAN") {
         cfg.define("TRANSCRIBE_VULKAN", "ON");

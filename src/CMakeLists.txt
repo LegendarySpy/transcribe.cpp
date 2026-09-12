@@ -195,6 +195,14 @@ target_link_libraries(transcribe
         ggml
 )
 
+if(TRANSCRIBE_COREML)
+    target_sources(transcribe PRIVATE transcribe-coreml.mm)
+    set_target_properties(transcribe PROPERTIES OBJCXX_VISIBILITY_PRESET hidden)
+    set_source_files_properties(transcribe-coreml.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_compile_definitions(transcribe PRIVATE TRANSCRIBE_COREML)
+    target_link_libraries(transcribe PRIVATE "-framework CoreML" "-framework Foundation")
+endif()
+
 # BLAS for the host decoder (cblas_sgemv in decoder.cpp). On Apple we
 # link Accelerate directly; elsewhere we probe for OpenBLAS / MKL /
 # BLIS via find_package(BLAS). When no BLAS is found the decoder falls

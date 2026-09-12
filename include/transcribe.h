@@ -989,12 +989,24 @@ TRANSCRIBE_API void transcribe_model_load_params_init(struct transcribe_model_lo
  *            parakeet, voxtral_realtime) — they have no lowerable ceiling, so
  *            a non-zero n_ctx is a no-op there. A negative value returns
  *            TRANSCRIBE_ERR_INVALID_ARG.
+ *
+ * coreml_encoder_path:
+ *            optional path to a compiled Core ML encoder companion
+ *            (.mlmodelc) derived from the loaded GGUF, for families with
+ *            a Core ML adapter (see docs/coreml.md). NULL or empty keeps
+ *            the ggml encoder. The string is read during session init
+ *            only. A non-empty path on a build without TRANSCRIBE_COREML,
+ *            a variant mismatch, or a load failure returns
+ *            TRANSCRIBE_ERR_INVALID_ARG. When NULL, the family's
+ *            TRANSCRIBE_<FAMILY>_COREML_MODEL environment variable is
+ *            consulted instead.
  */
 struct transcribe_session_params {
     uint64_t           struct_size;
     int                n_threads;
     transcribe_kv_type kv_type;
     int32_t            n_ctx;
+    const char *       coreml_encoder_path;
 };
 
 TRANSCRIBE_API void transcribe_session_params_init(struct transcribe_session_params * params);

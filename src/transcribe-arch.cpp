@@ -6,6 +6,9 @@
 
 #include "transcribe-arch.h"
 
+#include "transcribe-env.h"
+
+#include <cstddef>
 #include <cstring>
 
 namespace transcribe {
@@ -85,6 +88,16 @@ extern const Arch arch;
 
 namespace sortformer {
 extern const Arch arch;
+}
+
+const char * session_coreml_encoder_path(const transcribe_session_params * params, const char * env_name) {
+    if (params != nullptr &&
+        params->struct_size >=
+            offsetof(transcribe_session_params, coreml_encoder_path) + sizeof(params->coreml_encoder_path) &&
+        params->coreml_encoder_path != nullptr && params->coreml_encoder_path[0] != '\0') {
+        return params->coreml_encoder_path;
+    }
+    return transcribe::env::str(env_name);
 }
 
 const Arch * find_arch(const char * name) {

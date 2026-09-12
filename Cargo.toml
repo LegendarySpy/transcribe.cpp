@@ -62,6 +62,8 @@ path = "bindings/rust/sys/src/lib.rs"
 # CPU build on macOS is `default-features = false`.
 default = ["metal"]
 metal = []
+# Core ML encoder companions (docs/coreml.md); Apple targets only, no-op elsewhere.
+coreml = []
 vulkan = []
 cuda = []
 rocm = []
