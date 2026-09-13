@@ -123,3 +123,19 @@ Core ML, +0.20 pp with a paired 95% bootstrap interval of [0.0, 0.56] pp;
 five hypotheses changed on rare proper nouns and invented words, and seven
 more differed only in punctuation. `qwen3-asr-1.7b` converts through the same path but has
 not been exercised here.
+
+## Vocabulary context
+
+The RUN-slot `transcribe_qwen3_asr_run_ext` accepts UTF-8 vocabulary/background
+context in its `context` field. Initialize it with
+`transcribe_qwen3_asr_run_ext_init` and attach `&ext.ext` to `run_params.family`.
+The Rust equivalent is `RunExtension::Qwen3Asr(Qwen3AsrRunOptions { context })`.
+Context is inserted into the system turn, matching the [upstream prompt builder](https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/inference/qwen3_asr.py).
+It guides recognition; it is not an instruction-following cleanup prompt.
+
+Null or empty context preserves the original prompt exactly. Context applies
+only to that request, including every utterance in a native batch. The caller
+must reapply it when splitting audio into separate requests. CPU, GPU, and
+Core ML encoder paths share the same prompt builder. Context is limited to
+4096 UTF-8 bytes and 1024 tokens; larger inputs return `INVALID_ARG`. Ordinary
+tokenization treats special-token spellings as text rather than chat delimiters.

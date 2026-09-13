@@ -1309,8 +1309,8 @@ TRANSCRIBE_API transcribe_status transcribe_model_get_capabilities(const struct 
  * Feature meanings:
  *
  *   INITIAL_PROMPT       The model accepts a free-text or token
- *                        prompt to bias decoding. Today: whisper
- *                        only; reached via transcribe_whisper_run_ext.
+ *                        prompt to bias decoding. Whisper and Qwen3-ASR expose
+ *                        this through their family run extensions.
  *
  *   TEMPERATURE_FALLBACK The model runs a multi-tier temperature loop
  *                        with metric-driven fallback. Today: whisper.

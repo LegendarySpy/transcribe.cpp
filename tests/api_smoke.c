@@ -340,6 +340,12 @@ static void test_init_macros(void) {
 
     /* Whisper run extension: kind + size wired by the init function,
      * and the field defaults match the family's shipping recipe. */
+    struct transcribe_qwen3_asr_run_ext qrx;
+    transcribe_qwen3_asr_run_ext_init(&qrx);
+    CHECK(qrx.ext.size == sizeof(qrx));
+    CHECK(qrx.ext.kind == TRANSCRIBE_EXT_KIND_QWEN3_ASR_RUN);
+    CHECK(qrx.context == NULL);
+
     struct transcribe_whisper_run_ext wrx;
     transcribe_whisper_run_ext_init(&wrx);
     CHECK(wrx.ext.size == sizeof(struct transcribe_whisper_run_ext));

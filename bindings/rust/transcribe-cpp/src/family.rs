@@ -17,6 +17,12 @@ use transcribe_cpp_sys as sys;
 
 use crate::error::Result;
 
+/// Qwen3-ASR vocabulary/background context for recognition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Qwen3AsrRunOptions {
+    pub context: Option<String>,
+}
+
 /// Whisper run-extension knobs (run slot): initial prompt, temperature
 /// fallback, and decode thresholds. `None` keeps the family default.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -107,6 +113,7 @@ pub struct SortformerStreamOptions {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum RunExtension {
+    Qwen3Asr(Qwen3AsrRunOptions),
     Whisper(WhisperRunOptions),
     Sortformer(SortformerStreamOptions),
 }
@@ -126,6 +133,10 @@ pub enum StreamExtension {
 /// stays valid for the duration of the native call. Boxed for a stable address
 /// across moves of the holder.
 pub(crate) enum RunExtRaw {
+    Qwen3Asr {
+        ext: Box<sys::transcribe_qwen3_asr_run_ext>,
+        _context: Option<CString>,
+    },
     Whisper {
         ext: Box<sys::transcribe_whisper_run_ext>,
         _prompt: Option<CString>,
@@ -137,6 +148,9 @@ impl RunExtRaw {
     pub(crate) fn ext_ptr(&self) -> *const sys::transcribe_ext {
         match self {
             // `ext` is field 0, so &ext == &the family struct.
+            RunExtRaw::Qwen3Asr { ext, .. } => {
+                (&**ext) as *const sys::transcribe_qwen3_asr_run_ext as *const sys::transcribe_ext
+            }
             RunExtRaw::Whisper { ext, .. } => {
                 (&**ext) as *const sys::transcribe_whisper_run_ext as *const sys::transcribe_ext
             }
@@ -150,6 +164,18 @@ impl RunExtRaw {
 impl RunExtension {
     pub(crate) fn materialize(&self) -> Result<RunExtRaw> {
         match self {
+            RunExtension::Qwen3Asr(o) => {
+                let mut ext: sys::transcribe_qwen3_asr_run_ext = unsafe { std::mem::zeroed() };
+                unsafe { sys::transcribe_qwen3_asr_run_ext_init(&mut ext) };
+                let context = o.context.as_deref().map(CString::new).transpose()?;
+                if let Some(value) = context.as_ref() {
+                    ext.context = value.as_ptr();
+                }
+                Ok(RunExtRaw::Qwen3Asr {
+                    ext: Box::new(ext),
+                    _context: context,
+                })
+            }
             RunExtension::Whisper(o) => {
                 let mut ext: sys::transcribe_whisper_run_ext = unsafe { std::mem::zeroed() };
                 unsafe { sys::transcribe_whisper_run_ext_init(&mut ext) };
