@@ -10,6 +10,9 @@
 // host-decodes (predictor + joint + TDT).
 
 #include "decoder.h"
+#ifdef TRANSCRIBE_COREML
+#    include "transcribe-coreml.h"
+#endif
 #include "encoder.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -19,6 +22,7 @@
 #include "transcribe-arch.h"
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
+#include "transcribe-env.h"
 #include "transcribe-load-common.h"
 #include "transcribe-loader.h"
 #include "transcribe-log.h"
@@ -56,6 +60,9 @@ static_assert(std::is_base_of_v<transcribe_model, ParakeetModel>);
 static_assert(std::is_base_of_v<transcribe_session, ParakeetSession>);
 
 ParakeetSession::~ParakeetSession() {
+#ifdef TRANSCRIBE_COREML
+    coreml_encoder_free(coreml_encoder);
+#endif
     // Streaming cache tensors live in their own ggml_context + backend
     // buffer. Free buffer first (may hold a backend ref), then the ctx.
     if (stream_caches.buffer != nullptr) {
@@ -451,6 +458,18 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         return st;
     }
 
+    const int64_t decoder_only_key = gguf_find_key(loader.gguf(), "stt.parakeet.decoder_only");
+    if (decoder_only_key >= 0) {
+        if (gguf_get_kv_type(loader.gguf(), decoder_only_key) != GGUF_TYPE_BOOL) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        m->decoder_only = gguf_get_val_bool(loader.gguf(), decoder_only_key);
+    }
+    if (m->decoder_only && m->variant != "tdt-0.6b-v3") {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: decoder-only GGUF requires offline TDT V3");
+        return TRANSCRIBE_ERR_UNSUPPORTED_VARIANT;
+    }
+
     // Derive supports_streaming from hparams:
     //   ChunkedLimited + (L, R) >= 0 — cache-aware streaming
     //     (nemotron-speech-streaming-en-0.6b).
@@ -508,7 +527,8 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
 
     // Validate every tensor against the canonical catalog (type + shape
     // only, so it works before the backend buffer is bound).
-    if (const transcribe_status st = build_parakeet_weights(m->ctx_meta, m->hparams, m->weights); st != TRANSCRIBE_OK) {
+    if (const transcribe_status st = build_parakeet_weights(m->ctx_meta, m->hparams, m->weights, !m->decoder_only);
+        st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
     }
@@ -574,7 +594,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     // Fuse BatchNorm into scale + bias (replaces 4 elementwise ops per
     // block with 2). Skipped for LayerNorm conv-module variants (no
     // running stats to fuse against).
-    if (m->hparams.enc_conv_norm_type == ParakeetHParams::ConvNormType::BatchNorm) {
+    if (!m->decoder_only && m->hparams.enc_conv_norm_type == ParakeetHParams::ConvNormType::BatchNorm) {
         if (const transcribe_status st = fuse_batch_norm(*m); st != TRANSCRIBE_OK) {
             return st;
         }
@@ -582,7 +602,8 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
 
     // On CPU primary backend, dequantize conv pointwise weights to F32
     // (see promote_conv_pw_to_f32_on_cpu). No-op on GPU backends.
-    if (const transcribe_status st = promote_conv_pw_to_f32_on_cpu(*m); st != TRANSCRIBE_OK) {
+    if (const transcribe_status st = m->decoder_only ? TRANSCRIBE_OK : promote_conv_pw_to_f32_on_cpu(*m);
+        st != TRANSCRIBE_OK) {
         return st;
     }
 
@@ -637,6 +658,33 @@ transcribe_status init_context(transcribe_model *                model,
     pc->model     = model;
     pc->n_threads = params->n_threads;
     pc->kv_type   = params->kv_type;
+
+    if (const char * path = transcribe::session_coreml_encoder_path(params, "TRANSCRIBE_PARAKEET_COREML_MODEL")) {
+#ifdef TRANSCRIBE_COREML
+        const auto & hp = static_cast<ParakeetModel *>(model)->hparams;
+        if (hp.enc_subsampling_factor != 8 || hp.enc_conv_norm_type != ParakeetHParams::ConvNormType::BatchNorm ||
+            hp.enc_att_context_style != ParakeetHParams::AttContextStyle::Regular || hp.enc_att_context_left >= 0 ||
+            hp.enc_att_context_right >= 0 || hp.has_spk_kernel) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "parakeet Core ML: only full-context, batch-norm, 8x-subsampling encoders are supported");
+            return TRANSCRIBE_ERR_UNSUPPORTED_VARIANT;
+        }
+        pc->coreml_encoder = coreml_encoder_load(path, model->variant.c_str(), hp.fe_num_mels, 0, hp.enc_d_model,
+                                                 hp.enc_subsampling_factor, true);
+        if (pc->coreml_encoder == nullptr) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+#else
+        (void) path;
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: rebuild with TRANSCRIBE_COREML=ON to use a Core ML encoder");
+        return TRANSCRIBE_ERR_INVALID_ARG;
+#endif
+    }
+
+    if (static_cast<ParakeetModel *>(model)->decoder_only && pc->coreml_encoder == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet: decoder-only GGUF requires a matching Core ML encoder");
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
 
     *out_ctx = pc.release();
     return TRANSCRIBE_OK;
@@ -989,6 +1037,36 @@ transcribe_status run_one_shot_inner(ParakeetSession *             pc,
         return mst;
     }
     pc->t_mel_us = ggml_time_us() - t_mel_start;
+
+#ifdef TRANSCRIBE_COREML
+    if (pc->coreml_encoder != nullptr) {
+        if (mt != nullptr) {
+            return TRANSCRIBE_ERR_UNSUPPORTED_VARIANT;
+        }
+        if (mel_n_frames <= coreml_encoder_capacity(pc->coreml_encoder)) {
+            const int64_t start = ggml_time_us();
+            if (!coreml_encoder_run(pc->coreml_encoder, pc->mel_buf.data(), mel_n_frames, false, pc->enc_host)) {
+                return TRANSCRIBE_ERR_GGUF;
+            }
+            pc->t_encode_us          = ggml_time_us() - start;
+            pc->encoder_out          = nullptr;
+            const int       d_model  = pm->hparams.enc_d_model;
+            const int       frames   = static_cast<int>(pc->enc_host.size() / d_model);
+            const long long shape[2] = { frames, d_model };
+            transcribe::debug::dump_host_f32("enc.final", pc->enc_host.data(),
+                                             static_cast<long long>(pc->enc_host.size()), shape, 2, "encoder.final");
+            return decode_and_populate(pc, pm, params, pc->enc_host.data(), frames, d_model, -1);
+        }
+        if (pm->decoder_only) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "parakeet: input exceeds Core ML encoder capacity; split audio into chunks of at most 15 seconds");
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+        log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                "parakeet Core ML: %d mel frames exceed encoder capacity %d; using ggml for this utterance",
+                mel_n_frames, coreml_encoder_capacity(pc->coreml_encoder));
+    }
+#endif
 
     // Multitalker masked mode (NeMo mask_features): binarize the target
     // speaker's per-diar-frame activity, expand 8x to feature frames from
@@ -1665,22 +1743,23 @@ transcribe_status run_batch(transcribe_session *          session,
     std::vector<std::vector<float>> mels(static_cast<size_t>(n));
     std::vector<int>                nf(static_cast<size_t>(n), 0);
     std::vector<int>                n_mels_per(static_cast<size_t>(n), 0);
-    const int64_t                   t_mel_start  = ggml_time_us();
-    const bool                      all_ok       = transcribe::parallel_for_all(n, pc->n_threads, [&](int i) -> bool {
-        if (pcm[i] == nullptr || n_samples[i] <= 0) {
-            return false;
-        }
-        int                     this_mels = 0, this_frames = 0;
-        const transcribe_status st =
-            pm->mel->compute(pcm[i], static_cast<size_t>(n_samples[i]), mels[i], this_mels, this_frames);
-        if (st != TRANSCRIBE_OK || this_frames <= 0) {
-            return false;
-        }
-        nf[i]         = this_frames;
-        n_mels_per[i] = this_mels;
-        return true;
-    });
-    const int64_t                   total_mel_us = ggml_time_us() - t_mel_start;
+    const int64_t                   t_mel_start = ggml_time_us();
+    const bool                      all_ok =
+        pc->coreml_encoder == nullptr && transcribe::parallel_for_all(n, pc->n_threads, [&](int i) -> bool {
+            if (pcm[i] == nullptr || n_samples[i] <= 0) {
+                return false;
+            }
+            int                     this_mels = 0, this_frames = 0;
+            const transcribe_status st =
+                pm->mel->compute(pcm[i], static_cast<size_t>(n_samples[i]), mels[i], this_mels, this_frames);
+            if (st != TRANSCRIBE_OK || this_frames <= 0) {
+                return false;
+            }
+            nf[i]         = this_frames;
+            n_mels_per[i] = this_mels;
+            return true;
+        });
+    const int64_t total_mel_us = ggml_time_us() - t_mel_start;
 
     if (all_ok) {
         int T_max = 0, n_mels = 0;

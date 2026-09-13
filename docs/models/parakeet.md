@@ -125,3 +125,72 @@ orthography uses `ß`; see
 [parakeet-primeline.md](parakeet-primeline.md#orthography-ß-vs-ss) for
 why and what to do about it. See the family doc for the full runtime
 contract.
+
+## Apple Neural Engine encoder (optional)
+
+Both families use the [shared Core ML encoder runtime](../coreml.md), which
+other compatible model families can reuse.
+
+On Apple Silicon with macOS 13 or later, the optional Core ML backend covers
+the offline full-context FastConformer encoders: every Parakeet variant except
+the streaming and multitalker checkpoints, which the converter and the runtime
+reject. Build with `-DTRANSCRIBE_COREML=ON`; use `-DTRANSCRIBE_METAL=OFF` and
+`--backend cpu` to keep the decoder on CPU. Core ML uses `CPUAndNeuralEngine`,
+which excludes the GPU but permits CPU operations where needed.
+
+Create the companion encoder directly from the same Handy GGUF used for
+inference. The converter reads and dequantizes its encoder tensors; it does not
+download a separate NVIDIA checkpoint:
+
+```bash
+uv run --python 3.11 scripts/convert-parakeet-gguf-to-coreml.py \
+  models/parakeet-tdt-0.6b-v3-Q8_0.gguf \
+  --output models/parakeet-tdt-0.6b-v3-Q8_0-encoder.mlpackage --compile
+
+TRANSCRIBE_PARAKEET_COREML_MODEL=models/parakeet-tdt-0.6b-v3-Q8_0-encoder.mlmodelc \
+  build/bin/transcribe-cli -m models/parakeet-tdt-0.6b-v3-Q8_0.gguf \
+  --backend cpu --threads 2 samples/jfk.wav
+```
+
+The default encoder capacity is 1501 mel frames (about 15 seconds). Shorter
+inputs use a length mask. Longer inputs explicitly fall back to the existing
+ggml encoder, without truncation. `--max-frames` can export a different fixed
+capacity; attention memory grows quadratically with capacity. Batch requests
+use the existing serial per-utterance path when this encoder is enabled.
+
+The companion uses FP16 computation, so transcripts can differ from ggml.
+Checkpoints with `xscaling` (the 80-mel `ctc`, `rnnt`, and `tdt_ctc` families)
+have block-0 inputs beyond FP16 range; the converter applies that scale to the
+block-0 residual contributions instead, which is equivalent up to LayerNorm
+epsilon and keeps the graph finite on every compute unit. Its metadata records
+the source GGUF SHA256, filename, and variant. The runtime checks variant and
+tensor shapes, but does not recompute the GGUF checksum; keep each companion
+paired with the exact GGUF used to create it. Invalid paths or prediction
+failures return errors. Unset the environment variable to use the normal ggml
+encoder. This path does not cover the Nemotron streaming models,
+`parakeet-unified-en-0.6b`, or `multitalker-parakeet-streaming-0.6b-v1`.
+
+Exercised with real Q8_0 weights on `samples/jfk.wav`, a 3 s clip, the
+1501-frame boundary, the 1502-frame and 22 s ggml fallbacks, session reuse, and
+a two-item batch, with `enc.final` inside `tests/tolerances/parakeet.json`:
+`tdt-0.6b-v2`, `tdt-0.6b-v3`, `tdt-1.1b`, `tdt_ctc-110m`, `ctc-0.6b`,
+`rnnt-0.6b`, and `primeline` (also on `samples/german.wav`). Transcripts
+matched ggml on every case except the 1501-frame boundary clip, where
+`tdt_ctc-110m` drops a comma and `tdt-1.1b` drops the cut-off final word.
+`ctc-1.1b` and `tdt_ctc-1.1b` convert through the same path but are
+unverified.
+
+
+### Decoder-only Parakeet TDT V3 packages
+
+`scripts/extract-parakeet-decoder.py SOURCE.gguf OUTPUT-decoder.gguf` copies the
+original GGUF metadata and predictor/joint tensors, omitting encoder tensors.
+It sets `stt.parakeet.decoder_only=true` and records
+`stt.parakeet.source_sha256`. Use the Core ML encoder exported from SOURCE;
+the extraction step does not change the encoder or decoder weights.
+
+`ParakeetModel::decoder_only` skips encoder tensor validation and preparation.
+Only offline TDT V3 supports this package. Session creation requires the matching
+Core ML companion; builds without Core ML cannot create such a session.
+Inputs exceeding the companion capacity return an error requesting chunking.
+Full GGUF models retain their existing CPU/GPU path and over-capacity fallback.

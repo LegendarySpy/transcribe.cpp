@@ -1,6 +1,6 @@
 # Core ML encoder companion
 
-This branch supports the optional Qwen3-ASR Core ML encoder. The audio frontend
+This branch supports optional Qwen3-ASR and offline Parakeet Core ML encoders. The audio frontend
 and autoregressive decoder remain in the existing transcribe.cpp engine.
 
 ## Build and load
@@ -50,3 +50,32 @@ new companion. The Qwen model note records its numerical check and limitations.
 
 The shared session struct layout is independent of the private Core ML build
 flag. Builds with Core ML disabled retain the existing ggml path.
+
+## Parakeet TDT
+
+The offline Parakeet adapter loads the same session companion through
+`coreml_encoder_path` or `TRANSCRIBE_PARAKEET_COREML_MODEL`. Export from the exact
+GGUF using `scripts/convert-parakeet-gguf-to-coreml.py`. The default capacity is
+1501 mel frames (about 15 seconds); shorter inputs are length-masked and longer
+inputs use the existing ggml encoder. Streaming variants are rejected.
+
+The encoder uses CPU + Neural Engine, with GPU excluded. Its output feeds the
+existing host decoder. A missing or mismatched companion returns an error.
+`transcribe_parakeet_coreml_smoke` exercises the supplied real model when
+`TRANSCRIBE_PARAKEET_COREML_GGUF` and `TRANSCRIBE_PARAKEET_COREML_MODEL` are set.
+See `docs/models/parakeet.md` for the adapter contract and supported variants.
+
+
+### Decoder-only Parakeet TDT V3 packages
+
+`scripts/extract-parakeet-decoder.py SOURCE.gguf OUTPUT-decoder.gguf` copies the
+original GGUF metadata and predictor/joint tensors, omitting encoder tensors.
+It sets `stt.parakeet.decoder_only=true` and records
+`stt.parakeet.source_sha256`. Use the Core ML encoder exported from SOURCE;
+the extraction step does not change the encoder or decoder weights.
+
+`ParakeetModel::decoder_only` skips encoder tensor validation and preparation.
+Only offline TDT V3 supports this package. Session creation requires the matching
+Core ML companion; builds without Core ML cannot create such a session.
+Inputs exceeding the companion capacity return an error requesting chunking.
+Full GGUF models retain their existing CPU/GPU path and over-capacity fallback.

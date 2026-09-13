@@ -54,6 +54,18 @@ target_link_libraries(transcribe_api_smoke PRIVATE transcribe)
 
 add_test(NAME transcribe_api_smoke COMMAND transcribe_api_smoke)
 
+if(TRANSCRIBE_COREML AND TRANSCRIBE_BUILD_EXAMPLES)
+    add_test(NAME transcribe_parakeet_coreml_smoke
+        COMMAND ${CMAKE_COMMAND}
+            -DCLI=$<TARGET_FILE:transcribe-cli>
+            -DAUDIO=${PROJECT_SOURCE_DIR}/samples/jfk.wav
+            -DFAMILY=PARAKEET
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/coreml_smoke.cmake)
+    set_tests_properties(transcribe_parakeet_coreml_smoke PROPERTIES
+        SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
+endif()
+
+
 add_test(
     NAME transcribe_extension_umbrella_check
     COMMAND ${CMAKE_COMMAND}

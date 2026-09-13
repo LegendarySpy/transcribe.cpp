@@ -736,7 +736,8 @@ constexpr const char * kTag = kFamilyTag;
 
 transcribe_status build_parakeet_weights(ggml_context *          ctx_meta,
                                          const ParakeetHParams & hp,
-                                         ParakeetWeights &       weights) {
+                                         ParakeetWeights &       weights,
+                                         bool                    include_encoder) {
     if (ctx_meta == nullptr) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -752,110 +753,112 @@ transcribe_status build_parakeet_weights(ggml_context *          ctx_meta,
     const int64_t joint_h  = hp.joint_hidden;       // 0 for CTC
     const int64_t joint_n  = hp.joint_n_classes();  // meaningless for CTC; we read CTC head shape instead
 
-    // The flattened "freq" axis into pre_encode.out is
-    // (subsampling_channels * F'), where F' is the freq dim after three
-    // k=3 s=2 convs. Padding tracks NeMo's causal_downsampling (inferred
-    // from the attention style — only ChunkedLimited is causal), NOT the
-    // conformer conv_context_size:
-    //   non-causal: symmetric (k-1)/2 both sides. 128→64→32→16; 256*16=4096.
-    //   causal:     (left=k-1, right=stride-1). 128→65→33→17; 256*17=4352.
-    auto pre_encode_F_prime = [&]() {
-        const bool causal = (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited);
-        const int  k = 3, s = 2;
-        // Total per-axis pad: (k-1)/2 + (k-1)/2 = k-1 = 2 for non-causal;
-        // (k-1) + (s-1) = 3 for causal.
-        const int  total_pad = causal ? ((k - 1) + (s - 1)) : ((k - 1) / 2 + (k - 1) / 2);
-        int        dim       = hp.fe_num_mels;
-        for (int i = 0; i < 3; ++i) {
-            dim = ((dim + total_pad - k) / s) + 1;
-        }
-        return static_cast<int64_t>(dim);
-    };
-    const int64_t pre_encode_freq = channels * pre_encode_F_prime();
-    const int64_t pre_encode_in   = pre_encode_freq;
+    if (include_encoder) {
+        // The flattened "freq" axis into pre_encode.out is
+        // (subsampling_channels * F'), where F' is the freq dim after three
+        // k=3 s=2 convs. Padding tracks NeMo's causal_downsampling (inferred
+        // from the attention style — only ChunkedLimited is causal), NOT the
+        // conformer conv_context_size:
+        //   non-causal: symmetric (k-1)/2 both sides. 128→64→32→16; 256*16=4096.
+        //   causal:     (left=k-1, right=stride-1). 128→65→33→17; 256*17=4352.
+        auto pre_encode_F_prime = [&]() {
+            const bool causal = (hp.enc_att_context_style == ParakeetHParams::AttContextStyle::ChunkedLimited);
+            const int  k = 3, s = 2;
+            // Total per-axis pad: (k-1)/2 + (k-1)/2 = k-1 = 2 for non-causal;
+            // (k-1) + (s-1) = 3 for causal.
+            const int  total_pad = causal ? ((k - 1) + (s - 1)) : ((k - 1) / 2 + (k - 1) / 2);
+            int        dim       = hp.fe_num_mels;
+            for (int i = 0; i < 3; ++i) {
+                dim = ((dim + total_pad - k) / s) + 1;
+            }
+            return static_cast<int64_t>(dim);
+        };
+        const int64_t pre_encode_freq = channels * pre_encode_F_prime();
+        const int64_t pre_encode_in   = pre_encode_freq;
 
-    // ----- pre_encode -----
-    // Conv shapes documented in weights.h. ggml_tensor::ne is fast-to-
-    // slow dim order; for an OIHW conv kernel that's [kw, kh, in, out].
-    // 1×1 pointwise convs collapse to [1, 1, in, out].
-    GET_CONV(weights.pre_encode.conv0_w, "enc.pre_encode.conv.0.weight", 3, 3, 1, channels);
-    GET_F32(weights.pre_encode.conv0_b, "enc.pre_encode.conv.0.bias", channels);
-    GET_CONV(weights.pre_encode.conv2_w, "enc.pre_encode.conv.2.weight", 3, 3, 1, channels);
-    GET_F32(weights.pre_encode.conv2_b, "enc.pre_encode.conv.2.bias", channels);
-    GET_CONV(weights.pre_encode.conv3_w, "enc.pre_encode.conv.3.weight", 1, 1, channels, channels);
-    GET_F32(weights.pre_encode.conv3_b, "enc.pre_encode.conv.3.bias", channels);
-    GET_CONV(weights.pre_encode.conv5_w, "enc.pre_encode.conv.5.weight", 3, 3, 1, channels);
-    GET_F32(weights.pre_encode.conv5_b, "enc.pre_encode.conv.5.bias", channels);
-    GET_CONV(weights.pre_encode.conv6_w, "enc.pre_encode.conv.6.weight", 1, 1, channels, channels);
-    GET_F32(weights.pre_encode.conv6_b, "enc.pre_encode.conv.6.bias", channels);
-    GET_LIN(weights.pre_encode.out_w, "enc.pre_encode.out.weight", pre_encode_in, d_model);
-    GET_F32(weights.pre_encode.out_b, "enc.pre_encode.out.bias", d_model);
+        // ----- pre_encode -----
+        // Conv shapes documented in weights.h. ggml_tensor::ne is fast-to-
+        // slow dim order; for an OIHW conv kernel that's [kw, kh, in, out].
+        // 1×1 pointwise convs collapse to [1, 1, in, out].
+        GET_CONV(weights.pre_encode.conv0_w, "enc.pre_encode.conv.0.weight", 3, 3, 1, channels);
+        GET_F32(weights.pre_encode.conv0_b, "enc.pre_encode.conv.0.bias", channels);
+        GET_CONV(weights.pre_encode.conv2_w, "enc.pre_encode.conv.2.weight", 3, 3, 1, channels);
+        GET_F32(weights.pre_encode.conv2_b, "enc.pre_encode.conv.2.bias", channels);
+        GET_CONV(weights.pre_encode.conv3_w, "enc.pre_encode.conv.3.weight", 1, 1, channels, channels);
+        GET_F32(weights.pre_encode.conv3_b, "enc.pre_encode.conv.3.bias", channels);
+        GET_CONV(weights.pre_encode.conv5_w, "enc.pre_encode.conv.5.weight", 3, 3, 1, channels);
+        GET_F32(weights.pre_encode.conv5_b, "enc.pre_encode.conv.5.bias", channels);
+        GET_CONV(weights.pre_encode.conv6_w, "enc.pre_encode.conv.6.weight", 1, 1, channels, channels);
+        GET_F32(weights.pre_encode.conv6_b, "enc.pre_encode.conv.6.bias", channels);
+        GET_LIN(weights.pre_encode.out_w, "enc.pre_encode.out.weight", pre_encode_in, d_model);
+        GET_F32(weights.pre_encode.out_b, "enc.pre_encode.out.bias", d_model);
 
-    // ----- encoder blocks -----
-    weights.blocks.assign(hp.enc_n_layers, ParakeetBlock{});
-    for (int i = 0; i < hp.enc_n_layers; ++i) {
-        auto & b = weights.blocks[i];
+        // ----- encoder blocks -----
+        weights.blocks.assign(hp.enc_n_layers, ParakeetBlock{});
+        for (int i = 0; i < hp.enc_n_layers; ++i) {
+            auto & b = weights.blocks[i];
 
-        // Macaron FF1.
-        GET_F32(b.norm_ff1_w, lname("enc.blocks.%d.norm_ff1.weight", i), d_model);
-        GET_F32(b.norm_ff1_b, lname("enc.blocks.%d.norm_ff1.bias", i), d_model);
-        GET_LIN(b.ff1_lin1_w, lname("enc.blocks.%d.ff1.linear1.weight", i), d_model, d_ff);
-        GET_LIN(b.ff1_lin2_w, lname("enc.blocks.%d.ff1.linear2.weight", i), d_ff, d_model);
+            // Macaron FF1.
+            GET_F32(b.norm_ff1_w, lname("enc.blocks.%d.norm_ff1.weight", i), d_model);
+            GET_F32(b.norm_ff1_b, lname("enc.blocks.%d.norm_ff1.bias", i), d_model);
+            GET_LIN(b.ff1_lin1_w, lname("enc.blocks.%d.ff1.linear1.weight", i), d_model, d_ff);
+            GET_LIN(b.ff1_lin2_w, lname("enc.blocks.%d.ff1.linear2.weight", i), d_ff, d_model);
 
-        // Self-attention with relative position. Q/K/V/out biases only
-        // when use_bias=true; linear_pos is bias-free even then.
-        GET_F32(b.norm_attn_w, lname("enc.blocks.%d.norm_attn.weight", i), d_model);
-        GET_F32(b.norm_attn_b, lname("enc.blocks.%d.norm_attn.bias", i), d_model);
-        GET_LIN(b.attn_q_w, lname("enc.blocks.%d.attn.linear_q.weight", i), d_model, d_model);
-        GET_LIN(b.attn_k_w, lname("enc.blocks.%d.attn.linear_k.weight", i), d_model, d_model);
-        GET_LIN(b.attn_v_w, lname("enc.blocks.%d.attn.linear_v.weight", i), d_model, d_model);
-        GET_LIN(b.attn_out_w, lname("enc.blocks.%d.attn.linear_out.weight", i), d_model, d_model);
-        GET_LIN(b.attn_pos_w, lname("enc.blocks.%d.attn.linear_pos.weight", i), d_model, d_model);
-        // pos_bias_u/v are added directly to a fp32 q tensor via
-        // ggml_add — must stay fp32 to avoid a mixed-type broadcast.
-        GET_F32(b.attn_pos_u, lname("enc.blocks.%d.attn.pos_bias_u", i), head_dim, n_heads);
-        GET_F32(b.attn_pos_v, lname("enc.blocks.%d.attn.pos_bias_v", i), head_dim, n_heads);
+            // Self-attention with relative position. Q/K/V/out biases only
+            // when use_bias=true; linear_pos is bias-free even then.
+            GET_F32(b.norm_attn_w, lname("enc.blocks.%d.norm_attn.weight", i), d_model);
+            GET_F32(b.norm_attn_b, lname("enc.blocks.%d.norm_attn.bias", i), d_model);
+            GET_LIN(b.attn_q_w, lname("enc.blocks.%d.attn.linear_q.weight", i), d_model, d_model);
+            GET_LIN(b.attn_k_w, lname("enc.blocks.%d.attn.linear_k.weight", i), d_model, d_model);
+            GET_LIN(b.attn_v_w, lname("enc.blocks.%d.attn.linear_v.weight", i), d_model, d_model);
+            GET_LIN(b.attn_out_w, lname("enc.blocks.%d.attn.linear_out.weight", i), d_model, d_model);
+            GET_LIN(b.attn_pos_w, lname("enc.blocks.%d.attn.linear_pos.weight", i), d_model, d_model);
+            // pos_bias_u/v are added directly to a fp32 q tensor via
+            // ggml_add — must stay fp32 to avoid a mixed-type broadcast.
+            GET_F32(b.attn_pos_u, lname("enc.blocks.%d.attn.pos_bias_u", i), head_dim, n_heads);
+            GET_F32(b.attn_pos_v, lname("enc.blocks.%d.attn.pos_bias_v", i), head_dim, n_heads);
 
-        // Conv module. pointwise1 doubles the channel count for the
-        // GLU split; depthwise has groups=d_model so its weight is
-        // [kernel, 1, d_model] in ggml ne order. pointwise2 collapses
-        // back to d_model.
-        GET_F32(b.norm_conv_w, lname("enc.blocks.%d.norm_conv.weight", i), d_model);
-        GET_F32(b.norm_conv_b, lname("enc.blocks.%d.norm_conv.bias", i), d_model);
-        GET_CONV(b.conv_pw1_w, lname("enc.blocks.%d.conv.pointwise1.weight", i), 1, d_model, 2 * d_model);
-        GET_CONV(b.conv_dw_w, lname("enc.blocks.%d.conv.depthwise.weight", i), k, 1, d_model);
-        GET_CONV(b.conv_pw2_w, lname("enc.blocks.%d.conv.pointwise2.weight", i), 1, d_model, d_model);
-        GET_F32(b.conv_bn_w, lname("enc.blocks.%d.conv.bn.weight", i), d_model);
-        GET_F32(b.conv_bn_b, lname("enc.blocks.%d.conv.bn.bias", i), d_model);
-        if (hp.enc_conv_norm_type == ParakeetHParams::ConvNormType::BatchNorm) {
-            GET_F32(b.conv_bn_rm, lname("enc.blocks.%d.conv.bn.running_mean", i), d_model);
-            GET_F32(b.conv_bn_rv, lname("enc.blocks.%d.conv.bn.running_var", i), d_model);
-        }
+            // Conv module. pointwise1 doubles the channel count for the
+            // GLU split; depthwise has groups=d_model so its weight is
+            // [kernel, 1, d_model] in ggml ne order. pointwise2 collapses
+            // back to d_model.
+            GET_F32(b.norm_conv_w, lname("enc.blocks.%d.norm_conv.weight", i), d_model);
+            GET_F32(b.norm_conv_b, lname("enc.blocks.%d.norm_conv.bias", i), d_model);
+            GET_CONV(b.conv_pw1_w, lname("enc.blocks.%d.conv.pointwise1.weight", i), 1, d_model, 2 * d_model);
+            GET_CONV(b.conv_dw_w, lname("enc.blocks.%d.conv.depthwise.weight", i), k, 1, d_model);
+            GET_CONV(b.conv_pw2_w, lname("enc.blocks.%d.conv.pointwise2.weight", i), 1, d_model, d_model);
+            GET_F32(b.conv_bn_w, lname("enc.blocks.%d.conv.bn.weight", i), d_model);
+            GET_F32(b.conv_bn_b, lname("enc.blocks.%d.conv.bn.bias", i), d_model);
+            if (hp.enc_conv_norm_type == ParakeetHParams::ConvNormType::BatchNorm) {
+                GET_F32(b.conv_bn_rm, lname("enc.blocks.%d.conv.bn.running_mean", i), d_model);
+                GET_F32(b.conv_bn_rv, lname("enc.blocks.%d.conv.bn.running_var", i), d_model);
+            }
 
-        // Macaron FF2.
-        GET_F32(b.norm_ff2_w, lname("enc.blocks.%d.norm_ff2.weight", i), d_model);
-        GET_F32(b.norm_ff2_b, lname("enc.blocks.%d.norm_ff2.bias", i), d_model);
-        GET_LIN(b.ff2_lin1_w, lname("enc.blocks.%d.ff2.linear1.weight", i), d_model, d_ff);
-        GET_LIN(b.ff2_lin2_w, lname("enc.blocks.%d.ff2.linear2.weight", i), d_ff, d_model);
+            // Macaron FF2.
+            GET_F32(b.norm_ff2_w, lname("enc.blocks.%d.norm_ff2.weight", i), d_model);
+            GET_F32(b.norm_ff2_b, lname("enc.blocks.%d.norm_ff2.bias", i), d_model);
+            GET_LIN(b.ff2_lin1_w, lname("enc.blocks.%d.ff2.linear1.weight", i), d_model, d_ff);
+            GET_LIN(b.ff2_lin2_w, lname("enc.blocks.%d.ff2.linear2.weight", i), d_ff, d_model);
 
-        // Final per-block layer norm.
-        GET_F32(b.norm_out_w, lname("enc.blocks.%d.norm_out.weight", i), d_model);
-        GET_F32(b.norm_out_b, lname("enc.blocks.%d.norm_out.bias", i), d_model);
+            // Final per-block layer norm.
+            GET_F32(b.norm_out_w, lname("enc.blocks.%d.norm_out.weight", i), d_model);
+            GET_F32(b.norm_out_b, lname("enc.blocks.%d.norm_out.bias", i), d_model);
 
-        // Optional encoder linear/conv biases (use_bias=true only;
-        // linear_pos has no bias slot).
-        if (hp.enc_use_bias) {
-            GET_F32(b.ff1_lin1_b, lname("enc.blocks.%d.ff1.linear1.bias", i), d_ff);
-            GET_F32(b.ff1_lin2_b, lname("enc.blocks.%d.ff1.linear2.bias", i), d_model);
-            GET_F32(b.attn_q_b, lname("enc.blocks.%d.attn.linear_q.bias", i), d_model);
-            GET_F32(b.attn_k_b, lname("enc.blocks.%d.attn.linear_k.bias", i), d_model);
-            GET_F32(b.attn_v_b, lname("enc.blocks.%d.attn.linear_v.bias", i), d_model);
-            GET_F32(b.attn_out_b, lname("enc.blocks.%d.attn.linear_out.bias", i), d_model);
-            GET_F32(b.conv_pw1_b, lname("enc.blocks.%d.conv.pointwise1.bias", i), 2 * d_model);
-            GET_F32(b.conv_dw_b, lname("enc.blocks.%d.conv.depthwise.bias", i), d_model);
-            GET_F32(b.conv_pw2_b, lname("enc.blocks.%d.conv.pointwise2.bias", i), d_model);
-            GET_F32(b.ff2_lin1_b, lname("enc.blocks.%d.ff2.linear1.bias", i), d_ff);
-            GET_F32(b.ff2_lin2_b, lname("enc.blocks.%d.ff2.linear2.bias", i), d_model);
+            // Optional encoder linear/conv biases (use_bias=true only;
+            // linear_pos has no bias slot).
+            if (hp.enc_use_bias) {
+                GET_F32(b.ff1_lin1_b, lname("enc.blocks.%d.ff1.linear1.bias", i), d_ff);
+                GET_F32(b.ff1_lin2_b, lname("enc.blocks.%d.ff1.linear2.bias", i), d_model);
+                GET_F32(b.attn_q_b, lname("enc.blocks.%d.attn.linear_q.bias", i), d_model);
+                GET_F32(b.attn_k_b, lname("enc.blocks.%d.attn.linear_k.bias", i), d_model);
+                GET_F32(b.attn_v_b, lname("enc.blocks.%d.attn.linear_v.bias", i), d_model);
+                GET_F32(b.attn_out_b, lname("enc.blocks.%d.attn.linear_out.bias", i), d_model);
+                GET_F32(b.conv_pw1_b, lname("enc.blocks.%d.conv.pointwise1.bias", i), 2 * d_model);
+                GET_F32(b.conv_dw_b, lname("enc.blocks.%d.conv.depthwise.bias", i), d_model);
+                GET_F32(b.conv_pw2_b, lname("enc.blocks.%d.conv.pointwise2.bias", i), d_model);
+                GET_F32(b.ff2_lin1_b, lname("enc.blocks.%d.ff2.linear1.bias", i), d_ff);
+                GET_F32(b.ff2_lin2_b, lname("enc.blocks.%d.ff2.linear2.bias", i), d_model);
+            }
         }
     }
 
