@@ -656,8 +656,13 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
         // The relative shift followed by the T_kv slice maps
         // out[k, q] = in[k - q + T_q - 1, q]. Advancing q therefore
         // moves one source row forward and one position backward.
-        return ggml_view_4d(ctx, scores, T_kv, T_q, heads, B, scores->nb[1] - scores->nb[0], scores->nb[2],
-                            scores->nb[3], /*offset=*/(T_q - 1) * scores->nb[0]);
+        // At T_q == 1, nb[1] is unused, but CUDA binbcast derives the head
+        // stride from it while collapsing this singleton axis. Keep it
+        // canonical to avoid indexing heads T_kv-1 elements apart.
+        const size_t query_stride =
+            T_q == 1 ? static_cast<size_t>(T_kv) * scores->nb[0] : scores->nb[1] - scores->nb[0];
+        return ggml_view_4d(ctx, scores, T_kv, T_q, heads, B, query_stride, scores->nb[2], scores->nb[3],
+                            /*offset=*/(T_q - 1) * scores->nb[0]);
     };
 
     // A full-attention flash mask has an independent relative-position
