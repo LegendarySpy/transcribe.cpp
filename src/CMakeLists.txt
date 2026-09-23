@@ -64,6 +64,9 @@ add_library(transcribe
     arch/sortformer/stream.cpp
     arch/sortformer/capabilities.cpp
     arch/sortformer/weights.cpp
+    arch/nemotron3_diar/model.cpp
+    arch/nemotron3_diar/stream.cpp
+    arch/nemotron3_diar/weights.cpp
     arch/voxtral/model.cpp
     arch/voxtral/capabilities.cpp
     arch/voxtral/weights.cpp

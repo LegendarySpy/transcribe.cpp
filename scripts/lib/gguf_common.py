@@ -204,6 +204,10 @@ def reference_dtype_for(
         return GGMLQuantizationType.F32
     if name in ("frontend.mel_filterbank", "frontend.window"):
         return GGMLQuantizationType.F32
+    # nemotron3_diar: learned AOSC silence embedding, copied verbatim into
+    # the speaker cache's reserved silence slots.
+    if name == "diar.silence_emb":
+        return GGMLQuantizationType.F32
 
     # Conv bucket (pointwise + depthwise + 2D).
     is_convpw = (
