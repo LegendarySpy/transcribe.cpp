@@ -1,0 +1,55 @@
+{
+  "schema": "transcribe-golden-manifest-v1",
+  "family": "nemotron3_diar",
+  "variant": "nemotron-3-diarization",
+  "source_model": {
+    "hf_repo": "nvidia/Nemotron-3-Diarization",
+    "hf_revision": "a435e9867d79e789e90053f9b6d6834053af564a"
+  },
+  "reference": {
+    "kind": "transformers",
+    "source": "https://github.com/huggingface/transformers",
+    "revision": "c8b81b63232be35ab1774dd3cabbf499d8b9808f",
+    "entrypoint": "scripts/dump_reference_nemotron3_diar_transformers.py"
+  },
+  "expected_dtype": "float32",
+  "dtype_source": "config",
+  "frontend": {
+    "sample_rate": 16000,
+    "n_mels": 128,
+    "hop_length": 160,
+    "fft_size": 512,
+    "win_length": 400,
+    "window": "hann_symmetric",
+    "normalization": "none",
+    "preemphasis": 0.97,
+    "dither": 0.0
+  },
+  "tokenizer_summary": {
+    "type": "other",
+    "vocab_size": 0,
+    "special_tokens": {}
+  },
+  "capabilities": {
+    "languages": ["en"],
+    "language_detection": false,
+    "translation": false,
+    "timestamps": [],
+    "streaming": true,
+    "speaker_diarization": true
+  },
+  "diarization": {
+    "max_speakers": 8,
+    "frame_period_seconds": 0.01,
+    "output": "T x 8 sigmoid speaker-activity probabilities at the 10 ms mel rate (arrival-order columns)",
+    "streaming_cfg_shipped": {
+      "chunk_len": 340,
+      "chunk_right_context": 40,
+      "fifo_len": 40,
+      "spkcache_len": 264,
+      "spkcache_update_period": 300
+    }
+  },
+  "tolerance_file": "tests/tolerances/nemotron3_diar.json",
+  "cases": ["sortformer-2spk-mix"]
+}

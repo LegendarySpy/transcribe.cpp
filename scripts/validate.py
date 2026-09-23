@@ -337,6 +337,14 @@ def write_cpp_transcript(
     print(f"  wrote {path}", file=sys.stderr)
 
 
+# Encoder-diarizers: no text, the gate is the speaker-probability tensor.
+DIARIZER_FAMILIES = ("sortformer", "nemotron3_diar")
+DIARIZER_PRESET_ENV = {
+    "sortformer": "VALIDATE_SORTFORMER_PRESET",
+    "nemotron3_diar": "VALIDATE_NEMOTRON3_DIAR_PRESET",
+}
+
+
 def cmd_ref(args: argparse.Namespace) -> int:
     repo = find_repo_root(Path(__file__).parent)
     manifest = load_manifest(repo, args.family, getattr(args, "variant", None))
@@ -411,14 +419,17 @@ def cmd_ref(args: argparse.Namespace) -> int:
         # (--preset) and the C++ side (TRANSCRIBE_SORTFORMER_STREAM_PRESET in
         # cmd_cpp); unset -> the checkpoint-shipped cfg (single chunk on the
         # short oracle, i.e. diar.probs == diar.preds_offline).
-        if args.family == "sortformer":
+        #
+        # nemotron3_diar follows the same split; VALIDATE_NEMOTRON3_DIAR_PRESET
+        # pairs the reference --preset with TRANSCRIBE_NEMOTRON3_DIAR_PRESET.
+        if args.family in DIARIZER_FAMILIES:
             stages = ["encoder", "diarize"]
         else:
             stages = ["encoder", "decode"]
-        sf_preset = os.environ.get("VALIDATE_SORTFORMER_PRESET")
+        sf_preset = os.environ.get(DIARIZER_PRESET_ENV.get(args.family, ""))
         for stage in stages:
             stage_args = list(common_args)
-            if args.family == "sortformer" and stage == "diarize" and sf_preset:
+            if args.family in DIARIZER_FAMILIES and stage == "diarize" and sf_preset:
                 stage_args += ["--preset", sf_preset]
             cmd = base_args + [stage] + stage_args
             run_cmd(
@@ -466,6 +477,11 @@ def cmd_cpp(args: argparse.Namespace) -> int:
             sf_preset = os.environ.get("VALIDATE_SORTFORMER_PRESET")
             if sf_preset:
                 env["TRANSCRIBE_SORTFORMER_STREAM_PRESET"] = sf_preset
+        if args.family == "nemotron3_diar":
+            env["TRANSCRIBE_NEMOTRON3_DIAR_OFFLINE_DUMP"] = "1"
+            nd_preset = os.environ.get("VALIDATE_NEMOTRON3_DIAR_PRESET")
+            if nd_preset:
+                env["TRANSCRIBE_NEMOTRON3_DIAR_PRESET"] = nd_preset
 
         # Whisper: by default, exercise the production C++ MelFrontend so
         # the per-tensor compare covers the full mel→encoder→decoder
@@ -647,7 +663,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         # diar.probs tensor, gated above; the `diarize` stage's segment lines
         # are informational only, so skip the text-transcript comparison.
         ref_transcript = ref_dir / "transcript.json"
-        if ref_transcript.exists() and args.family != "sortformer":
+        if ref_transcript.exists() and args.family not in DIARIZER_FAMILIES:
             transcript_compare = case_transcript_compare(manifest, case)
             ref_data = json.loads(ref_transcript.read_text())
             ref_text = str(ref_data.get("text", ""))
