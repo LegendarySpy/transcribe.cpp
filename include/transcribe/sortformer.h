@@ -55,6 +55,14 @@ extern "C" {
  *                       compute per audio second than the larger chunks
  *                       (many small windows); see the family doc for
  *                       measured throughput.
+ *   VERY_LOW_LATENCY    ~0.64 s lookahead (Nemotron-3 Diarization only).
+ *   ULTRA_LOW_LATENCY   ~0.32 s lookahead (Nemotron-3 Diarization only).
+ *
+ * Nemotron-3 Diarization (arch nemotron3_diar) shares this extension. Its
+ * presets are NVIDIA's published v3 operating points: VERY_HIGH_LATENCY is
+ * 30.4 s (chunk 340 + rc 40), LOW_LATENCY 1.04 s (chunk 9 + rc 4); it has no
+ * HIGH_LATENCY point. A preset a model has no validated geometry for is
+ * rejected with TRANSCRIBE_ERR_INVALID_ARG.
  *
  * Values outside the enum range are rejected by transcribe_run with
  * TRANSCRIBE_ERR_INVALID_ARG before the previous result is cleared.
@@ -64,6 +72,8 @@ typedef enum {
     TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY = 1,
     TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY      = 2,
     TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY       = 3,
+    TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY  = 4,
+    TRANSCRIBE_SORTFORMER_PRESET_ULTRA_LOW_LATENCY = 5,
 } transcribe_sortformer_preset;
 
 struct transcribe_sortformer_stream_ext {

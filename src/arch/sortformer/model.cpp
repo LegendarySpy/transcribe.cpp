@@ -1103,6 +1103,9 @@ static transcribe_status run_validate(const transcribe_session * /*ctx*/, const 
         case TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY:
         case TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY:
             return TRANSCRIBE_OK;
+        case TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY:
+        case TRANSCRIBE_SORTFORMER_PRESET_ULTRA_LOW_LATENCY:
+            break;  // Nemotron-3 operating points; no v2.1 geometry
     }
     return TRANSCRIBE_ERR_INVALID_ARG;
 }

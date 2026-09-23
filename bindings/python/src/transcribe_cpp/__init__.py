@@ -56,7 +56,9 @@ Timestamps = Literal["none", "auto", "segment", "word", "token"]
 Pnc = Literal["default", "off", "on"]
 Itn = Literal["default", "off", "on"]
 Diarize = Literal["default", "off", "on"]
-SortformerPreset = Literal["default", "very_high_latency", "high_latency", "low_latency"]
+SortformerPreset = Literal[
+    "default", "very_high_latency", "high_latency", "low_latency", "very_low_latency", "ultra_low_latency"
+]
 CommitPolicy = Literal["auto", "on_finalize", "stable_prefix"]
 Feature = Literal[
     "initial_prompt", "temperature_fallback", "long_form",
@@ -857,6 +859,8 @@ class SortformerStreamOptions(FamilyExtension):
         "very_high_latency": _generated.TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY,
         "high_latency": _generated.TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY,
         "low_latency": _generated.TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY,
+        "very_low_latency": _generated.TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY,
+        "ultra_low_latency": _generated.TRANSCRIBE_SORTFORMER_PRESET_ULTRA_LOW_LATENCY,
     }
 
     def __init__(self, *, preset: SortformerPreset | None = None):

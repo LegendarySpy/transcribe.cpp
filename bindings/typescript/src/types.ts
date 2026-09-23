@@ -255,7 +255,9 @@ export type SortformerPreset =
   | "default"
   | "very_high_latency"
   | "high_latency"
-  | "low_latency";
+  | "low_latency"
+  | "very_low_latency"
+  | "ultra_low_latency";
 /** Sortformer diarizer options (run slot). A run produces speaker
  *  segments, no text. */
 export interface SortformerStreamOptions {

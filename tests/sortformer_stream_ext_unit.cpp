@@ -154,6 +154,11 @@ int main() {
         rp.family  = &oor.ext;
         CHECK(transcribe_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_ERR_INVALID_ARG);
         CHECK(same_segments(read_segments(session), env_rows));
+
+        // The sub-second presets are Nemotron-3 operating points only.
+        oor.preset = TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY;
+        CHECK(transcribe_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_ERR_INVALID_ARG);
+        CHECK(same_segments(read_segments(session), env_rows));
     }
 
     // 4a. Ext preset == env preset parity (same operating point, same rows).

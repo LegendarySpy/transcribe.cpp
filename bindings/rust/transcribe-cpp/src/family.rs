@@ -80,6 +80,10 @@ pub enum SortformerPreset {
     /// ~1.04 s lookahead; the real-time point (compute-heavy per audio
     /// second — many small windows).
     LowLatency,
+    /// ~0.64 s lookahead (Nemotron-3 Diarization only).
+    VeryLowLatency,
+    /// ~0.32 s lookahead (Nemotron-3 Diarization only).
+    UltraLowLatency,
 }
 
 impl SortformerPreset {
@@ -96,6 +100,12 @@ impl SortformerPreset {
             }
             SortformerPreset::LowLatency => {
                 sys::transcribe_sortformer_preset::TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY
+            }
+            SortformerPreset::VeryLowLatency => {
+                sys::transcribe_sortformer_preset::TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY
+            }
+            SortformerPreset::UltraLowLatency => {
+                sys::transcribe_sortformer_preset::TRANSCRIBE_SORTFORMER_PRESET_ULTRA_LOW_LATENCY
             }
         }
     }
