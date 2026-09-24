@@ -22,6 +22,13 @@ thresholding the model card's `logits.sigmoid()` example implies.
     --probs-dir reports/diar/probs/nemotron-3-diarization-CPP-F32-offline \
     --pred-dir reports/diar/pred/nemotron-3-diarization-CPP-F32-offline
 
+  # C++ port, push-audio stream (transcribe_stream_*) fed in 100 ms pieces
+  uv run --project scripts/envs/nemotron3_diar scripts/diar/run_nemotron3_diar.py cpp \
+    --gguf models/nemotron-3-diarization/nemotron-3-diarization-Q8_0.gguf --preset low_latency \
+    --stream-chunk-ms 100 --manifest samples/diar/ami-ihm-test-fa.manifest.jsonl \
+    --probs-dir reports/diar/probs/nemotron-3-diarization-CPP-Q8_0-metal-low_latency-stream \
+    --pred-dir reports/diar/pred/nemotron-3-diarization-CPP-Q8_0-metal-low_latency-stream
+
   uv run scripts/diar/score_der.py --manifest samples/diar/ami-ihm-test-fa.manifest.jsonl \
     --pred-dir reports/diar/pred/nemotron-3-diarization-CPP-F32-offline \
     --out reports/diar/nemotron-3-diarization-CPP-F32-offline.ami-ihm-test-fa.score.json
@@ -93,6 +100,8 @@ def run_cpp(rows: list[dict], args: argparse.Namespace):
             cmd = [str(cli), "-q", "-m", args.gguf, "--backend", args.backend, row["audio"]]
             if args.threads:
                 cmd[1:1] = ["--threads", str(args.threads)]
+            if args.stream_chunk_ms:
+                cmd[1:1] = ["--stream-chunk-ms", str(args.stream_chunk_ms)]
             t0 = time.perf_counter()
             proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
             elapsed = time.perf_counter() - t0
@@ -118,6 +127,7 @@ def main() -> int:
     ap.add_argument("--cli", default="build/bin/transcribe-cli", help="cpp: transcribe-cli path")
     ap.add_argument("--backend", default="auto", help="cpp: compute backend")
     ap.add_argument("--threads", type=int, default=0, help="cpp: CPU threads")
+    ap.add_argument("--stream-chunk-ms", type=int, default=0, help="cpp: feed the stream API in pieces of N ms")
     ap.add_argument("--rescore-only", action="store_true", help="Rebuild RTTMs from saved probs")
     args = ap.parse_args()
 

@@ -16,7 +16,9 @@ convolution, the speaker cache stores embedder outputs and uses a learned
 silence embedding, and cache probabilities are pooled from the 10 ms output.
 The public surface is shared: the `SFST` run extension, its preset enum,
 and the transcript-independent `transcribe_speaker_segment` output, so a
-caller that drives Sortformer v2.1 drives this model unchanged.
+caller that drives Sortformer v2.1 drives this model unchanged. On top of
+that, this family implements push-audio live diarization
+(`transcribe_stream_*` with the `SFLV` stream extension).
 
 ## Identity
 
@@ -77,7 +79,40 @@ padding is masked as an attention key and gets zero cache probabilities.
 sub-second values are new enum members; `sortformer` rejects them the same
 way. `TRANSCRIBE_NEMOTRON3_DIAR_PRESET` (`offline`, `low_latency`,
 `very_low_latency`, `ultra_low_latency`, and the validation-only `small`)
-overrides the extension for validation runs.
+overrides the extension for validation runs, on both the run and the
+stream path.
+
+### Push-audio streaming
+
+`transcribe_stream_begin` / `feed` / `finalize` with
+`transcribe_sortformer_live_ext` (`SFLV`, STREAM slot) on
+`transcribe_stream_params::family`. Accepted presets: `LOW_LATENCY` (the
+init default, and the preset of a stream begun without an extension),
+`VERY_LOW_LATENCY`, `ULTRA_LOW_LATENCY`. `DEFAULT`, `VERY_HIGH_LATENCY` and
+`HIGH_LATENCY` are rejected pre-clear: a 30 s lookahead is a file workload,
+and `transcribe_run` already serves it.
+
+Feeds take any piece size. Each stage runs only on input that can no longer
+change (`model.cpp`, "Push-audio streaming"):
+
+- mel: a frame is final once its centered 512-sample window has arrived.
+  Each feed recomputes from two frames before the first new one, so the left
+  half-window and the pre-emphasis carry come from real audio, and keeps
+  only that much PCM.
+- embedder: an encoder frame is final once its 8 mel frames are. The
+  embedder runs in fixed 64-frame blocks on both the run and the stream path,
+  because on CPU the quantized matmul result depends on the row count.
+- chunks: a chunk runs once the chunk and its lookahead are embedded, with
+  the same step input the batch run builds. Finalize flushes the tail with
+  the batch run's short lookahead, trailing padding frame and key mask.
+
+The stream therefore reproduces `transcribe_run` at the same preset, bit for
+bit. Mid-stream rows follow the rule in `sortformer.h`: the processed
+frontier is `transcribe_stream_update::audio_committed_ms`; a row with
+`t1_ms < audio_committed_ms` is final, a row with `t1_ms ==
+audio_committed_ms` is still open. The stream revision advances whenever the
+rows change. Memory is bounded by the speaker cache plus the per-frame
+output probabilities (32 bytes per 10 ms, ~11.5 MB per hour).
 
 ## Commands
 
@@ -143,7 +178,7 @@ Diarization substitutes for the forced transcription rows, as for
 | Cache compression | `small` preset (cache 24) | `VALIDATE_NEMOTRON3_DIAR_PRESET=small` | prob parity through compression | MUST PASS | PASS — 3.6e-6, zero flips |
 | Speaker-activity tensor | debug dump | `diar.probs` [T, 8] | parity with the reference | MUST PASS | PASS |
 | Full-context forward | offline dump | `diar.preds_offline` + per-stage `enc.*` | parity with the reference | MUST PASS | PASS — 9/9 tensors |
-| Push-audio live streaming | `transcribe_stream_*` | n/a | incremental rows | OUT OF SCOPE — same deferral as `sortformer`; the RUN-slot presets cover file and chunked use | N/A |
+| Push-audio live streaming | `transcribe_stream_*`, `SFLV` | `transcribe_nemotron3_diar_stream_unit` + AMI DER (`--stream-chunk-ms`) | stream rows == batch rows at the same preset; final-only mid-stream rows | MUST PASS | PASS — bit-identical to the batch run (CPU/Metal, F32/Q8_0, all stream presets + `small`, 1 sample to 1 s feeds); AMI below |
 | Batch (`run_batch`) | n/a | n/a | n/a | ACCEPTED GAP — single-session runs only, as `sortformer` | N/A |
 | Transcription / translation / timestamps | n/a | n/a | no text output | OUT OF SCOPE — not a transcription model | N/A |
 
@@ -170,6 +205,7 @@ AMI IHM test (DER / JER, missed / false alarm / confusion):
 | C++ Q4_K_M, Metal, offline | 9.41% | 13.31% | 4.72% | 3.77% | 0.92% |
 
 | C++ Q8_0, Metal, low_latency (1.04 s) | 9.48% | 13.02% | 5.02% | 3.51% | 0.95% |
+| C++ Q8_0, Metal, low_latency, push-audio stream (100 ms feeds) | 9.48% | 13.02% | 5.02% | 3.51% | 0.95% |
 | C++ Q8_0, Metal, very_low_latency (0.64 s) | 9.64% | 13.16% | 5.13% | 3.51% | 1.01% |
 | `sortformer` v2.1 Q8_0, CPU, very_high_latency (same pipeline) | 15.99% | 21.20% | 7.42% | 4.97% | 3.60% |
 
@@ -193,6 +229,22 @@ The sub-second presets re-encode the whole speaker cache and FIFO (~540
 frames) for every 0.24-0.72 s chunk: AMI ran at 16x (low) and 11x (very
 low) realtime on Metal, and a 2 minute clip at ~2x / ~0.8x realtime on CPU
 for low / ultra-low.
+
+Push-audio streaming reproduces the batch run bit for bit: the 16 AMI
+meetings streamed at `low_latency` in 100 ms feeds give the same `[T, 8]`
+probabilities as the batch run (hence the same DER), and the
+`sortformer-2spk-mix` clip matches for 1 ms to 1 s feeds on CPU and Metal,
+F32 and Q8_0, at every stream preset and `small`. Streaming costs what the
+batch run costs (Q8_0, M2 Pro, `transcribe-cli --stream-chunk-ms`):
+
+| Run | Backend | Audio | Batch | Stream |
+| --- | --- | --- | --- | --- |
+| low_latency, 100 ms feeds | Metal | IS1009a, 14 min | 16x | 16x |
+| low_latency, 10 ms / 1 s feeds | Metal | IS1009a, 14 min | 16x | 14x / 16x |
+| very_low_latency, 100 ms feeds | Metal | IS1009a, 14 min | | 11x |
+| ultra_low_latency, 100 ms feeds | Metal | IS1009a, 14 min | | 5x |
+| low_latency, 100 ms feeds | CPU | ES2004a, first 5 min | 3x | 3x |
+| low_latency, 100 ms feeds | Metal | AMI test, 9.06 h (incl. load) | | 14x |
 
 Quant policy: F32 (reference), F16, Q8_0. Q8_0 matches F32 on AMI at a
 quarter of the size (106 MB). Q4_K_M (61 MB) costs 0.2 DER points; like

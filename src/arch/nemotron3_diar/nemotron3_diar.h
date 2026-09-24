@@ -170,6 +170,39 @@ void update_speaker_cache(SpeakerCache &             sc,
                           const float *              logits,
                           int                        n_chunk);
 
+// Push-audio stream state (transcribe_stream_*). Frame and sample indices
+// count from stream begin. Each stage only runs on input that can no longer
+// change, so the stream reproduces the batch run at the same preset.
+struct LiveState {
+    StreamParams       params;
+    std::vector<float> pcm;  // received samples from pcm_base on
+    int64_t            pcm_base   = 0;
+    int64_t            n_received = 0;
+    int                n_mel      = 0;  // mel frames computed
+    std::vector<float> mel;             // [.., n_mels] time-major, from frame n_embedded * sub
+    int                n_embedded = 0;  // encoder frames embedded
+    std::vector<float> embeds;          // [.., D] embeddings from encoder frame next_chunk
+    int                next_chunk = 0;  // first encoder frame of the next chunk
+    int                n_scanned  = 0;  // output frames turned into rows
+    std::vector<int>   open_start;      // per speaker: first frame of the open run, or -1
+    std::vector<std::vector<transcribe_session::SpeakerSegmentEntry>> closed;  // per speaker
+
+    void reset() {
+        params = {};
+        pcm.clear();
+        pcm_base   = 0;
+        n_received = 0;
+        n_mel      = 0;
+        mel.clear();
+        n_embedded = 0;
+        embeds.clear();
+        next_chunk = 0;
+        n_scanned  = 0;
+        open_start.clear();
+        closed.clear();
+    }
+};
+
 struct Session final : public transcribe_session {
     std::vector<float> mel_buf;
     std::vector<float> embeds_host;  // [T_enc * D] embedder output for the whole clip
@@ -177,6 +210,7 @@ struct Session final : public transcribe_session {
     std::vector<float> logits_host;  // [n_input * sub * S] per-step logits
     std::vector<float> probs;        // [T_mel * S] accumulated output
     SpeakerCache       cache;
+    LiveState          live;
 
     Session() = default;
     ~Session() override;

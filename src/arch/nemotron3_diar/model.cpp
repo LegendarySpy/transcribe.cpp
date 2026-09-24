@@ -5,7 +5,8 @@
 // [speaker cache | FIFO | chunk | lookahead] embeddings: 31 pre-LN RoPE
 // layers -> projection -> sub-pixel upsampling -> speaker head. The host
 // speaker cache (stream.cpp) carries identity across chunks. Mirrors HF
-// Nemotron3DiarizationForAudioFrameClassification.forward.
+// Nemotron3DiarizationForAudioFrameClassification.forward. Push-audio streams
+// run the same chunks as their input arrives ("Push-audio streaming" below).
 
 #include "ggml.h"
 #include "gguf.h"
@@ -191,16 +192,19 @@ transcribe_status new_compute_ctx(Session * s, size_t bytes) {
     return s->compute_ctx != nullptr ? TRANSCRIBE_OK : TRANSCRIBE_ERR_BACKEND;
 }
 
-// Embedder over the whole clip: time-major mel padded to a multiple of sub,
-// viewed as [n_mels * sub, T_enc] and projected to [d, T_enc].
-transcribe_status run_embedder(Session * s, Model * m, int n_mels, int n_mel_frames, int n_valid_mel, int n_enc) {
-    // Fixed-size blocks keep the stacked input and its projection bounded
-    // however long the clip is; the last block is zero-padded.
-    constexpr int block = 4096;
-    const int     sub   = m->hparams.subsampling_factor;
-    const int     D     = m->hparams.d_model;
-    const int     width = n_mels * sub;
-    const int     rows  = std::min(block, n_enc);
+// Embedder block, in encoder frames. Fixed so the batch run and the stream
+// use one matmul shape: on CPU the quantized matmul result depends on the
+// row count.
+constexpr int k_embed_rows = 64;
+
+// Embedder (8-frame stacking + projection) over n_enc encoder frames in
+// k_embed_rows blocks, the last block zero-padded. fill(first, n, dst)
+// writes the stacked time-major input of frames [first, first + n) into dst
+// ([n, n_mels * sub]). Output rows go to out ([n_enc, D]).
+template <typename Fill> transcribe_status embed_frames(Session * s, Model * m, int n_enc, float * out, Fill && fill) {
+    const int rows  = k_embed_rows;
+    const int D     = m->hparams.d_model;
+    const int width = m->hparams.fe_num_mels * m->hparams.subsampling_factor;
 
     if (const transcribe_status st = new_compute_ctx(s, 1 * 1024 * 1024); st != TRANSCRIBE_OK) {
         return st;
@@ -208,33 +212,46 @@ transcribe_status run_embedder(Session * s, Model * m, int n_mels, int n_mel_fra
     ggml_context * ctx = s->compute_ctx;
     ggml_tensor *  in  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
     ggml_set_input(in);
-    ggml_tensor * out   = ggml_mul_mat(ctx, m->weights.embed_w, in);
+    ggml_tensor * y     = ggml_mul_mat(ctx, m->weights.embed_w, in);
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, out);
+    ggml_build_forward_expand(graph, y);
     ggml_backend_sched_reset(s->sched);
     if (!ggml_backend_sched_alloc_graph(s->sched, graph)) {
         return TRANSCRIBE_ERR_BACKEND;
     }
     transcribe::configure_sched_n_threads(s->sched, s->n_threads);
 
-    s->embeds_host.resize(static_cast<size_t>(n_enc) * D);
     std::vector<float> stacked(static_cast<size_t>(rows) * width);
     for (int first = 0; first < n_enc; first += rows) {
         const int n = std::min(rows, n_enc - first);
         std::fill(stacked.begin(), stacked.end(), 0.0f);
-        const int t_end = std::min((first + n) * sub, n_valid_mel);
-        for (int t = first * sub; t < t_end; ++t) {
-            float * dst = stacked.data() + static_cast<size_t>(t - first * sub) * n_mels;
-            for (int f = 0; f < n_mels; ++f) {
-                dst[f] = s->mel_buf[static_cast<size_t>(f) * n_mel_frames + t];
-            }
-        }
+        fill(first, n, stacked.data());
         ggml_backend_tensor_set(in, stacked.data(), 0, stacked.size() * sizeof(float));
         if (ggml_backend_sched_graph_compute(s->sched, graph) != GGML_STATUS_SUCCESS) {
             return TRANSCRIBE_ERR_BACKEND;
         }
-        ggml_backend_tensor_get(out, s->embeds_host.data() + static_cast<size_t>(first) * D, 0,
-                                static_cast<size_t>(n) * D * sizeof(float));
+        ggml_backend_tensor_get(y, out + static_cast<size_t>(first) * D, 0, static_cast<size_t>(n) * D * sizeof(float));
+    }
+    return TRANSCRIBE_OK;
+}
+
+// Embedder over the whole clip from the channel-major mel in s->mel_buf.
+transcribe_status run_embedder(Session * s, Model * m, int n_mels, int n_mel_frames, int n_valid_mel, int n_enc) {
+    const int sub = m->hparams.subsampling_factor;
+    const int D   = m->hparams.d_model;
+
+    s->embeds_host.resize(static_cast<size_t>(n_enc) * D);
+    const transcribe_status st = embed_frames(s, m, n_enc, s->embeds_host.data(), [&](int first, int n, float * dst) {
+        const int t_end = std::min((first + n) * sub, n_valid_mel);
+        for (int t = first * sub; t < t_end; ++t) {
+            float * row = dst + static_cast<size_t>(t - first * sub) * n_mels;
+            for (int f = 0; f < n_mels; ++f) {
+                row[f] = s->mel_buf[static_cast<size_t>(f) * n_mel_frames + t];
+            }
+        }
+    });
+    if (st != TRANSCRIBE_OK) {
+        return st;
     }
     if (transcribe::debug::enabled()) {
         const long long shape[2] = { n_enc, D };
@@ -319,6 +336,35 @@ transcribe_status run_offline_dump(Session * s, Model * m, int n_enc, int n_vali
     return TRANSCRIBE_OK;
 }
 
+// One chunk step: [speaker cache | FIFO | chunk | lookahead]. `emb` holds the
+// `take` embeddings from the chunk's first frame on (n_chunk chunk frames,
+// the rest lookahead), the first n_valid of them real. Appends the chunk's
+// mel-rate probabilities to s->probs.
+transcribe_status
+run_chunk(Session * s, Model * m, const StreamParams & p, const float * emb, int n_chunk, int take, int n_valid) {
+    const HParams & hp     = m->hparams;
+    const int       D      = hp.d_model;
+    const int       S      = hp.max_speakers;
+    const int       sub    = hp.subsampling_factor;
+    const int       cached = s->cache.cache_n + s->cache.fifo_n;
+    const int       n      = cached + take;
+
+    s->input_host.resize(static_cast<size_t>(n) * D);
+    auto dst = s->input_host.begin();
+    dst      = std::copy_n(s->cache.embeds.begin(), static_cast<size_t>(s->cache.cache_n) * D, dst);
+    dst      = std::copy_n(s->cache.fifo.begin(), static_cast<size_t>(s->cache.fifo_n) * D, dst);
+    std::copy_n(emb, static_cast<size_t>(take) * D, dst);
+
+    if (const transcribe_status st = run_step(s, m, n, cached + n_valid, false); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    update_speaker_cache(s->cache, hp, p, m->silence_host, s->input_host.data(), n, cached + n_valid,
+                         s->logits_host.data(), n_chunk);
+    sigmoid_rows(s->logits_host, static_cast<size_t>(cached) * sub * S, static_cast<size_t>(n_chunk) * sub * S,
+                 s->probs);
+    return TRANSCRIBE_OK;
+}
+
 // Chunked AOSC/FIFO forward over the clip's embeddings; fills s->probs
 // ([n_mel_frames, S]).
 transcribe_status run_chunks(Session *            s,
@@ -327,39 +373,25 @@ transcribe_status run_chunks(Session *            s,
                              int                  n_enc,
                              int                  n_valid_enc,
                              int                  n_mel_frames) {
-    const HParams & hp  = m->hparams;
-    const int       D   = hp.d_model;
-    const int       S   = hp.max_speakers;
-    const int       sub = hp.subsampling_factor;
+    const HParams & hp = m->hparams;
+    const int       S  = hp.max_speakers;
 
     s->cache.reset();
     s->probs.clear();
-    s->probs.reserve(static_cast<size_t>(n_enc) * sub * S);
+    s->probs.reserve(static_cast<size_t>(n_enc) * hp.subsampling_factor * S);
 
     for (int start = 0; start < n_enc; start += p.chunk_len) {
         if (s->poll_abort()) {
             return TRANSCRIBE_ERR_ABORTED;
         }
-        const int end     = std::min(start + p.chunk_len, n_enc);
-        const int n_chunk = end - start;
-        const int take    = std::min(end + p.right_context, n_enc) - start;
-        const int cached  = s->cache.cache_n + s->cache.fifo_n;
-        const int n       = cached + take;
-        const int n_valid = cached + std::clamp(n_valid_enc - start, 0, take);
-
-        s->input_host.resize(static_cast<size_t>(n) * D);
-        auto dst = s->input_host.begin();
-        dst      = std::copy_n(s->cache.embeds.begin(), static_cast<size_t>(s->cache.cache_n) * D, dst);
-        dst      = std::copy_n(s->cache.fifo.begin(), static_cast<size_t>(s->cache.fifo_n) * D, dst);
-        std::copy_n(s->embeds_host.begin() + static_cast<size_t>(start) * D, static_cast<size_t>(take) * D, dst);
-
-        if (const transcribe_status st = run_step(s, m, n, n_valid, false); st != TRANSCRIBE_OK) {
+        const int end  = std::min(start + p.chunk_len, n_enc);
+        const int take = std::min(end + p.right_context, n_enc) - start;
+        if (const transcribe_status st =
+                run_chunk(s, m, p, s->embeds_host.data() + static_cast<size_t>(start) * hp.d_model, end - start, take,
+                          std::clamp(n_valid_enc - start, 0, take));
+            st != TRANSCRIBE_OK) {
             return st;
         }
-        update_speaker_cache(s->cache, hp, p, m->silence_host, s->input_host.data(), n, n_valid, s->logits_host.data(),
-                             n_chunk);
-        sigmoid_rows(s->logits_host, static_cast<size_t>(cached) * sub * S, static_cast<size_t>(n_chunk) * sub * S,
-                     s->probs);
     }
     s->probs.resize(std::min(s->probs.size(), static_cast<size_t>(n_mel_frames) * S));
     return TRANSCRIBE_OK;
@@ -567,7 +599,11 @@ transcribe_status run(transcribe_session *          session,
 }
 
 bool accepts_ext_kind(const transcribe_model * model, transcribe_ext_slot slot, uint32_t kind) {
-    return model != nullptr && slot == TRANSCRIBE_EXT_SLOT_RUN && kind == TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM;
+    if (model == nullptr) {
+        return false;
+    }
+    return (slot == TRANSCRIBE_EXT_SLOT_RUN && kind == TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM) ||
+           (slot == TRANSCRIBE_EXT_SLOT_STREAM && kind == TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE);
 }
 
 transcribe_status run_validate(const transcribe_session * session, const transcribe_run_params * params) {
@@ -584,6 +620,296 @@ transcribe_status run_validate(const transcribe_session * session, const transcr
     return resolve_stream_params(m->hparams, requested_preset(params), sp) ? TRANSCRIBE_OK : TRANSCRIBE_ERR_INVALID_ARG;
 }
 
+// ---- Push-audio streaming -------------------------------------------------
+// The batch run is already chunked; the stream runs the same chunks as soon
+// as their input is final. A mel frame is final once its centered window has
+// fully arrived, an encoder frame once its sub mel frames are, and a chunk
+// once the chunk and its lookahead are embedded. Stream output therefore
+// equals the batch run at the same preset; only the tail (partial lookahead,
+// trailing padding frame) waits for finalize.
+
+// Mel frames recomputed ahead of the first new one: the left half-window and
+// the pre-emphasis carry of that frame come from already-received audio.
+constexpr int k_live_mel_guard = 2;
+
+transcribe_status resolve_live_params(const Model * m, const transcribe_stream_params * sp, StreamParams & out) {
+    const transcribe_ext * fam = sp != nullptr ? sp->family : nullptr;
+    if (const transcribe_status st = transcribe_ext_check(fam, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE,
+                                                          sizeof(struct transcribe_sortformer_live_ext));
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    const transcribe_sortformer_preset preset =
+        fam != nullptr ? reinterpret_cast<const transcribe_sortformer_live_ext *>(fam)->preset :
+                         TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY;
+    switch (preset) {
+        case TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY:
+        case TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY:
+        case TRANSCRIBE_SORTFORMER_PRESET_ULTRA_LOW_LATENCY:
+            break;
+        default:
+            return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    return resolve_stream_params(m->hparams, preset, out) ? TRANSCRIBE_OK : TRANSCRIBE_ERR_INVALID_ARG;
+}
+
+// Mel frames up to the final count (all frames at finalize, zeroing the
+// trailing padding frame as run() does), appended time-major to live.mel.
+transcribe_status live_mel(Session * s, Model * m, bool final) {
+    LiveState &     lv  = s->live;
+    const HParams & hp  = m->hparams;
+    const int64_t   N   = lv.n_received;
+    const int       hop = hp.fe_hop_length;
+    const int       pad = hp.fe_n_fft / 2;
+    int             target;
+    if (final) {
+        target = N >= hop ? static_cast<int>(N / hop) + 1 : lv.n_mel;
+    } else {
+        target = N >= pad ? static_cast<int>((N - pad) / hop) + 1 : 0;
+    }
+    if (target <= lv.n_mel) {
+        return TRANSCRIBE_OK;
+    }
+    const int     first  = std::max(0, lv.n_mel - k_live_mel_guard);
+    const int64_t a      = static_cast<int64_t>(first) * hop;
+    int           n_mels = 0, n_frames = 0;
+    if (const transcribe_status st = m->mel->compute(lv.pcm.data() + (a - lv.pcm_base), static_cast<size_t>(N - a),
+                                                     s->mel_buf, n_mels, n_frames);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (n_frames < target - first) {
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    for (int t = lv.n_mel - first; t < target - first; ++t) {
+        for (int f = 0; f < n_mels; ++f) {
+            lv.mel.push_back(s->mel_buf[static_cast<size_t>(f) * n_frames + t]);
+        }
+    }
+    lv.n_mel = target;
+
+    const int64_t keep = static_cast<int64_t>(std::max(0, target - k_live_mel_guard)) * hop;
+    lv.pcm.erase(lv.pcm.begin(), lv.pcm.begin() + (keep - lv.pcm_base));
+    lv.pcm_base = keep;
+    return TRANSCRIBE_OK;
+}
+
+// Embeds every encoder frame whose mel frames are all computed (at finalize
+// the last frame is zero-padded, as in run()).
+transcribe_status live_embed(Session * s, Model * m, bool final) {
+    LiveState & lv     = s->live;
+    const int   sub    = m->hparams.subsampling_factor;
+    const int   D      = m->hparams.d_model;
+    const int   width  = m->hparams.fe_num_mels * sub;
+    const int   target = final ? (lv.n_mel + sub - 1) / sub : lv.n_mel / sub;
+    const int   n      = target - lv.n_embedded;
+    if (n <= 0) {
+        return TRANSCRIBE_OK;
+    }
+    lv.mel.resize(std::max(lv.mel.size(), static_cast<size_t>(n) * width), 0.0f);
+    const size_t old = lv.embeds.size();
+    lv.embeds.resize(old + static_cast<size_t>(n) * D);
+    const transcribe_status st = embed_frames(s, m, n, lv.embeds.data() + old, [&](int first, int count, float * dst) {
+        std::copy_n(lv.mel.begin() + static_cast<size_t>(first) * width, static_cast<size_t>(count) * width, dst);
+    });
+    if (st != TRANSCRIBE_OK) {
+        return st;
+    }
+    lv.mel.erase(lv.mel.begin(), lv.mel.begin() + static_cast<size_t>(n) * width);
+    lv.n_embedded = target;
+    return TRANSCRIBE_OK;
+}
+
+// Runs every chunk whose chunk + lookahead frames are embedded; at finalize
+// also the tail chunks with the batch run's short lookahead and padding mask.
+transcribe_status live_chunks(Session * s, Model * m, bool final) {
+    LiveState &          lv          = s->live;
+    const StreamParams & p           = lv.params;
+    const int            D           = m->hparams.d_model;
+    const int            n_enc       = lv.n_embedded;
+    const int            n_valid_mel = static_cast<int>(lv.n_received / m->hparams.fe_hop_length);
+    const int n_valid_enc = (n_valid_mel + m->hparams.subsampling_factor - 1) / m->hparams.subsampling_factor;
+    while (lv.next_chunk < n_enc && (final || lv.next_chunk + p.chunk_len + p.right_context <= n_enc)) {
+        if (s->poll_abort()) {
+            return TRANSCRIBE_ERR_ABORTED;
+        }
+        const int start = lv.next_chunk;
+        const int end   = std::min(start + p.chunk_len, n_enc);
+        const int take  = std::min(end + p.right_context, n_enc) - start;
+        if (const transcribe_status st =
+                run_chunk(s, m, p, lv.embeds.data(), end - start, take, std::clamp(n_valid_enc - start, 0, take));
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        lv.embeds.erase(lv.embeds.begin(), lv.embeds.begin() + static_cast<size_t>(end - start) * D);
+        lv.next_chunk = end;
+    }
+    if (final) {
+        const int S = m->hparams.max_speakers;
+        s->probs.resize(std::min(s->probs.size(), static_cast<size_t>(lv.n_mel) * S));
+    }
+    return TRANSCRIBE_OK;
+}
+
+// Turns the new output frames into rows: closed runs are final, a run still
+// active at the frontier is published with t1 = frontier (closed at finalize).
+// Returns true when the published rows changed.
+bool live_rows(Session * s, Model * m, bool final) {
+    LiveState &  lv           = s->live;
+    const int    S            = m->hparams.max_speakers;
+    const double ms_per_frame = 1000.0 * m->hparams.frame_hop / m->hparams.fe_sample_rate;
+    const int    n_frames     = static_cast<int>(s->probs.size() / static_cast<size_t>(S));
+    const auto   to_ms        = [&](int frame) {
+        return static_cast<int64_t>(std::llround(frame * ms_per_frame));
+    };
+    if (n_frames == lv.n_scanned && !final) {
+        return false;
+    }
+    for (int spk = 0; spk < S; ++spk) {
+        int & run_start = lv.open_start[static_cast<size_t>(spk)];
+        for (int t = lv.n_scanned; t <= n_frames; ++t) {
+            if (t == n_frames && !final) {
+                break;
+            }
+            const bool active = t < n_frames && s->probs[static_cast<size_t>(t) * S + spk] > 0.5f;
+            if (active && run_start < 0) {
+                run_start = t;
+            } else if (!active && run_start >= 0) {
+                transcribe_session::SpeakerSegmentEntry row;
+                row.t0_ms      = to_ms(run_start);
+                row.t1_ms      = to_ms(t);
+                row.speaker_id = spk + 1;
+                row.p          = std::numeric_limits<float>::quiet_NaN();
+                lv.closed[static_cast<size_t>(spk)].push_back(row);
+                run_start = -1;
+            }
+        }
+    }
+    lv.n_scanned = n_frames;
+
+    std::vector<transcribe_session::SpeakerSegmentEntry> rows;
+    for (int spk = 0; spk < S; ++spk) {
+        const auto & closed = lv.closed[static_cast<size_t>(spk)];
+        rows.insert(rows.end(), closed.begin(), closed.end());
+        if (const int run_start = lv.open_start[static_cast<size_t>(spk)]; run_start >= 0) {
+            transcribe_session::SpeakerSegmentEntry row;
+            row.t0_ms      = to_ms(run_start);
+            row.t1_ms      = to_ms(n_frames);
+            row.speaker_id = spk + 1;
+            row.p          = std::numeric_limits<float>::quiet_NaN();
+            rows.push_back(row);
+        }
+    }
+    const bool changed =
+        !std::equal(rows.begin(), rows.end(), s->speaker_segments.begin(), s->speaker_segments.end(),
+                    [](const auto & a, const auto & b) {
+                        return a.t0_ms == b.t0_ms && a.t1_ms == b.t1_ms && a.speaker_id == b.speaker_id;
+                    });
+    s->speaker_segments.swap(rows);
+    return changed;
+}
+
+// Runs the pipeline over the received audio and publishes rows + cursors.
+transcribe_status live_process(Session * s, Model * m, bool final, transcribe_stream_update * update) {
+    const int64_t t_start = ggml_time_us();
+    if (const transcribe_status st = live_mel(s, m, final); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    const int64_t t_mel = ggml_time_us();
+    s->t_mel_us += t_mel - t_start;
+    for (auto stage : { live_embed, live_chunks }) {
+        if (const transcribe_status st = stage(s, m, final); st != TRANSCRIBE_OK) {
+            return st;
+        }
+    }
+    s->t_encode_us += ggml_time_us() - t_mel;
+
+    const bool changed = live_rows(s, m, final);
+    if (changed) {
+        s->stream_revision += 1;
+    }
+    const int     S            = m->hparams.max_speakers;
+    const int     sr           = std::max(1, m->hparams.fe_sample_rate);
+    const double  ms_per_frame = 1000.0 * m->hparams.frame_hop / sr;
+    const int64_t received_ms  = s->live.n_received * 1000 / sr;
+    const int64_t committed_ms =
+        static_cast<int64_t>(std::llround(static_cast<double>(s->probs.size() / S) * ms_per_frame));
+    if (update != nullptr) {
+        update->result_changed     = changed;
+        update->revision           = s->stream_revision;
+        update->input_received_ms  = received_ms;
+        update->audio_committed_ms = committed_ms;
+        update->buffered_ms        = std::max<int64_t>(0, received_ms - committed_ms);
+    }
+    if (final && transcribe::debug::enabled()) {
+        const long long shape[2] = { static_cast<long long>(s->probs.size() / S), S };
+        transcribe::debug::dump_host_f32("diar.probs", s->probs.data(), static_cast<long long>(s->probs.size()), shape,
+                                         2, "diarize");
+    }
+    return TRANSCRIBE_OK;
+}
+
+transcribe_status stream_validate(const transcribe_session * session,
+                                  const transcribe_run_params * /*run_params*/,
+                                  const transcribe_stream_params * stream_params) {
+    StreamParams sp{};
+    return resolve_live_params(static_cast<const Model *>(session->model), stream_params, sp);
+}
+
+transcribe_status stream_begin(transcribe_session * session,
+                               const transcribe_run_params * /*run_params*/,
+                               const transcribe_stream_params * stream_params) {
+    auto * s = static_cast<Session *>(session);
+    auto * m = static_cast<Model *>(session->model);
+    if (!m->mel.has_value()) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    s->live.reset();
+    if (const transcribe_status st = resolve_live_params(m, stream_params, s->live.params); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (const transcribe_status st = ensure_sched(s, m); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    transcribe::debug::init();
+    const size_t S = static_cast<size_t>(m->hparams.max_speakers);
+    s->live.open_start.assign(S, -1);
+    s->live.closed.assign(S, {});
+    s->cache.reset();
+    s->probs.clear();
+    s->result_kind = TRANSCRIBE_TIMESTAMPS_NONE;
+    s->has_result  = true;
+    return TRANSCRIBE_OK;
+}
+
+transcribe_status stream_feed(transcribe_session *       session,
+                              const float *              pcm,
+                              int                        n_samples,
+                              transcribe_stream_update * update) {
+    auto * s = static_cast<Session *>(session);
+    if (s->poll_abort()) {
+        return TRANSCRIBE_ERR_ABORTED;
+    }
+    s->live.pcm.insert(s->live.pcm.end(), pcm, pcm + n_samples);
+    s->live.n_received += n_samples;
+    return live_process(s, static_cast<Model *>(session->model), false, update);
+}
+
+transcribe_status stream_finalize(transcribe_session * session, transcribe_stream_update * update) {
+    auto * s = static_cast<Session *>(session);
+    if (s->poll_abort()) {
+        return TRANSCRIBE_ERR_ABORTED;
+    }
+    return live_process(s, static_cast<Model *>(session->model), true, update);
+}
+
+void stream_reset(transcribe_session * session) {
+    auto * s = static_cast<Session *>(session);
+    s->live.reset();
+    s->cache.reset();
+    s->probs.clear();
+}
+
 }  // namespace
 
 extern const Arch arch = {
@@ -592,11 +918,11 @@ extern const Arch arch = {
     /* .init_context     = */ init_context,
     /* .run              = */ run,
     /* .run_batch        = */ nullptr,
-    /* .stream_validate  = */ nullptr,
-    /* .stream_begin     = */ nullptr,
-    /* .stream_feed      = */ nullptr,
-    /* .stream_finalize  = */ nullptr,
-    /* .stream_reset     = */ nullptr,
+    /* .stream_validate  = */ stream_validate,
+    /* .stream_begin     = */ stream_begin,
+    /* .stream_feed      = */ stream_feed,
+    /* .stream_finalize  = */ stream_finalize,
+    /* .stream_reset     = */ stream_reset,
     /* .accepts_ext_kind = */ accepts_ext_kind,
     /* .run_validate     = */ run_validate,
 };
