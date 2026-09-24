@@ -95,6 +95,20 @@ pub fn smoke_voxtral_model() -> Option<PathBuf> {
     )
 }
 
+/// Nemotron-3 Diarization canary (accepts SORTFORMER_LIVE on the stream slot).
+pub fn smoke_nemotron3_diar_model() -> Option<PathBuf> {
+    family_model(
+        "TRANSCRIBE_SMOKE_NEMOTRON3_DIAR_MODEL",
+        "models/nemotron-3-diarization/nemotron-3-diarization-Q8_0.gguf",
+    )
+}
+
+/// The committed 2-speaker diarization oracle mix, or `None` when absent.
+pub fn diar_audio() -> Option<Vec<f32>> {
+    let path = repo_root().join("samples/sortformer-2spk-mix.wav");
+    path.is_file().then(|| load_wav(&path))
+}
+
 /// Canary model whose generic PNC run parameter changes the prompt.
 pub fn smoke_pnc_model() -> Option<PathBuf> {
     family_model(

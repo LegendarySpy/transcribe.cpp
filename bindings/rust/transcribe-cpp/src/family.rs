@@ -119,6 +119,21 @@ pub struct SortformerStreamOptions {
     pub preset: Option<SortformerPreset>,
 }
 
+/// Push-audio live diarization knobs (stream slot, Nemotron-3 Diarization).
+/// Accepts `LowLatency` (the default when `None`), `VeryLowLatency` and
+/// `UltraLowLatency`; other presets are rejected at `stream` with
+/// [`Error::InvalidArgument`](crate::Error). Read rows from
+/// [`Stream::snapshot`](crate::Stream::snapshot)`.speaker_segments` after each
+/// feed: a row whose `t1_ms` equals the feed's
+/// [`StreamUpdate::audio_committed_ms`](crate::StreamUpdate) is still open
+/// (the speaker is talking at the processed frontier); every other row is
+/// final. After `finalize` all rows are final and equal a `run` at the same
+/// preset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SortformerLiveOptions {
+    pub preset: Option<SortformerPreset>,
+}
+
 /// A family extension for the run slot (offline `run`/`run_batch`).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -136,6 +151,7 @@ pub enum StreamExtension {
     ParakeetBuffered(ParakeetBufferedStreamOptions),
     MoonshineStreaming(MoonshineStreamingOptions),
     VoxtralRealtime(VoxtralRealtimeStreamOptions),
+    SortformerLive(SortformerLiveOptions),
 }
 
 /// Owns a materialized run-slot C extension struct (and any strings it points
@@ -228,6 +244,7 @@ pub(crate) enum StreamExtRaw {
     ParakeetBuffered(Box<sys::transcribe_parakeet_buffered_stream_ext>),
     MoonshineStreaming(Box<sys::transcribe_moonshine_streaming_stream_ext>),
     VoxtralRealtime(Box<sys::transcribe_voxtral_realtime_stream_ext>),
+    SortformerLive(Box<sys::transcribe_sortformer_live_ext>),
 }
 
 impl StreamExtRaw {
@@ -247,6 +264,9 @@ impl StreamExtRaw {
             StreamExtRaw::VoxtralRealtime(e) => {
                 (&**e) as *const sys::transcribe_voxtral_realtime_stream_ext
                     as *const sys::transcribe_ext
+            }
+            StreamExtRaw::SortformerLive(e) => {
+                (&**e) as *const sys::transcribe_sortformer_live_ext as *const sys::transcribe_ext
             }
         }
     }
@@ -284,6 +304,12 @@ impl StreamExtension {
                 set(&mut e.num_delay_tokens, o.num_delay_tokens);
                 set(&mut e.min_decode_interval_ms, o.min_decode_interval_ms);
                 StreamExtRaw::VoxtralRealtime(Box::new(e))
+            }
+            StreamExtension::SortformerLive(o) => {
+                let mut e: sys::transcribe_sortformer_live_ext = unsafe { std::mem::zeroed() };
+                unsafe { sys::transcribe_sortformer_live_ext_init(&mut e) };
+                set(&mut e.preset, o.preset.map(SortformerPreset::to_sys));
+                StreamExtRaw::SortformerLive(Box::new(e))
             }
         }
     }
