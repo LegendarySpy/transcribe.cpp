@@ -1,7 +1,7 @@
 # Core ML encoder companion
 
-This branch supports optional Qwen3-ASR and offline Parakeet Core ML encoders. The audio frontend
-and autoregressive decoder remain in the existing transcribe.cpp engine.
+This branch supports optional Qwen3-ASR, offline Parakeet, and Whisper Core ML encoders. The
+audio frontend and decoder remain in the existing transcribe.cpp engine.
 
 ## Build and load
 
@@ -50,6 +50,17 @@ new companion. The Qwen model note records its numerical check and limitations.
 
 The shared session struct layout is independent of the private Core ML build
 flag. Builds with Core ML disabled retain the existing ggml path.
+
+## Whisper
+
+The Whisper adapter loads the session companion through `coreml_encoder_path`
+or `TRANSCRIBE_WHISPER_COREML_MODEL`. Export from the exact GGUF using
+`scripts/convert-whisper-gguf-to-coreml.py`. The encoder has a fixed 3000-frame
+(30 second) input, matching the padded window Whisper always encodes, so there
+is no capacity fallback. `transcribe_whisper_coreml_smoke` exercises the
+supplied real model when `TRANSCRIBE_WHISPER_COREML_GGUF` and
+`TRANSCRIBE_WHISPER_COREML_MODEL` are set. See `docs/models/whisper.md` for
+details.
 
 ## Parakeet TDT
 

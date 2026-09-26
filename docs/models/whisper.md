@@ -90,6 +90,69 @@ The repo doesn't ship the GGUFs — pull them from the corresponding
 the upstream OpenAI checkpoint via the per-variant doc's reproduction
 section.
 
+## Apple Neural Engine encoder (optional)
+
+Whisper uses the [shared Core ML encoder runtime](../coreml.md).
+
+On Apple Silicon with macOS 13 or later, build with Core ML support and
+convert the encoder directly from the **same transcribe.cpp GGUF** used by the
+runtime. Only Handy's GGUF is downloaded; the converter reads its tensors,
+expands quantized weights, and emits an FP16 Core ML encoder. It records the
+GGUF's SHA-256 and variant in the model metadata. The decoder and frontend
+continue to use the GGUF through the existing runtime.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DTRANSCRIBE_COREML=ON
+cmake --build build --target transcribe-cli -j 2
+
+mkdir -p models
+curl -fL -o models/whisper-tiny-Q8_0.gguf \
+  https://huggingface.co/handy-computer/whisper-tiny-gguf/resolve/main/whisper-tiny-Q8_0.gguf
+
+uv run --python 3.11 scripts/convert-whisper-gguf-to-coreml.py \
+  models/whisper-tiny-Q8_0.gguf \
+  --output models/whisper-tiny-Q8_0-encoder.mlpackage --compile
+
+TRANSCRIBE_WHISPER_COREML_MODEL=models/whisper-tiny-Q8_0-encoder.mlmodelc \
+  build/bin/transcribe-cli -m models/whisper-tiny-Q8_0.gguf --threads 2 samples/jfk.wav
+```
+
+Conversion requires Xcode's `coremlcompiler`; `uv` supplies the conversion-only
+Python dependencies. No Python dependency is added to the C++ runtime. Use the
+same command for other Whisper variants and quantizations. Regenerate the
+encoder when changing the GGUF; using a separate unquantized encoder would test
+different weights. Conversion to FP16 still introduces numerical differences.
+
+Core ML uses `CPUAndNeuralEngine`, which excludes the GPU but lets macOS place
+unsupported operations on the CPU. This setting alone is not proof that every
+operation runs on ANE; inspect the Core ML compute plan or use Instruments to
+check placement. Leaving `TRANSCRIBE_METAL` enabled permits GPU decoding.
+
+Pass the compiled `.mlmodelc` in `transcribe_session_params::coreml_encoder_path`
+(Rust: `SessionOptions::coreml_encoder_path`); an unset path falls back to
+`TRANSCRIBE_WHISPER_COREML_MODEL`. The path is read when creating a Whisper
+session. Unset or empty leaves the ggml encoder active. An explicitly requested
+encoder that cannot load or predict returns an error instead of silently using
+ggml. Builds without Core ML support reject a nonempty path. Encoders without
+matching variant metadata are rejected. The SHA-256 is provenance metadata, not
+a runtime file-hash check.
+The session retains the Core ML model for reuse; first load may take longer
+while macOS specializes it. GGUF encoder weights remain loaded too.
+
+The CLI's `backend` field describes the ggml decoder backend. The
+`Core ML encoder loaded` log identifies the separate encoder path. Tensor
+debugging provides `enc.final`; internal Core ML layers are not exposed.
+Flash-attention flags apply only to the ggml portions of the run.
+
+Run the optional regression check after building the CLI:
+
+```bash
+TRANSCRIBE_WHISPER_COREML_GGUF="$PWD/models/whisper-tiny-Q8_0.gguf" \
+TRANSCRIBE_WHISPER_COREML_MODEL="$PWD/models/whisper-tiny-Q8_0-encoder.mlmodelc" \
+  ctest --test-dir build -R transcribe_whisper_coreml_smoke --output-on-failure
+```
+
 ## Capabilities
 
 All Whisper variants support:

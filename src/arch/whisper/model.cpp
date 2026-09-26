@@ -4,6 +4,9 @@
 // path below; TRANSCRIBE_MEL_FROM_REF can inject a reference mel tensor
 // to isolate encoder/decoder drift during numerical validation.
 
+#ifdef TRANSCRIBE_COREML
+#    include "transcribe-coreml.h"
+#endif
 #include "decoder.h"
 #include "encoder.h"
 #include "ggml-alloc.h"
@@ -68,6 +71,9 @@ WhisperModel::~WhisperModel() {
 }
 
 WhisperSession::~WhisperSession() {
+#ifdef TRANSCRIBE_COREML
+    coreml_encoder_free(coreml_encoder);
+#endif
     kv_cache.free();
     enc_out.free();
 }
@@ -568,6 +574,21 @@ transcribe_status whisper_init_context(transcribe_model *                model,
     cc->decoder_use_flash = true;
     transcribe::flash::apply_env_overrides(cc->encoder_use_flash, cc->decoder_use_flash);
 
+    if (const char * path = transcribe::session_coreml_encoder_path(params, "TRANSCRIBE_WHISPER_COREML_MODEL")) {
+#ifdef TRANSCRIBE_COREML
+        const auto & hp    = static_cast<WhisperModel *>(model)->hparams;
+        cc->coreml_encoder = coreml_encoder_load(path, model->variant.c_str(), hp.enc_num_mel_bins,
+                                                 2 * hp.enc_max_source_positions, hp.enc_d_model, 2, false);
+        if (cc->coreml_encoder == nullptr) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+#else
+        (void) path;
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper: rebuild with TRANSCRIBE_COREML=ON to use a Core ML encoder");
+        return TRANSCRIBE_ERR_INVALID_ARG;
+#endif
+    }
+
     *out_ctx = cc.release();
     return TRANSCRIBE_OK;
 }
@@ -601,6 +622,51 @@ transcribe_status run_whisper_encoder_on_window(WhisperSession * cc,
         return TRANSCRIBE_ERR_OOM;
     }
 
+    if (cc->sched == nullptr) {
+        cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
+                                           static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
+        if (cc->sched == nullptr) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper run: ggml_backend_sched_new failed");
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+
+        // Apply the caller's CPU thread count once at sched creation; it
+        // persists across the reused encoder/decoder graphs. GPU backends
+        // ignore it, CPU/BLAS use it. Without this, compute ran at ggml's
+        // default count regardless of params.n_threads.
+        transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
+    }
+
+#ifdef TRANSCRIBE_COREML
+    if (cc->coreml_encoder != nullptr) {
+        const int d_model = cm->hparams.enc_d_model;
+        const int frames  = cm->hparams.enc_max_source_positions;
+        if (n_mels != cm->hparams.enc_num_mel_bins || n_mel_frames != 2 * frames) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+        ggml_backend_sched_reset(cc->sched);
+        if (cc->enc_out.tensor == nullptr || cc->enc_out.d_model != d_model || cc->enc_out.T_enc != frames) {
+            if (!enc_out_init(cc->enc_out, cm->plan.primary, d_model, frames)) {
+                return TRANSCRIBE_ERR_OOM;
+            }
+        }
+        cc->enc_host.resize(static_cast<size_t>(frames) * d_model);
+        cc->perf.enc_build.add(ggml_time_us() - t_enc_build_start);
+        const int64_t start = ggml_time_us();
+        if (!coreml_encoder_run(cc->coreml_encoder, mel_data, n_mel_frames, true, cc->enc_host)) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        cc->perf.enc_compute.add(ggml_time_us() - start);
+        ggml_backend_tensor_set(cc->enc_out.tensor, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
+        if (allow_dumps) {
+            transcribe::debug::dump_tensor("enc.final", cc->enc_out.tensor, "encoder.final");
+        }
+        out_T_enc = frames;
+        cc->enc_T = frames;
+        return TRANSCRIBE_OK;
+    }
+#endif
+
     EncoderBuild eb = build_encoder_graph(cc->compute_ctx, cm->weights, cm->hparams, n_mel_frames,
                                           cc->encoder_use_flash, cm->backend.c_str());
     if (eb.mel_in == nullptr || eb.out == nullptr || eb.graph == nullptr) {
@@ -628,20 +694,6 @@ transcribe_status run_whisper_encoder_on_window(WhisperSession * cc,
 
     // Allocate + compute encoder graph.
     const int64_t t_enc_alloc_start = ggml_time_us();
-    if (cc->sched == nullptr) {
-        cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
-                                           static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
-        if (cc->sched == nullptr) {
-            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper run: ggml_backend_sched_new failed");
-            return TRANSCRIBE_ERR_BACKEND;
-        }
-
-        // Apply the caller's CPU thread count once at sched creation; it
-        // persists across the reused encoder/decoder graphs. GPU backends
-        // ignore it, CPU/BLAS use it. Without this, compute ran at ggml's
-        // default count regardless of params.n_threads.
-        transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
-    }
     ggml_backend_sched_reset(cc->sched);
     if (!ggml_backend_sched_alloc_graph(cc->sched, eb.graph)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,

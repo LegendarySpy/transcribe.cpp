@@ -28,6 +28,10 @@ typedef struct ggml_backend *        ggml_backend_t;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 typedef struct ggml_backend_sched *  ggml_backend_sched_t;
 
+namespace transcribe {
+struct CoreMLEncoder;
+}
+
 namespace transcribe::whisper {
 
 void apply_family_invariants(transcribe_model & model);
@@ -292,7 +296,8 @@ struct WhisperSession final : public transcribe_session {
     // Currently-allocated capacity of compute_ctx (mem_size). Used by
     // ensure_compute_ctx to decide between ggml_reset (cheap reuse)
     // and ggml_free + ggml_init (only when more space is needed).
-    size_t compute_ctx_size = 0;
+    size_t          compute_ctx_size = 0;
+    CoreMLEncoder * coreml_encoder   = nullptr;
 
     // Persistent backend-resident encoder output (see WhisperEncOut).
     WhisperEncOut enc_out;
