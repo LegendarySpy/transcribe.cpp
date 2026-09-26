@@ -199,7 +199,7 @@ unverified.
 
 ### Decoder-only Parakeet TDT V3 packages
 
-`scripts/extract-parakeet-decoder.py SOURCE.gguf OUTPUT-decoder.gguf` copies the
+`scripts/extract-coreml-decoder.py SOURCE.gguf OUTPUT-decoder.gguf` copies the
 original GGUF metadata and predictor/joint tensors, omitting encoder tensors.
 It sets `stt.parakeet.decoder_only=true` and records
 `stt.parakeet.source_sha256`. Use the Core ML encoder exported from SOURCE;

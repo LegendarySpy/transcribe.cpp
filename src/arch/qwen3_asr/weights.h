@@ -210,6 +210,9 @@ struct QwenAsrWeights {
     // builder reuses token_w for the output projection.
 };
 
-transcribe_status build_qwen3_asr_weights(ggml_context * ctx_meta, const QwenAsrHParams & hp, QwenAsrWeights & weights);
+transcribe_status build_qwen3_asr_weights(ggml_context *         ctx_meta,
+                                          const QwenAsrHParams & hp,
+                                          QwenAsrWeights &       weights,
+                                          bool                   include_encoder = true);
 
 }  // namespace transcribe::qwen3_asr

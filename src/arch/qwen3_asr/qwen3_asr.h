@@ -78,7 +78,8 @@ struct QwenAsrModel final : public transcribe_model {
     Tokenizer      tok;
     QwenAsrHParams hparams;
     QwenAsrWeights weights;
-    ggml_context * ctx_meta = nullptr;
+    ggml_context * ctx_meta     = nullptr;
+    bool           decoder_only = false;  // stt.qwen3_asr.decoder_only: no enc.* tensors
 
     transcribe::BackendPlan                    plan;
     ggml_backend_buffer_t                      backend_buffer = nullptr;

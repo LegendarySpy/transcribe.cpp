@@ -169,6 +169,14 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         return st;
     }
 
+    const int64_t decoder_only_key = gguf_find_key(loader.gguf(), "stt.qwen3_asr.decoder_only");
+    if (decoder_only_key >= 0) {
+        if (gguf_get_kv_type(loader.gguf(), decoder_only_key) != GGUF_TYPE_BOOL) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        m->decoder_only = gguf_get_val_bool(loader.gguf(), decoder_only_key);
+    }
+
     // Publish the input-length ceiling now that the decoder context window
     // and frontend rate are known.
     m->caps.max_audio_ms = qwen3_max_audio_ms(m->hparams);
@@ -246,7 +254,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         return TRANSCRIBE_ERR_GGUF;
     }
 
-    if (const transcribe_status st = build_qwen3_asr_weights(m->ctx_meta, m->hparams, m->weights);
+    if (const transcribe_status st = build_qwen3_asr_weights(m->ctx_meta, m->hparams, m->weights, !m->decoder_only);
         st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
@@ -368,6 +376,11 @@ transcribe_status init_context(transcribe_model *                model,
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr: rebuild with TRANSCRIBE_COREML=ON to use a Core ML encoder");
         return TRANSCRIBE_ERR_INVALID_ARG;
 #endif
+    }
+
+    if (cm->decoder_only && cc->coreml_encoder == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr: decoder-only GGUF requires a matching Core ML encoder");
+        return TRANSCRIBE_ERR_INVALID_ARG;
     }
 
     *out_ctx = cc.release();
@@ -732,6 +745,10 @@ transcribe_status run(transcribe_session *          session,
             const long long shape[2] = { T_enc, d_enc };
             transcribe::debug::dump_host_f32("enc.proj.out", cc->enc_host.data(),
                                              static_cast<long long>(cc->enc_host.size()), shape, 2, "enc.proj");
+        } else if (cm->decoder_only) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "qwen3_asr: input exceeds Core ML encoder capacity; split audio into chunks of at most 15 seconds");
+            return TRANSCRIBE_ERR_INVALID_ARG;
         } else {
             log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
                     "qwen3_asr Core ML: %d mel frames exceed encoder capacity %d; using ggml for this utterance",
