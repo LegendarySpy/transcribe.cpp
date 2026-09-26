@@ -909,7 +909,8 @@ bool compute_window_words(const WindowInput &    in,
         }
     }
     for (Segment & sg : segs) {
-        sg.t1_ms = std::max(sg.t1_ms, sg.t0_ms);
+        sg.t0_ms = std::clamp(sg.t0_ms, ws, we);
+        sg.t1_ms = std::clamp(sg.t1_ms, sg.t0_ms, we);
     }
     return aligned;
 }

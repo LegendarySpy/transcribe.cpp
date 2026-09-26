@@ -80,7 +80,7 @@ void check_word_invariants(const transcribe_session * ctx, int64_t clip_ms) {
         CHECK_EQ_INT(transcribe_get_segment(ctx, k, &seg), TRANSCRIBE_OK);
         CHECK_EQ_INT(seg.first_word, covered);
         covered += seg.n_words;
-        CHECK(seg.t0_ms <= seg.t1_ms);
+        CHECK(seg.t0_ms >= 0 && seg.t0_ms <= seg.t1_ms && seg.t1_ms <= clip_ms);
     }
     CHECK_EQ_INT(covered, n_words);
 }

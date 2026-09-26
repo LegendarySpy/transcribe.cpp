@@ -175,8 +175,8 @@ void apply_segment_heuristics(std::vector<double> & starts,
 // Full per-window pipeline. `words` comes from split_words; `segs` lists the
 // window's segments in order. Returns true when DTW timing was used, false
 // when the window fell back to proportional timing. Output words satisfy
-// win_start <= t0 <= t1 <= win_end with non-decreasing starts across the run;
-// when the first new word starts before *prev_word_t1 (the last word of an
+// win_start <= t0 <= t1 <= win_end with non-decreasing starts across the run
+// (segment times are clamped to the window too); when the first new word starts before *prev_word_t1 (the last word of an
 // earlier window), *prev_word_t1 is trimmed to that start.
 bool compute_window_words(const WindowInput &    in,
                           std::vector<Word>      words,

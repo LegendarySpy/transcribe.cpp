@@ -399,6 +399,7 @@ void check_window(const std::vector<wa::OutWord> & out,
     }
     for (const wa::Segment & sg : segs) {
         CHECK(sg.t0_ms <= sg.t1_ms);
+        CHECK(out.empty() || (sg.t0_ms >= ws && sg.t1_ms <= we));
     }
 }
 

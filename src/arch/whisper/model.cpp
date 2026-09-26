@@ -1287,6 +1287,7 @@ struct AlignWindowArgs {
     int           T_enc           = 0;
     int           align_frames    = 0;  // real mel frames in this window
     int64_t       time_offset_ms  = 0;
+    int64_t       audio_end_ms    = 0;
     bool          is_multilingual = true;
     // Run PCM, for the per-frame energy used to trim silent word edges.
     const float * pcm             = nullptr;
@@ -1369,8 +1370,11 @@ void whisper_align_window(WhisperSession *              cc,
         }
         in.frame_db = frame_db.data();
     }
-    in.win_start_ms = a.time_offset_ms;
-    in.win_end_ms   = a.time_offset_ms + static_cast<int64_t>(std::max(0, a.align_frames)) * 10;
+    // A window can start past the audio (text decoded from the 30 s padding);
+    // its words then sit at the audio end.
+    in.win_start_ms = std::min(a.time_offset_ms, a.audio_end_ms);
+    in.win_end_ms   = std::clamp(a.time_offset_ms + static_cast<int64_t>(std::max(0, a.align_frames)) * 10,
+                                 in.win_start_ms, a.audio_end_ms);
 
     const char * fail = nullptr;
     if (T_audio < 1) {
@@ -2695,6 +2699,7 @@ transcribe_status whisper_run(transcribe_session *          session,
             aa.T_enc           = T_enc_local;
             aa.align_frames    = std::clamp(content_frames - seek, 0, seek_num_frames);
             aa.time_offset_ms  = time_offset_ms;
+            aa.audio_end_ms    = static_cast<int64_t>(content_frames) * 10;
             aa.is_multilingual = is_multilingual;
             aa.pcm             = pcm;
             aa.n_samples       = n_samples;
