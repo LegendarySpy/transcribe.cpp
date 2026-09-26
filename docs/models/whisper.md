@@ -261,6 +261,9 @@ rules on every run:
 - Long-form input (over 30 s) always decodes timestamp tokens; `NONE`
   only drops the segments. Blind 30-second advances under
   `<|notimestamps|>` cut words at window edges and made windows stop early.
+- A fallback tier at temperature T divides the logits by T before the
+  suppression and timestamp rules, and its average log-probability comes
+  from those scaled logits (whisper.cpp's order).
 - The transcript is built from the kept segments: a window's unfinished
   tail after its last closed timestamp pair is decoded again by the next
   window and appears once.
@@ -270,6 +273,16 @@ rules on every run:
   closing timestamp pair, and no prior context is used once less than 5 s
   of audio remains (both as in whisper.cpp; the short final window tended
   to repeat or continue the carried text).
+
+whisper.cpp's defaults, as used by whisper-rs, map to these run-ext fields
+(Rust `WhisperRunOptions`): `suppress_non_speech = false` (silence decodes
+as a tag such as `[BLANK_AUDIO]` instead of an invented "Thank you."),
+`best_of = 5`, `entropy_thold = 2.4`, `condition_on_prev_tokens = true`,
+and `no_speech_thold = TRANSCRIBE_WHISPER_THOLD_DISABLED`. whisper.cpp
+reads its no-speech probability from a stale logits row, so its gate
+effectively never fires; disabling ours matches that. whisper.cpp has no
+compression-ratio check (the entropy check replaces it); keeping ours
+changed no transcript in our comparison.
 
 What's not supported (consistent across the family): real-time
 streaming (whisper is not streaming-first; chunked 30-second windows

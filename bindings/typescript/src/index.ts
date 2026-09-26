@@ -573,6 +573,9 @@ const FAMILY: Record<string, FamilyReg> = {
       max_prev_context_tokens: o.maxPrevContextTokens,
       seed: o.seed,
       max_initial_timestamp: o.maxInitialTimestamp,
+      suppress_non_speech: o.suppressNonSpeech,
+      best_of: o.bestOf,
+      entropy_thold: o.entropyThold,
     }),
   },
   moonshine: {

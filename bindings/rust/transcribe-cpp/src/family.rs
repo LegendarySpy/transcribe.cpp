@@ -37,6 +37,13 @@ pub struct WhisperRunOptions {
     pub max_prev_context_tokens: Option<i32>,
     pub seed: Option<u32>,
     pub max_initial_timestamp: Option<f32>,
+    /// `Some(false)` keeps non-speech tokens (whisper.cpp's
+    /// `suppress_nst=false`): silence decodes as a tag like `[BLANK_AUDIO]`.
+    pub suppress_non_speech: Option<bool>,
+    /// Candidates sampled per temperature > 0 fallback tier (whisper.cpp: 5).
+    pub best_of: Option<i32>,
+    /// whisper.cpp's repetition fallback on the last 32 tokens (whisper.cpp: 2.4).
+    pub entropy_thold: Option<f32>,
 }
 
 /// Parakeet phrase boosting (run slot; also applied by `stream`). Phrases
@@ -263,6 +270,9 @@ impl RunExtension {
                 set(&mut ext.max_prev_context_tokens, o.max_prev_context_tokens);
                 set(&mut ext.seed, o.seed);
                 set(&mut ext.max_initial_timestamp, o.max_initial_timestamp);
+                set(&mut ext.suppress_non_speech, o.suppress_non_speech);
+                set(&mut ext.best_of, o.best_of);
+                set(&mut ext.entropy_thold, o.entropy_thold);
                 Ok(RunExtRaw::Whisper {
                     ext: Box::new(ext),
                     _prompt: prompt,

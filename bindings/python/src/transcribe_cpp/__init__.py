@@ -728,7 +728,10 @@ class WhisperRunOptions(FamilyExtension):
                  no_speech_thold: float | None = None,
                  max_prev_context_tokens: int | None = None,
                  seed: int | None = None,
-                 max_initial_timestamp: float | None = None):
+                 max_initial_timestamp: float | None = None,
+                 suppress_non_speech: bool | None = None,
+                 best_of: int | None = None,
+                 entropy_thold: float | None = None):
         self.initial_prompt = initial_prompt
         self.condition_on_prev_tokens = condition_on_prev_tokens
         self.temperature = temperature
@@ -739,6 +742,9 @@ class WhisperRunOptions(FamilyExtension):
         self.max_prev_context_tokens = max_prev_context_tokens
         self.seed = seed
         self.max_initial_timestamp = max_initial_timestamp
+        self.suppress_non_speech = suppress_non_speech
+        self.best_of = best_of
+        self.entropy_thold = entropy_thold
 
     def _apply(self, ext) -> None:
         if self.initial_prompt is not None:
@@ -761,6 +767,12 @@ class WhisperRunOptions(FamilyExtension):
             ext.seed = self.seed
         if self.max_initial_timestamp is not None:
             ext.max_initial_timestamp = self.max_initial_timestamp
+        if self.suppress_non_speech is not None:
+            ext.suppress_non_speech = self.suppress_non_speech
+        if self.best_of is not None:
+            ext.best_of = self.best_of
+        if self.entropy_thold is not None:
+            ext.entropy_thold = self.entropy_thold
 
 
 class MoonshineStreamingOptions(FamilyExtension):

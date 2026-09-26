@@ -231,6 +231,9 @@ export interface WhisperRunOptions {
   maxPrevContextTokens?: number;
   seed?: number;
   maxInitialTimestamp?: number;
+  suppressNonSpeech?: boolean;
+  bestOf?: number;
+  entropyThold?: number;
 }
 export interface MoonshineStreamingOptions {
   minDecodeIntervalMs?: number;
