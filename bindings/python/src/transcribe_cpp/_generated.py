@@ -13,7 +13,7 @@ import ctypes as _c
 # Stable digest of the ABI surface below (structs, enums, macros, layout,
 # prototypes). A native provider package echoes this back so the API
 # package can reject an ABI-mismatched provider before dlopen.
-PUBLIC_HEADER_HASH = "1fe2f06b3d5ff729"
+PUBLIC_HEADER_HASH = "64c6fc92bcd3f446"
 
 # === enum constants ===
 TRANSCRIBE_OK = 0
@@ -115,6 +115,7 @@ TRANSCRIBE_WHISPER_PROMPT_ALL_SEGMENTS = 1
 # === macro constants (integer object-like macros) ===
 TRANSCRIBE_EXT_KIND_MOONSHINE_STREAMING_STREAM = 1414746957
 TRANSCRIBE_EXT_KIND_PARAKEET_BUFFERED_STREAM = 1396853584
+TRANSCRIBE_EXT_KIND_PARAKEET_RUN = 1314016080
 TRANSCRIBE_EXT_KIND_PARAKEET_STREAM = 1414744912
 TRANSCRIBE_EXT_KIND_QWEN3_ASR_RUN = 1314019153
 TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE = 1447839315
@@ -159,6 +160,8 @@ class transcribe_parakeet_stream_ext(_c.Structure):
     pass
 class transcribe_parakeet_buffered_stream_ext(_c.Structure):
     pass
+class transcribe_parakeet_run_ext(_c.Structure):
+    pass
 class transcribe_qwen3_asr_run_ext(_c.Structure):
     pass
 class transcribe_sortformer_stream_ext(_c.Structure):
@@ -190,6 +193,7 @@ transcribe_speaker_segment._fields_ = [("struct_size", _c.c_uint64), ("t0_ms", _
 transcribe_moonshine_streaming_stream_ext._fields_ = [("ext", transcribe_ext), ("min_decode_interval_ms", _c.c_int32)]
 transcribe_parakeet_stream_ext._fields_ = [("ext", transcribe_ext), ("att_context_right", _c.c_int32)]
 transcribe_parakeet_buffered_stream_ext._fields_ = [("ext", transcribe_ext), ("left_ms", _c.c_int32), ("chunk_ms", _c.c_int32), ("right_ms", _c.c_int32)]
+transcribe_parakeet_run_ext._fields_ = [("ext", transcribe_ext), ("boost_phrases", _c.POINTER(_c.c_char_p)), ("n_boost_phrases", _c.c_int32), ("boost_score", _c.c_float)]
 transcribe_qwen3_asr_run_ext._fields_ = [("ext", transcribe_ext), ("context", _c.c_char_p)]
 transcribe_sortformer_stream_ext._fields_ = [("ext", transcribe_ext), ("preset", _c.c_int)]
 transcribe_sortformer_live_ext._fields_ = [("ext", transcribe_ext), ("preset", _c.c_int)]
@@ -237,6 +241,7 @@ STRUCT_LAYOUT = {
     'transcribe_moonshine_streaming_stream_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'min_decode_interval_ms': 16}},
     'transcribe_parakeet_stream_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'att_context_right': 16}},
     'transcribe_parakeet_buffered_stream_ext': {'size': 32, 'align': 8, 'offsets': {'ext': 0, 'left_ms': 16, 'chunk_ms': 20, 'right_ms': 24}},
+    'transcribe_parakeet_run_ext': {'size': 32, 'align': 8, 'offsets': {'ext': 0, 'boost_phrases': 16, 'n_boost_phrases': 24, 'boost_score': 28}},
     'transcribe_qwen3_asr_run_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'context': 16}},
     'transcribe_sortformer_stream_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'preset': 16}},
     'transcribe_sortformer_live_ext': {'size': 24, 'align': 8, 'offsets': {'ext': 0, 'preset': 16}},
@@ -360,6 +365,8 @@ def configure(lib):
     lib.transcribe_open.argtypes = [_c.c_char_p, _c.POINTER(transcribe_model_load_params), _c.POINTER(transcribe_session_params), _c.POINTER(_c.c_void_p)]
     lib.transcribe_parakeet_buffered_stream_ext_init.restype = None
     lib.transcribe_parakeet_buffered_stream_ext_init.argtypes = [_c.POINTER(transcribe_parakeet_buffered_stream_ext)]
+    lib.transcribe_parakeet_run_ext_init.restype = None
+    lib.transcribe_parakeet_run_ext_init.argtypes = [_c.POINTER(transcribe_parakeet_run_ext)]
     lib.transcribe_parakeet_stream_ext_init.restype = None
     lib.transcribe_parakeet_stream_ext_init.argtypes = [_c.POINTER(transcribe_parakeet_stream_ext)]
     lib.transcribe_print_timings.restype = None

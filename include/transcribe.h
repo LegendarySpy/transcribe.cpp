@@ -2097,13 +2097,17 @@ TRANSCRIBE_API transcribe_status transcribe_stream_get_text(const struct transcr
  *                                    state, out-of-range enum in
  *                                    run_params, or an extension whose
  *                                    kind is unknown to / not accepted
- *                                    by the loaded model on the
- *                                    TRANSCRIBE_EXT_SLOT_STREAM slot.
+ *                                    by the loaded model on its slot
+ *                                    (stream_params->family: STREAM;
+ *                                    run_params->family: RUN, applied to
+ *                                    the stream by families that honor
+ *                                    it, e.g. parakeet phrase boosting).
  *   TRANSCRIBE_ERR_BAD_STRUCT_SIZE   non-null run_params or stream_params
  *                                    has a struct_size below what this
  *                                    entry point requires (including
  *                                    struct_size == 0), or
- *                                    stream_params->family is too small
+ *                                    stream_params->family or
+ *                                    run_params->family is too small
  *                                    to contain a transcribe_ext header,
  *                                    or (for a family that implements the
  *                                    preflight, see below) a family
@@ -2134,7 +2138,7 @@ TRANSCRIBE_API transcribe_status transcribe_stream_get_text(const struct transcr
  *   1. Dispatcher preflight. Top-level argument checks run first:
  *      NULL session, ACTIVE-state rejection, struct_size failures,
  *      out-of-range run_params enums, unknown / unaccepted extension
- *      kind for the STREAM slot, TRANSLATE, granularity finer than the
+ *      kind for either slot, TRANSLATE, granularity finer than the
  *      model's max, and unsupported language. On failure the call
  *      returns without entering ACTIVE and WITHOUT clearing the
  *      previous result snapshot. Lifecycle state is untouched.
@@ -2294,14 +2298,15 @@ TRANSCRIBE_API transcribe_status transcribe_stream_last_status(const struct tran
  *                    written).
  *   INT_MIN          Hard error: model or text is NULL, the model's
  *                    tokenizer does not support encode for this
- *                    vocabulary (e.g. a SentencePiece family without
- *                    encode wired), or the vocab file is malformed.
+ *                    vocabulary (e.g. a SentencePiece vocab without
+ *                    scores), or the vocab file is malformed.
  *
  * Plumbed per family:
  *   - Whisper      (GPT-2 byte-level BPE)
  *   - Qwen3-ASR    (Qwen2 byte-level BPE)
- *   - Parakeet     (SentencePiece; currently returns INT_MIN)
- *   - Cohere ASR   (SentencePiece; currently returns INT_MIN)
+ *   - SentencePiece families (Parakeet, Cohere ASR, ...): a leading
+ *     word marker is added and each space maps to one; no NFKC, and
+ *     user-defined symbols are not prematched.
  */
 TRANSCRIBE_API int transcribe_tokenize(const struct transcribe_model * model,
                                        const char *                    text,

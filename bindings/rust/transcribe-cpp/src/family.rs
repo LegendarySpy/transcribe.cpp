@@ -11,7 +11,7 @@
 //! loaded model accepts a given kind on a slot; an unaccepted extension is
 //! rejected by `run`/`stream` with [`Error::InvalidArgument`](crate::Error).
 
-use std::ffi::CString;
+use std::ffi::{c_char, CString};
 
 use transcribe_cpp_sys as sys;
 
@@ -37,6 +37,15 @@ pub struct WhisperRunOptions {
     pub max_prev_context_tokens: Option<i32>,
     pub seed: Option<u32>,
     pub max_initial_timestamp: Option<f32>,
+}
+
+/// Parakeet phrase boosting (run slot; also applied by `stream`). Phrases
+/// are matched as typed (casing matters). `boost_score: None` keeps the
+/// library default (2.0); an empty list disables boosting.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParakeetRunOptions {
+    pub boost_phrases: Vec<String>,
+    pub boost_score: Option<f32>,
 }
 
 /// Moonshine-streaming stream-extension knobs (stream slot).
@@ -138,6 +147,7 @@ pub struct SortformerLiveOptions {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum RunExtension {
+    Parakeet(ParakeetRunOptions),
     Qwen3Asr(Qwen3AsrRunOptions),
     Whisper(WhisperRunOptions),
     Sortformer(SortformerStreamOptions),
@@ -159,6 +169,11 @@ pub enum StreamExtension {
 /// stays valid for the duration of the native call. Boxed for a stable address
 /// across moves of the holder.
 pub(crate) enum RunExtRaw {
+    Parakeet {
+        ext: Box<sys::transcribe_parakeet_run_ext>,
+        _phrases: Vec<CString>,
+        _ptrs: Vec<*const c_char>,
+    },
     Qwen3Asr {
         ext: Box<sys::transcribe_qwen3_asr_run_ext>,
         _context: Option<CString>,
@@ -174,6 +189,9 @@ impl RunExtRaw {
     pub(crate) fn ext_ptr(&self) -> *const sys::transcribe_ext {
         match self {
             // `ext` is field 0, so &ext == &the family struct.
+            RunExtRaw::Parakeet { ext, .. } => {
+                (&**ext) as *const sys::transcribe_parakeet_run_ext as *const sys::transcribe_ext
+            }
             RunExtRaw::Qwen3Asr { ext, .. } => {
                 (&**ext) as *const sys::transcribe_qwen3_asr_run_ext as *const sys::transcribe_ext
             }
@@ -190,6 +208,28 @@ impl RunExtRaw {
 impl RunExtension {
     pub(crate) fn materialize(&self) -> Result<RunExtRaw> {
         match self {
+            RunExtension::Parakeet(o) => {
+                let mut ext: sys::transcribe_parakeet_run_ext = unsafe { std::mem::zeroed() };
+                unsafe { sys::transcribe_parakeet_run_ext_init(&mut ext) };
+                let phrases = o
+                    .boost_phrases
+                    .iter()
+                    .map(|p| CString::new(p.as_str()))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                // The pointer array lives in the holder; moving a Vec keeps its
+                // heap buffer, so ext.boost_phrases stays valid.
+                let ptrs: Vec<*const c_char> = phrases.iter().map(|p| p.as_ptr()).collect();
+                if !ptrs.is_empty() {
+                    ext.boost_phrases = ptrs.as_ptr();
+                    ext.n_boost_phrases = i32::try_from(ptrs.len()).unwrap_or(i32::MAX);
+                }
+                set(&mut ext.boost_score, o.boost_score);
+                Ok(RunExtRaw::Parakeet {
+                    ext: Box::new(ext),
+                    _phrases: phrases,
+                    _ptrs: ptrs,
+                })
+            }
             RunExtension::Qwen3Asr(o) => {
                 let mut ext: sys::transcribe_qwen3_asr_run_ext = unsafe { std::mem::zeroed() };
                 unsafe { sys::transcribe_qwen3_asr_run_ext_init(&mut ext) };

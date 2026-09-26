@@ -1804,6 +1804,15 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
             return TRANSCRIBE_ERR_INVALID_ARG;
         }
     }
+    // The run-slot extension gets the same shape gate as transcribe_run.
+    if (run_params->family != nullptr) {
+        if (run_params->family->size < sizeof(struct transcribe_ext)) {
+            return TRANSCRIBE_ERR_BAD_STRUCT_SIZE;
+        }
+        if (!transcribe_model_accepts_ext_kind(session->model, TRANSCRIBE_EXT_SLOT_RUN, run_params->family->kind)) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+    }
 
     // Advisory warn for pnc/itn requests against models that don't
     // expose the corresponding runtime toggle. Emitted before
@@ -1839,10 +1848,10 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     // (parakeet re-reads .language on every feed), and the public contract
     // lets the caller free every params pointer once begin returns — so the
     // strings are copied into session storage here and the view repointed
-    // at it. `family` (the run-slot extension) is nulled in the view: no
-    // family reads it on the stream path today, and per the ext copy-out
-    // contract a retained pointer to it would dangle; a future family that
-    // wants a run-slot ext at stream begin must plumb it deliberately.
+    // at it. `family` (the run-slot extension) stays the caller's pointer
+    // and is valid for the stream_begin call only: a family that captures
+    // `*run_params` must null or copy it out (parakeet compiles its boost
+    // phrases at begin and nulls its copy).
     session->stream_language_owned        = run_params->language != nullptr ? run_params->language : "";
     session->stream_target_language_owned = run_params->target_language != nullptr ? run_params->target_language : "";
     // PREFIX copy, not struct assignment: the size gate above admits any
@@ -1859,7 +1868,6 @@ static transcribe_status transcribe_stream_begin_impl(struct transcribe_session 
     run_params_owned.language = run_params->language != nullptr ? session->stream_language_owned.c_str() : nullptr;
     run_params_owned.target_language =
         run_params->target_language != nullptr ? session->stream_target_language_owned.c_str() : nullptr;
-    run_params_owned.family = nullptr;
 
     const transcribe_status st = session->model->arch->stream_begin(session, &run_params_owned, stream_params);
     if (st != TRANSCRIBE_OK) {

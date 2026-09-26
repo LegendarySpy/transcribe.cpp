@@ -17,9 +17,10 @@
 //   - id <-> piece lookup; find() is O(1) via a hash built at load.
 //   - decode(): SentencePiece flavors substitute U+2581 ("▁") with ASCII
 //     space; "gpt2" inverts the byte-level mapping to recover UTF-8 bytes.
-//   - encode(): UTF-8 text -> token ids ("gpt2" only; others return
-//     NOT_IMPLEMENTED). Runs the pretokenizer, byte-level encodes each
-//     pretoken, then greedily applies BPE merges in rank order.
+//   - encode(): UTF-8 text -> token ids. "gpt2" runs the pretokenizer,
+//     byte-level encodes each pretoken, then greedily applies BPE merges
+//     in rank order. "unigram"/"bpe" run SentencePiece encoding over the
+//     piece scores (Viterbi / score-greedy merges).
 
 #pragma once
 
@@ -171,14 +172,22 @@ class Tokenizer {
     // render special tokens via direct id lookups and encode only
     // the plain-text fragments between them.
     //
-    // model == "unigram" / "bpe":
-    //   Currently returns TRANSCRIBE_ERR_NOT_IMPLEMENTED; no live
-    //   consumer needs it.
+    // model == "unigram" / "bpe" (SentencePiece, needs scores):
+    //   One U+2581 is prefixed and every whitespace byte becomes U+2581
+    //   (NeMo's add_dummy_prefix without remove_extra_whitespaces). No
+    //   NFKC, and user-defined symbols are not prematched. Unigram
+    //   takes the Viterbi path over piece scores; BPE repeatedly merges
+    //   the adjacent pair whose piece scores highest (leftmost on ties).
+    //   A character with no piece becomes byte-fallback pieces when the
+    //   vocab has them, else unk_id() (consecutive unknowns share one).
+    //   Only NORMAL / USER_DEFINED pieces are matched. A file labelled
+    //   "bpe" whose scores are not rank-ordered is encoded as unigram
+    //   (older converters labelled every SentencePiece model "bpe").
     //
     // Returns:
     //   TRANSCRIBE_OK                  on success, out_ids populated.
     //   TRANSCRIBE_ERR_NOT_IMPLEMENTED if the tokenizer model doesn't
-    //                                  support encoding yet.
+    //                                  support encoding.
     //   TRANSCRIBE_ERR_GGUF            if "gpt2" is loaded without
     //                                  merges (the encoder needs them).
     transcribe_status encode(const std::string & text, std::vector<int32_t> & out_ids) const;
@@ -211,6 +220,11 @@ class Tokenizer {
     void set_pretokenizer(const std::string & pre) { pre_ = pre; }
 
   private:
+    int               sp_piece_id(const char * data, size_t n) const;
+    bool              sp_append_unknown(const char * data, size_t n, std::vector<int32_t> & out_ids) const;
+    transcribe_status sp_encode_unigram(const std::string & s, std::vector<int32_t> & out_ids) const;
+    transcribe_status sp_encode_bpe(const std::string & s, std::vector<int32_t> & out_ids) const;
+
     // How decode() should reassemble token bytes. Set during load().
     //   SentencePiece    - U+2581 → ASCII space (unigram / bpe)
     //   Gpt2ByteUnicode  - invert GPT-2 byte-to-unicode per codepoint
@@ -231,6 +245,14 @@ class Tokenizer {
     std::vector<std::string> tokens_;
     std::vector<float>       scores_;      // optional, may be empty
     std::vector<int32_t>     token_type_;  // optional, may be empty
+
+    // SentencePiece encode state, set by load(): true when the pieces are
+    // unigram-scored (label "unigram", or a "bpe" label whose scores are
+    // not rank-ordered); the longest piece in bytes bounds the lattice.
+    bool   sp_unigram_       = false;
+    size_t sp_max_piece_len_ = 0;
+    float  sp_min_score_     = 0.0f;
+    bool   sp_byte_fallback_ = false;
 
     // O(1) piece -> id lookup built at load time. Duplicates are rare
     // (only from the byte-fallback vocab augmentation); we keep the

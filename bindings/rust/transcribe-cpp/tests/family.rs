@@ -1,5 +1,6 @@
 //! Per-family stream-extension happy-path tests (parakeet cache-aware,
-//! parakeet buffered, voxtral realtime, Nemotron-3 live diarization). Each
+//! parakeet buffered, voxtral realtime, Nemotron-3 live diarization), plus the
+//! parakeet phrase-boosting run extension on offline runs and streams. Each
 //! proves the extension end to end: the typed options materialize a
 //! kind-tagged struct, the model ACCEPTS the kind on its stream slot,
 //! `stream_begin` consumes it, and a short feed + finalize emits output. NOT
@@ -16,13 +17,14 @@
 mod common;
 
 use transcribe_cpp::sys::{
-    TRANSCRIBE_EXT_KIND_PARAKEET_BUFFERED_STREAM, TRANSCRIBE_EXT_KIND_PARAKEET_STREAM,
-    TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE, TRANSCRIBE_EXT_KIND_VOXTRAL_REALTIME_STREAM,
+    TRANSCRIBE_EXT_KIND_PARAKEET_BUFFERED_STREAM, TRANSCRIBE_EXT_KIND_PARAKEET_RUN,
+    TRANSCRIBE_EXT_KIND_PARAKEET_STREAM, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE,
+    TRANSCRIBE_EXT_KIND_VOXTRAL_REALTIME_STREAM,
 };
 use transcribe_cpp::{
-    ExtSlot, Model, ParakeetBufferedStreamOptions, ParakeetStreamOptions, RunExtension, RunOptions,
-    SortformerLiveOptions, SortformerPreset, SortformerStreamOptions, Stream, StreamExtension,
-    StreamOptions, VoxtralRealtimeStreamOptions,
+    Error, ExtSlot, Model, ParakeetBufferedStreamOptions, ParakeetRunOptions,
+    ParakeetStreamOptions, RunExtension, RunOptions, SortformerLiveOptions, SortformerPreset,
+    SortformerStreamOptions, Stream, StreamExtension, StreamOptions, VoxtralRealtimeStreamOptions,
 };
 
 /// Feed the first ~2 s of `pcm` in 100 ms chunks, finalize, and return
@@ -133,6 +135,57 @@ fn owned_stream_matches_borrowed_and_returns_session() {
         .into_stream(&RunOptions::default(), &bad)
         .unwrap_err();
     drop(session.into_stream(&RunOptions::default(), &opts).unwrap());
+}
+
+#[test]
+fn parakeet_boost_phrases_run_and_stream() {
+    let (Some(model_path), Some(pcm)) =
+        (common::smoke_parakeet_stream_model(), common::smoke_audio())
+    else {
+        eprintln!("skip parakeet_boost_phrases_run_and_stream: model/audio absent");
+        return;
+    };
+    let model = Model::load(&model_path).unwrap();
+    assert!(model.accepts_ext(ExtSlot::Run, TRANSCRIBE_EXT_KIND_PARAKEET_RUN));
+    let boost = |phrases: &[&str], score| RunOptions {
+        family: Some(RunExtension::Parakeet(ParakeetRunOptions {
+            boost_phrases: phrases.iter().map(|p| p.to_string()).collect(),
+            boost_score: score,
+        })),
+        ..Default::default()
+    };
+    let mut session = model.session().unwrap();
+    let plain = session.run(&pcm, &RunOptions::default()).unwrap().text;
+    // An empty list and a zero weight leave the transcript unchanged.
+    assert_eq!(session.run(&pcm, &boost(&[], None)).unwrap().text, plain);
+    assert_eq!(
+        session
+            .run(&pcm, &boost(&["Glimpse"], Some(0.0)))
+            .unwrap()
+            .text,
+        plain
+    );
+    assert!(!session
+        .run(&pcm, &boost(&["Glimpse", "Groq"], None))
+        .unwrap()
+        .text
+        .is_empty());
+    assert!(matches!(
+        session.run(&pcm, &boost(&["Glimpse"], Some(11.0))),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // The same extension applies to a stream begun with these run options.
+    let opts = StreamOptions {
+        family: Some(StreamExtension::ParakeetStream(ParakeetStreamOptions {
+            att_context_right: Some(-1),
+        })),
+        ..Default::default()
+    };
+    let mut stream = session.stream(&boost(&["Glimpse"], None), &opts).unwrap();
+    let (is_final, text) = short_feed_text(&mut stream, &pcm);
+    assert!(is_final);
+    assert!(!text.trim().is_empty(), "boosted stream produced no text");
 }
 
 #[test]

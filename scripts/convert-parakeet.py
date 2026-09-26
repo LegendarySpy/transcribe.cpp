@@ -49,7 +49,7 @@ transcribe::parakeet::read_parakeet_hparams):
   stt.variant          = profile["variant"]      (e.g. "tdt-0.6b-v2",
                                                  "tdt-0.6b-v3", "tdt-1.1b")
   stt.capability.lang_detect = true            (v3 only; absent otherwise)
-  tokenizer.ggml.model = "bpe"
+  tokenizer.ggml.model = "bpe" or "unigram"     (the SentencePiece model type)
   tokenizer.ggml.tokens / scores / token_type / *_token_id  (the standard set)
   stt.parakeet.encoder.{n_layers,d_model,n_heads,d_ff,conv_kernel,
                         subsampling_factor,subsampling_channels,
@@ -596,6 +596,13 @@ def extract_tokenizer(sp, blank_piece: str = "<blank>"):
     outside the SentencePiece vocab but inside the predictor's embed
     table (shape [vocab+1, hidden]).
     """
+    from sentencepiece import sentencepiece_model_pb2
+
+    # nemotron-3.5 is unigram; the runtime encoder needs the true type.
+    proto = sentencepiece_model_pb2.ModelProto()
+    proto.ParseFromString(sp.serialized_model_proto())
+    model = "unigram" if proto.trainer_spec.model_type == proto.trainer_spec.UNIGRAM else "bpe"
+
     vocab_size = sp.vocab_size()
 
     tokens: list[str] = []
@@ -630,6 +637,7 @@ def extract_tokenizer(sp, blank_piece: str = "<blank>"):
     blank_id = vocab_size
 
     return {
+        "model":    model,
         "tokens":   tokens,
         "scores":   scores,
         "types":    types,
@@ -1500,7 +1508,7 @@ def convert(model_spec: str, out_path: Path, repo_id: str | None = None) -> None
     writer.add_string("stt.parakeet.head_kind", head_kind)
 
     # ----- tokenizer.ggml.* -----
-    writer.add_string("tokenizer.ggml.model", "bpe")
+    writer.add_string("tokenizer.ggml.model", tok["model"])
     writer.add_array("tokenizer.ggml.tokens",     tok["tokens"])
     writer.add_array("tokenizer.ggml.scores",     tok["scores"])
     writer.add_array("tokenizer.ggml.token_type", tok["types"])

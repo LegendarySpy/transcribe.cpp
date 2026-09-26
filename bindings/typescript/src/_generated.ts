@@ -11,7 +11,7 @@
 // Stable digest of the ABI surface (structs, enums, macros, layout,
 // prototypes), computed by the Python oracle and pinned here so a header
 // ABI change turns this binding's drift check red for conscious review.
-export const PUBLIC_HEADER_HASH = "1fe2f06b3d5ff729";
+export const PUBLIC_HEADER_HASH = "64c6fc92bcd3f446";
 
 // === enum constants ===
 export const TRANSCRIBE_OK = 0;
@@ -113,6 +113,7 @@ export const TRANSCRIBE_WHISPER_PROMPT_ALL_SEGMENTS = 1;
 // === macro constants (integer object-like macros) ===
 export const TRANSCRIBE_EXT_KIND_MOONSHINE_STREAMING_STREAM = 1414746957;
 export const TRANSCRIBE_EXT_KIND_PARAKEET_BUFFERED_STREAM = 1396853584;
+export const TRANSCRIBE_EXT_KIND_PARAKEET_RUN = 1314016080;
 export const TRANSCRIBE_EXT_KIND_PARAKEET_STREAM = 1414744912;
 export const TRANSCRIBE_EXT_KIND_QWEN3_ASR_RUN = 1314019153;
 export const TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE = 1447839315;
@@ -140,6 +141,7 @@ export const STRUCT_LAYOUT: Record<string, StructLayout> = {
   'transcribe_moonshine_streaming_stream_ext': { size: 24, align: 8, offsets: {'ext': 0, 'min_decode_interval_ms': 16} },
   'transcribe_parakeet_stream_ext': { size: 24, align: 8, offsets: {'ext': 0, 'att_context_right': 16} },
   'transcribe_parakeet_buffered_stream_ext': { size: 32, align: 8, offsets: {'ext': 0, 'left_ms': 16, 'chunk_ms': 20, 'right_ms': 24} },
+  'transcribe_parakeet_run_ext': { size: 32, align: 8, offsets: {'ext': 0, 'boost_phrases': 16, 'n_boost_phrases': 24, 'boost_score': 28} },
   'transcribe_qwen3_asr_run_ext': { size: 24, align: 8, offsets: {'ext': 0, 'context': 16} },
   'transcribe_sortformer_stream_ext': { size: 24, align: 8, offsets: {'ext': 0, 'preset': 16} },
   'transcribe_sortformer_live_ext': { size: 24, align: 8, offsets: {'ext': 0, 'preset': 16} },
@@ -187,6 +189,7 @@ export function defineTypes(koffi: any): Record<string, any> {
   T['transcribe_moonshine_streaming_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], min_decode_interval_ms: 'int32_t' });
   T['transcribe_parakeet_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], att_context_right: 'int32_t' });
   T['transcribe_parakeet_buffered_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], left_ms: 'int32_t', chunk_ms: 'int32_t', right_ms: 'int32_t' });
+  T['transcribe_parakeet_run_ext'] = koffi.struct({ ext: T['transcribe_ext'], boost_phrases: 'void *', n_boost_phrases: 'int32_t', boost_score: 'float' });
   T['transcribe_qwen3_asr_run_ext'] = koffi.struct({ ext: T['transcribe_ext'], context: 'char *' });
   T['transcribe_sortformer_stream_ext'] = koffi.struct({ ext: T['transcribe_ext'], preset: 'int' });
   T['transcribe_sortformer_live_ext'] = koffi.struct({ ext: T['transcribe_ext'], preset: 'int' });
@@ -254,6 +257,7 @@ export const FUNCTION_SIGNATURES: Record<string, FnSig> = {
   'transcribe_n_words': { ret: 'int', args: ['const struct transcribe_session *'] },
   'transcribe_open': { ret: 'transcribe_status', args: ['const char *', 'const struct transcribe_model_load_params *', 'const struct transcribe_session_params *', 'struct transcribe_session **'] },
   'transcribe_parakeet_buffered_stream_ext_init': { ret: 'void', args: ['struct transcribe_parakeet_buffered_stream_ext *'] },
+  'transcribe_parakeet_run_ext_init': { ret: 'void', args: ['struct transcribe_parakeet_run_ext *'] },
   'transcribe_parakeet_stream_ext_init': { ret: 'void', args: ['struct transcribe_parakeet_stream_ext *'] },
   'transcribe_print_timings': { ret: 'void', args: ['const struct transcribe_session *'] },
   'transcribe_qwen3_asr_run_ext_init': { ret: 'void', args: ['struct transcribe_qwen3_asr_run_ext *'] },

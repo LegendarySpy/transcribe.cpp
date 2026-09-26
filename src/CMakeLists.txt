@@ -38,6 +38,7 @@ add_library(transcribe
     arch/parakeet/capabilities.cpp
     arch/parakeet/weights.cpp
     arch/parakeet/encoder.cpp
+    arch/parakeet/boost.cpp
     arch/parakeet/decoder.cpp
     arch/cohere/model.cpp
     arch/cohere/capabilities.cpp

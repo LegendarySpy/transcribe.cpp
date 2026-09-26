@@ -1404,6 +1404,70 @@ add_test(NAME transcribe_tokenizer_decode_only_unit
     COMMAND transcribe_tokenizer_decode_only_unit)
 
 # -----------------------------------------------------------------------------
+# SentencePiece encode() on toy vocabs
+# -----------------------------------------------------------------------------
+#
+# Builds tokenizer KVs in an in-memory gguf_context: BPE merge order,
+# unigram Viterbi, label-independent unigram detection, whitespace and
+# unknown-character handling. No fixtures.
+
+add_executable(transcribe_tokenizer_sentencepiece_unit
+    tokenizer_sentencepiece_unit.cpp)
+
+target_link_libraries(transcribe_tokenizer_sentencepiece_unit PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_tokenizer_sentencepiece_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_tokenizer_sentencepiece_unit)
+
+add_test(NAME transcribe_tokenizer_sentencepiece_unit
+    COMMAND transcribe_tokenizer_sentencepiece_unit)
+
+# -----------------------------------------------------------------------------
+# SentencePiece encode() parity on real Parakeet / Nemotron vocabularies
+# -----------------------------------------------------------------------------
+#
+# Reads only the tokenizer KVs of the GGUFs named by
+# TRANSCRIBE_PARAKEET_GGUF (v3), TRANSCRIBE_PARAKEET_UNIFIED_GGUF and
+# TRANSCRIBE_NEMOTRON35_GGUF and compares ids with
+# tests/fixtures/parakeet_sp_parity.inc (scripts/sp-tokenizer-parity-fixture.py).
+# All unset -> skip (77).
+
+add_executable(transcribe_parakeet_sp_parity
+    parakeet_sp_parity.cpp)
+
+target_link_libraries(transcribe_parakeet_sp_parity PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_parakeet_sp_parity PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR})
+
+transcribe_apply_warnings(transcribe_parakeet_sp_parity)
+
+add_test(NAME transcribe_parakeet_sp_parity
+    COMMAND transcribe_parakeet_sp_parity)
+set_tests_properties(transcribe_parakeet_sp_parity PROPERTIES
+    SKIP_RETURN_CODE 77)
+
+# -----------------------------------------------------------------------------
+# Parakeet phrase-boosting trie and decisions
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_parakeet_boost_unit
+    parakeet_boost_unit.cpp)
+
+target_link_libraries(transcribe_parakeet_boost_unit PRIVATE transcribe)
+
+target_include_directories(transcribe_parakeet_boost_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_parakeet_boost_unit)
+
+add_test(NAME transcribe_parakeet_boost_unit
+    COMMAND transcribe_parakeet_boost_unit)
+
+# -----------------------------------------------------------------------------
 # Whisper .bin synthesized suppression metadata
 # -----------------------------------------------------------------------------
 

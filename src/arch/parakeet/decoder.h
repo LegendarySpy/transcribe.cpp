@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include "boost.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe.h"
@@ -201,6 +202,39 @@ struct TdtToken {
     int   duration_frames = 0;
 };
 
+// One greedy decode position: predictor state, frame cursor, and the
+// tokens a fork branch holds back until it is resolved.
+struct GreedyCursor {
+    LstmState             state;
+    LstmState             next_state;
+    int                   last_token  = -1;
+    int                   step        = 0;
+    int                   new_symbols = 0;
+    bool                  dirty       = true;  // next_state needs a predictor step
+    std::vector<TdtToken> held;
+};
+
+// Boosted-decode state that outlives one decode call (streaming chunks).
+// A boost that changes the model's choice forks the decode: `plain` keeps
+// the model's token, `boosted` takes the swapped-in one, both run on the
+// same frames, and `boosted` survives only if it completes a phrase.
+struct BoostDecodeState {
+    int          node      = 0;  // trie state of the committed path
+    bool         fork_open = false;
+    GreedyCursor plain;
+    GreedyCursor boosted;
+    int          fork_node      = 0;
+    bool         fork_completed = false;
+    int          fork_tokens    = 0;
+    // Deletion check after a completed phrase: frames [guard_from,
+    // guard_until) and the words each branch started there;
+    // guard_until < 0 = not checking.
+    int          guard_from     = 0;
+    int          guard_until    = -1;
+    int          guard_plain    = 0;
+    int          guard_boosted  = 0;
+};
+
 // Run TDT greedy decode end-to-end against an encoder output buffer.
 //
 // Inputs:
@@ -211,6 +245,8 @@ struct TdtToken {
 //              ne=[d_enc, T_enc, 1, 1] read via tensor_get).
 //   T_enc    - number of encoder frames
 //   d_enc    - encoder d_model (must equal w.joint.d_enc)
+//   boost    - phrase-boosting trie, or nullptr / empty for plain greedy
+//              (the unboosted loop, unchanged)
 // Outputs:
 //   out_tokens - appended with one TdtToken per non-blank emission
 //
@@ -221,6 +257,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                                     int                        T_enc,
                                     int                        d_enc,
                                     int                        n_threads,
+                                    const BoostTrie *          boost,
                                     std::vector<TdtToken> &    out_tokens);
 
 // Run RNNT greedy decode end-to-end. Same predictor + joint code as TDT,
@@ -233,6 +270,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      int                        T_enc,
                                      int                        d_enc,
                                      int                        n_threads,
+                                     const BoostTrie *          boost,
                                      std::vector<TdtToken> &    out_tokens);
 
 // Streaming variant of RNN-T greedy decode. Consumes T_enc_new encoder
@@ -241,7 +279,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
 // state_io / last_token_io; frame_offset is the absolute encoder-frame
 // index of this chunk's first frame (so step_at_emit lands in
 // stream-wide coordinates). state_io must have been reset to a fresh
-// start-of-sequence state at stream_begin (last_token_io = -1).
+// start-of-sequence state at stream_begin (last_token_io = -1). With a
+// non-empty `boost` trie, boost_io carries the trie state and any open
+// fork across calls; a fork's tokens are appended only once it resolves.
 transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                const float *              enc_out,
                                                int                        T_enc_new,
@@ -250,7 +290,17 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                int &                      last_token_io,
                                                int                        frame_offset,
                                                int                        n_threads,
+                                               const BoostTrie *          boost,
+                                               BoostDecodeState &         boost_io,
                                                std::vector<TdtToken> &    out_tokens);
+
+// End of stream: resolve a fork decode_rnnt_greedy_streaming left open
+// (the boosted branch survives if it completed a phrase) and append its
+// tokens. No-op when no fork is open.
+void resolve_boost_fork(BoostDecodeState &      boost_io,
+                        LstmState &             state_io,
+                        int &                   last_token_io,
+                        std::vector<TdtToken> & out_tokens);
 
 // Run CTC greedy decode end-to-end. Per-frame: logits = W @ enc[t] + b,
 // argmax; collapse rule "drop adjacent duplicates, then drop blanks"

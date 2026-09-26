@@ -1466,9 +1466,9 @@ void test_begin_copies_param_strings_out() {
     const float pcm[160] = {};
     CHECK(transcribe_stream_feed(&session, pcm, 160, &up) == TRANSCRIBE_OK);
     CHECK(g_language_seen_at_feed == "en-US");
-    // The run-slot family ext pointer must not survive into the retained
-    // copy either: it is consumed during begin per its copy-out contract,
-    // and a stale pointer would dangle just like the strings.
+    // No run-slot ext was passed, so none is retained. One that is passed
+    // is valid for the begin call only; a family that keeps `*run_params`
+    // nulls its copy (parakeet does).
     CHECK(g_retained_rp.family == nullptr);
 
     transcribe_stream_reset(&session);

@@ -256,6 +256,11 @@ struct cli_args {
     bool itn_set           = false;
     bool keep_special_tags = false;  // --raw-tokens
 
+    // Parakeet phrase boosting. Ignored by other families and CTC heads.
+    std::vector<std::string> boost_phrases;       // --boost FILE (one phrase per line)
+    float                    boost_score = 2.0f;  // --boost-score F
+    bool                     boost_set   = false;
+
     // Canary family knobs. Ignored by non-Canary families.
     bool canary_pnc     = true;   // default: punctuation+caps on
     bool canary_pnc_set = false;  // --pnc / --no-pnc set this
@@ -330,6 +335,8 @@ void print_usage(const char * argv0) {
                  "  --temperature F       (whisper) tier-0 sampling temperature (default 0 = greedy)\n"
                  "  --condition-on-prev-tokens (whisper) carry prev-chunk tokens across chunks\n"
                  "  --prompt-condition T  (whisper) prompt placement: first|all (default: first)\n"
+                 "  --boost FILE          (parakeet) phrases to boost, one per line\n"
+                 "  --boost-score F       (parakeet) boost weight (default 2.0, 0 = off)\n"
                  "  --itn                 (sensevoice/funasr-nano) enable inverse text\n"
                  "                        normalization (sensevoice: on unless --no-itn)\n"
                  "  --no-itn              (sensevoice/funasr-nano) emit the upstream\n"
@@ -406,6 +413,29 @@ int list_devices_main() {
                     (double) d.memory_free / gib);
     }
     return EXIT_SUCCESS;
+}
+
+// Point rp.family at the parakeet phrase-boost extension when --boost /
+// --boost-score was given and the model accepts it. `ptrs` backs the
+// phrase array and must outlive the run / stream_begin call.
+void attach_parakeet_boost(const transcribe_model *             model,
+                           const cli_args &                     args,
+                           struct transcribe_parakeet_run_ext & px,
+                           std::vector<const char *> &          ptrs,
+                           struct transcribe_run_params &       rp) {
+    transcribe_parakeet_run_ext_init(&px);
+    if (!args.boost_set ||
+        !transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_RUN, TRANSCRIBE_EXT_KIND_PARAKEET_RUN)) {
+        return;
+    }
+    ptrs.clear();
+    for (const auto & p : args.boost_phrases) {
+        ptrs.push_back(p.c_str());
+    }
+    px.boost_phrases   = ptrs.data();
+    px.n_boost_phrases = static_cast<int32_t>(ptrs.size());
+    px.boost_score     = args.boost_score;
+    rp.family          = &px.ext;
 }
 
 bool parse_args(int argc, char ** argv, cli_args & out) {
@@ -582,6 +612,27 @@ bool parse_args(int argc, char ** argv, cli_args & out) {
             out.temperature     = static_cast<float>(std::atof(v));
             out.temperature_set = true;
             out.whisper_set     = true;
+        } else if (a == "--boost") {
+            const char * v = take_value(a.c_str());
+            if (!v) {
+                return false;
+            }
+            std::ifstream in(v);
+            if (!in) {
+                std::fprintf(stderr, "error: cannot read --boost file %s\n", v);
+                return false;
+            }
+            for (std::string line; std::getline(in, line);) {
+                out.boost_phrases.push_back(line);
+            }
+            out.boost_set = true;
+        } else if (a == "--boost-score") {
+            const char * v = take_value(a.c_str());
+            if (!v) {
+                return false;
+            }
+            out.boost_score = static_cast<float>(std::atof(v));
+            out.boost_set   = true;
         } else if (a == "--condition-on-prev-tokens") {
             out.condition_on_prev_tokens = true;
             out.whisper_set              = true;
@@ -891,6 +942,9 @@ int main(int argc, char ** argv) {
                 rp.family = &wx.ext;
             }
         }
+        struct transcribe_parakeet_run_ext px;
+        std::vector<const char *>          px_phrases;
+        attach_parakeet_boost(model, args, px, px_phrases, rp);
 
         if (args.keep_special_tags) {
             rp.keep_special_tags = true;
@@ -1323,6 +1377,9 @@ int main(int argc, char ** argv) {
                 rp.family = &wx.ext;
             }
         }
+        struct transcribe_parakeet_run_ext px;
+        std::vector<const char *>          px_phrases;
+        attach_parakeet_boost(model, args, px, px_phrases, rp);
 
         if (args.keep_special_tags) {
             rp.keep_special_tags = true;

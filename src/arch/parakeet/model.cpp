@@ -390,6 +390,7 @@ void reset_streaming_decoder_state(ParakeetSession * pc, const ParakeetModel * p
     pc->stream_dec_state.lstm_state.reset(n_layers, pred_hidden);
     pc->stream_dec_state.prev_token_id = -1;
     pc->stream_dec_state.frame_offset  = 0;
+    pc->stream_dec_state.boost         = BoostDecodeState{};
     pc->stream_dec_state.initialized   = true;
 }
 
@@ -733,6 +734,97 @@ static bool is_strippable_special(const transcribe::Tokenizer & tok, int id) {
     return tok.is_control(id) || is_lang_tag_piece(tok.token(id));
 }
 
+constexpr int32_t k_boost_max_phrases      = 1024;
+constexpr size_t  k_boost_max_phrase_bytes = 256;
+constexpr float   k_boost_max_score        = 10.0f;
+
+// Shape and value checks for the PARAKEET_RUN extension (NULL is fine).
+// Pure, so run_validate / stream_validate can reject before any state moves.
+static transcribe_status check_boost_ext(const transcribe_run_params * params) {
+    const transcribe_ext * ext = params != nullptr ? params->family : nullptr;
+    if (const transcribe_status st =
+            transcribe_ext_check(ext, TRANSCRIBE_EXT_KIND_PARAKEET_RUN, sizeof(struct transcribe_parakeet_run_ext));
+        st != TRANSCRIBE_OK || ext == nullptr) {
+        return st;
+    }
+    const auto * px = reinterpret_cast<const transcribe_parakeet_run_ext *>(ext);
+    if (px->n_boost_phrases < 0 || px->n_boost_phrases > k_boost_max_phrases ||
+        (px->n_boost_phrases > 0 && px->boost_phrases == nullptr) || !std::isfinite(px->boost_score) ||
+        px->boost_score < 0.0f || px->boost_score > k_boost_max_score) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    for (int32_t i = 0; i < px->n_boost_phrases; ++i) {
+        if (px->boost_phrases[i] == nullptr) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+    }
+    return TRANSCRIBE_OK;
+}
+
+// Compile the (validated) PARAKEET_RUN phrases into pc->boost; empty when
+// the extension is absent, has no usable phrase, or boost_score is 0.
+static void compile_boost(ParakeetSession * pc, const ParakeetModel * pm, const transcribe_run_params * params) {
+    pc->boost                  = BoostTrie{};
+    const transcribe_ext * ext = params != nullptr ? params->family : nullptr;
+    if (ext == nullptr || pm->host_decoder.head_kind == HostHeadKind::CTC) {
+        return;
+    }
+    const auto * px = reinterpret_cast<const transcribe_parakeet_run_ext *>(ext);
+    if (px->n_boost_phrases == 0 || px->boost_score <= 0.0f) {
+        return;
+    }
+
+    // Special: never swapped from or into (blank, unk, CONTROL pieces,
+    // language tags). Word: the piece opens a word (deletion check).
+    const transcribe::Tokenizer & tok   = pm->tok;
+    const int                     n_cls = pm->host_decoder.predictor.pred_vocab;
+    std::vector<uint8_t>          flags(static_cast<size_t>(n_cls), 0);
+    for (int id = 0; id < n_cls; ++id) {
+        const bool special = id == pm->host_decoder.blank_id || id == tok.unk_id() || is_strippable_special(tok, id);
+        const bool word    = tok.token(id).compare(0, 3, "\xE2\x96\x81") == 0;
+        flags[static_cast<size_t>(id)] = (special ? k_boost_token_special : 0) | (word ? k_boost_token_word : 0);
+    }
+
+    std::vector<std::vector<int32_t>> seqs;
+    std::vector<int32_t>              ids;
+    for (int32_t i = 0; i < px->n_boost_phrases; ++i) {
+        const char * phrase = px->boost_phrases[i];
+        if (strnlen(phrase, k_boost_max_phrase_bytes + 1) > k_boost_max_phrase_bytes) {
+            continue;
+        }
+        std::string text;
+        size_t      n_chars = 0;
+        for (const char * c = phrase; *c != '\0'; ++c) {
+            if (*c == ' ' || *c == '\t' || *c == '\n' || *c == '\r') {
+                if (!text.empty() && text.back() != ' ') {
+                    text.push_back(' ');
+                }
+                continue;
+            }
+            text.push_back(*c);
+            n_chars += (static_cast<unsigned char>(*c) & 0xC0) != 0x80;
+        }
+        if (!text.empty() && text.back() == ' ') {
+            text.pop_back();
+        }
+        // A phrase longer than the fork budget could never be accepted.
+        if (n_chars < 3 || tok.encode(text, ids) != TRANSCRIBE_OK || ids.empty() ||
+            ids.size() > static_cast<size_t>(k_boost_fork_tokens)) {
+            continue;
+        }
+        bool plain = true;
+        for (const int32_t id : ids) {
+            plain = plain && id >= 0 && id < n_cls && (flags[static_cast<size_t>(id)] & k_boost_token_special) == 0;
+        }
+        if (plain) {
+            seqs.push_back(ids);
+        }
+    }
+    build_boost_trie(seqs, std::move(flags), px->boost_score, pc->boost);
+    log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "parakeet boost: %zu of %d phrases, %zu trie nodes", seqs.size(),
+            px->n_boost_phrases, pc->boost.nodes.size());
+}
+
 // Collapse runs of ASCII spaces to one and trim both ends — cleans up the
 // double/edge spaces a stripped tag leaves behind. Shared by both builders.
 static void normalize_transcript_whitespace(std::string & s) {
@@ -798,15 +890,16 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
     }
 
     pc->raw_tokens.clear();
-    const int64_t t_dec_start = ggml_time_us();
+    const BoostTrie * boost       = pc->boost.empty() ? nullptr : &pc->boost;
+    const int64_t     t_dec_start = ggml_time_us();
     {
         transcribe_status st = TRANSCRIBE_OK;
         switch (pm->host_decoder.head_kind) {
             case HostHeadKind::TDT:
-                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
+                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, boost, pc->raw_tokens);
                 break;
             case HostHeadKind::RNNT:
-                st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
+                st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, boost, pc->raw_tokens);
                 break;
             case HostHeadKind::CTC:
                 st = decode_ctc_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
@@ -1438,6 +1531,7 @@ transcribe_status run(transcribe_session *          session,
     }
 
     pc->clear_result();
+    compile_boost(pc, pm, params);
 
     // Multitalker bundle: diarize=ON routes through the embedded-sortformer
     // orchestrator (per-speaker passes + merged speaker-tagged result).
@@ -1726,6 +1820,7 @@ transcribe_status run_batch(transcribe_session *          session,
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     transcribe::debug::init();
+    compile_boost(pc, pm, params);
 
     // Multitalker is a transcribe_run concern for now: batch keeps the
     // shipped single-speaker semantics even on a bundle model. Warn so a
@@ -2296,7 +2391,7 @@ transcribe_status emit_streaming_chunk(ParakeetSession * pc,
     if (const transcribe_status st = decode_rnnt_greedy_streaming(
             pm->host_decoder, pc->enc_host.data(), T_q_new, d_enc, pc->stream_dec_state.lstm_state,
             pc->stream_dec_state.prev_token_id, static_cast<int>(pc->stream_dec_state.frame_offset), pc->n_threads,
-            pc->raw_tokens);
+            pc->boost.empty() ? nullptr : &pc->boost, pc->stream_dec_state.boost, pc->raw_tokens);
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -2689,7 +2784,7 @@ transcribe_status emit_buffered_chunk(ParakeetSession * pc,
     if (const transcribe_status st = decode_rnnt_greedy_streaming(
             pm->host_decoder, enc_chunk, T_to_decode, d_enc, pc->stream_dec_state.lstm_state,
             pc->stream_dec_state.prev_token_id, static_cast<int>(pc->stream_dec_state.frame_offset), pc->n_threads,
-            pc->raw_tokens);
+            pc->boost.empty() ? nullptr : &pc->boost, pc->stream_dec_state.boost, pc->raw_tokens);
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -2863,13 +2958,16 @@ transcribe_status resolve_cache_aware_stream_geom(const ParakeetModel *         
 // Pre-flight: validate caller extension fields without mutating state.
 // Called by the dispatcher before clear_result, so a rejection leaves the
 // previous snapshot intact. stream_begin re-runs the same resolvers.
-transcribe_status stream_validate(const transcribe_session * session,
-                                  const transcribe_run_params * /*run_params*/,
+transcribe_status stream_validate(const transcribe_session *       session,
+                                  const transcribe_run_params *    run_params,
                                   const transcribe_stream_params * stream_params) {
     const auto * pc = static_cast<const ParakeetSession *>(session);
     const auto * pm = static_cast<const ParakeetModel *>(pc->model);
     if (pm == nullptr || pm->plan.scheduler_list.empty()) {
         return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    if (const transcribe_status st = check_boost_ext(run_params); st != TRANSCRIBE_OK) {
+        return st;
     }
 
     const bool is_chunked_limited =
@@ -2949,6 +3047,9 @@ transcribe_status stream_begin(transcribe_session *             session,
         pc->stream_pcm_buffer.clear();
         pc->raw_tokens.clear();
         pc->stream_run_params = *run_params;
+        // The run-slot ext is valid for this call only: compile it, keep no pointer.
+        compile_boost(pc, pm, run_params);
+        pc->stream_run_params.family = nullptr;
         reset_streaming_decoder_state(pc, pm);
         // frame_offset starts at 0, advanced per-chunk by T_to_decode.
         pc->stream_dec_state.frame_offset = 0;
@@ -2972,6 +3073,9 @@ transcribe_status stream_begin(transcribe_session *             session,
                              // clear_result doesn't touch it, so reset here
                              // or a back-to-back stream_begin carries tokens.
     pc->stream_run_params = *run_params;
+    // The run-slot ext is valid for this call only: compile it, keep no pointer.
+    compile_boost(pc, pm, run_params);
+    pc->stream_run_params.family = nullptr;
 
     // Multitalker is a transcribe_run concern for now: the incremental
     // streaming API keeps the shipped single-speaker semantics even on a
@@ -3286,6 +3390,8 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
                 return st;
             }
         }
+        resolve_boost_fork(pc->stream_dec_state.boost, pc->stream_dec_state.lstm_state,
+                           pc->stream_dec_state.prev_token_id, pc->raw_tokens);
         const bool tokens_changed = static_cast<int>(pc->raw_tokens.size()) != prev_n_tokens;
         if (tokens_changed || !pc->has_result) {
             rebuild_streaming_result_text(pc, pm);
@@ -3367,6 +3473,8 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
         }
     }
 
+    resolve_boost_fork(pc->stream_dec_state.boost, pc->stream_dec_state.lstm_state, pc->stream_dec_state.prev_token_id,
+                       pc->raw_tokens);
     const bool tokens_changed = static_cast<int>(pc->raw_tokens.size()) != prev_n_tokens;
     if (tokens_changed || !pc->has_result) {
         rebuild_streaming_result_text(pc, pm);
@@ -3395,17 +3503,21 @@ void stream_reset(transcribe_session * session) {
     pc->stream_audio_input_samples = 0;
 }
 
-// Kind+slot probe. No run-slot extensions (always false on _RUN). On
-// _STREAM: ChunkedLimited takes PARAKEET_STREAM, ChunkedLimitedWithRc
-// takes PARAKEET_BUFFERED_STREAM, offline variants neither.
+// Kind+slot probe. On _RUN: PARAKEET_RUN for TDT / RNN-T heads (phrase
+// boosting; no CTC). On _STREAM: ChunkedLimited takes PARAKEET_STREAM,
+// ChunkedLimitedWithRc takes PARAKEET_BUFFERED_STREAM, offline variants
+// neither.
 bool accepts_ext_kind(const transcribe_model * model, transcribe_ext_slot slot, uint32_t kind) {
     if (model == nullptr) {
         return false;
     }
+    const auto * pm = static_cast<const ParakeetModel *>(model);
+    if (slot == TRANSCRIBE_EXT_SLOT_RUN) {
+        return kind == TRANSCRIBE_EXT_KIND_PARAKEET_RUN && pm->host_decoder.head_kind != HostHeadKind::CTC;
+    }
     if (slot != TRANSCRIBE_EXT_SLOT_STREAM) {
         return false;
     }
-    const auto * pm = static_cast<const ParakeetModel *>(model);
     switch (pm->hparams.enc_att_context_style) {
         case ParakeetHParams::AttContextStyle::ChunkedLimited:
             return kind == TRANSCRIBE_EXT_KIND_PARAKEET_STREAM;
@@ -3415,6 +3527,10 @@ bool accepts_ext_kind(const transcribe_model * model, transcribe_ext_slot slot, 
             return false;
     }
     return false;
+}
+
+transcribe_status run_validate(const transcribe_session * /*session*/, const transcribe_run_params * params) {
+    return check_boost_ext(params);
 }
 
 }  // namespace
@@ -3433,6 +3549,7 @@ extern const Arch arch = {
     /* .stream_finalize  = */ stream_finalize,
     /* .stream_reset     = */ stream_reset,
     /* .accepts_ext_kind = */ accepts_ext_kind,
+    /* .run_validate     = */ run_validate,
 };
 
 }  // namespace transcribe::parakeet
@@ -3451,6 +3568,16 @@ extern "C" void transcribe_parakeet_stream_ext_init(struct transcribe_parakeet_s
     p->ext.size          = sizeof(*p);
     p->ext.kind          = TRANSCRIBE_EXT_KIND_PARAKEET_STREAM;
     p->att_context_right = -1;  // model default (max accuracy / max latency)
+}
+
+extern "C" void transcribe_parakeet_run_ext_init(struct transcribe_parakeet_run_ext * p) {
+    if (p == nullptr) {
+        return;
+    }
+    std::memset(p, 0, sizeof(*p));
+    p->ext.size    = sizeof(*p);
+    p->ext.kind    = TRANSCRIBE_EXT_KIND_PARAKEET_RUN;
+    p->boost_score = 2.0f;
 }
 
 extern "C" void transcribe_parakeet_buffered_stream_ext_init(struct transcribe_parakeet_buffered_stream_ext * p) {
