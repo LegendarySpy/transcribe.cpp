@@ -9,7 +9,9 @@
 //! run/batch/stream is refused with [`Error::Busy`].
 
 use std::ffi::CString;
+use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
+use std::ptr::NonNull;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -645,5 +647,122 @@ impl Stream<'_> {
     /// Whether the stream was ended by cancellation.
     pub fn was_aborted(&self) -> bool {
         self.session.was_aborted()
+    }
+}
+
+impl Session {
+    /// Begin a stream that takes ownership of this session, for callers that
+    /// keep a stream across calls (e.g. in a struct field) where a borrowed
+    /// [`Stream`] cannot live. Same semantics as [`Session::stream`]; get the
+    /// session back with [`OwnedStream::into_session`]. On error the session
+    /// is returned unchanged alongside the error.
+    pub fn into_stream(
+        self,
+        run: &RunOptions,
+        stream: &StreamOptions,
+    ) -> std::result::Result<OwnedStream, (Error, Session)> {
+        let session = NonNull::from(Box::leak(Box::new(self)));
+        // SAFETY: the leaked session is only reachable through the stream
+        // until `into_session` / `Drop` reclaims it, after the stream is gone.
+        match unsafe { &mut *session.as_ptr() }.stream(run, stream) {
+            Ok(stream) => Ok(OwnedStream {
+                stream: ManuallyDrop::new(stream),
+                session,
+            }),
+            // SAFETY: a failed `stream` call leaves no borrow behind.
+            Err(err) => Err((err, *unsafe { Box::from_raw(session.as_ptr()) })),
+        }
+    }
+}
+
+/// An active streaming run that owns its [`Session`]. Created by
+/// [`Session::into_stream`]; otherwise identical to [`Stream`]. Dropping it
+/// abandons the stream and frees the session.
+pub struct OwnedStream {
+    // Borrows `*session`, so it is always dropped first. Never handed out by
+    // `&mut`, which would let it be swapped away from its session.
+    stream: ManuallyDrop<Stream<'static>>,
+    // A raw pointer: a `Box` would assert unique access while `stream`
+    // borrows it.
+    session: NonNull<Session>,
+}
+
+// SAFETY: the stream is the only user of the heap session and both move
+// together; `Stream` and `Session` are each `Send`.
+unsafe impl Send for OwnedStream {}
+
+impl std::fmt::Debug for OwnedStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.stream.fmt(f)
+    }
+}
+
+impl Drop for OwnedStream {
+    fn drop(&mut self) {
+        // SAFETY: the stream is dropped before the session it borrows, and
+        // neither is used again.
+        unsafe {
+            ManuallyDrop::drop(&mut self.stream);
+            drop(Box::from_raw(self.session.as_ptr()));
+        }
+    }
+}
+
+impl OwnedStream {
+    /// See [`Stream::feed`].
+    pub fn feed(&mut self, pcm: &[f32]) -> Result<StreamUpdate> {
+        self.stream.feed(pcm)
+    }
+
+    /// See [`Stream::finalize`].
+    pub fn finalize(&mut self) -> Result<StreamUpdate> {
+        self.stream.finalize()
+    }
+
+    /// See [`Stream::reset`].
+    pub fn reset(&mut self) {
+        self.stream.reset()
+    }
+
+    /// See [`Stream::text`].
+    pub fn text(&self) -> StreamText {
+        self.stream.text()
+    }
+
+    /// See [`Stream::snapshot`].
+    pub fn snapshot(&self) -> Transcript {
+        self.stream.snapshot()
+    }
+
+    /// See [`Stream::state`].
+    pub fn state(&self) -> StreamState {
+        self.stream.state()
+    }
+
+    /// See [`Stream::revision`].
+    pub fn revision(&self) -> i32 {
+        self.stream.revision()
+    }
+
+    /// See [`Stream::last_status`].
+    pub fn last_status(&self) -> Option<Error> {
+        self.stream.last_status()
+    }
+
+    /// See [`Stream::was_aborted`].
+    pub fn was_aborted(&self) -> bool {
+        self.stream.was_aborted()
+    }
+
+    /// Abandon the stream (as dropping a [`Stream`] does) and return the
+    /// session, idle and reusable.
+    pub fn into_session(self) -> Session {
+        let mut this = ManuallyDrop::new(self);
+        // SAFETY: as in `Drop`, but the session is moved out instead of freed;
+        // `this` is never dropped.
+        unsafe {
+            ManuallyDrop::drop(&mut this.stream);
+            *Box::from_raw(this.session.as_ptr())
+        }
     }
 }

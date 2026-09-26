@@ -85,6 +85,57 @@ fn parakeet_cache_aware_streams_with_extension() {
 }
 
 #[test]
+fn owned_stream_matches_borrowed_and_returns_session() {
+    let (Some(model_path), Some(pcm)) =
+        (common::smoke_parakeet_stream_model(), common::smoke_audio())
+    else {
+        eprintln!("skip owned_stream_matches_borrowed_and_returns_session: model/audio absent");
+        return;
+    };
+    let mut session = Model::load(&model_path).unwrap().session().unwrap();
+    let opts = StreamOptions {
+        family: Some(StreamExtension::ParakeetStream(ParakeetStreamOptions {
+            att_context_right: Some(-1),
+        })),
+        ..Default::default()
+    };
+    let mut stream = session.stream(&RunOptions::default(), &opts).unwrap();
+    let (_, borrowed) = short_feed_text(&mut stream, &pcm);
+    drop(stream);
+
+    let mut owned = session.into_stream(&RunOptions::default(), &opts).unwrap();
+    for frame in pcm[..pcm.len().min(32_000)].chunks(1_600) {
+        owned.feed(frame).expect("feed");
+    }
+    assert!(owned.finalize().expect("finalize").is_final);
+    assert_eq!(owned.text().full, borrowed);
+
+    // The returned session is idle: it can run offline and stream again.
+    let mut session = owned.into_session();
+    assert!(!session
+        .run(&pcm[..16_000], &RunOptions::default())
+        .unwrap()
+        .text
+        .is_empty());
+    let session = session
+        .into_stream(&RunOptions::default(), &opts)
+        .unwrap()
+        .into_session();
+
+    // A rejected begin hands the session back.
+    let bad = StreamOptions {
+        family: Some(StreamExtension::ParakeetStream(ParakeetStreamOptions {
+            att_context_right: Some(5),
+        })),
+        ..Default::default()
+    };
+    let (_, session) = session
+        .into_stream(&RunOptions::default(), &bad)
+        .unwrap_err();
+    drop(session.into_stream(&RunOptions::default(), &opts).unwrap());
+}
+
+#[test]
 fn parakeet_buffered_streams_with_extension() {
     let (Some(model_path), Some(pcm)) = (
         common::smoke_parakeet_buffered_model(),
