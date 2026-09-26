@@ -181,6 +181,12 @@ the Q·K product of the alignment layers runs without flash attention;
 decoding, the encoder and every other attention stay on flash. The pass stops
 after the last alignment layer and costs about one decode step per window.
 
+Three refinements go beyond OpenAI: a word that starts without whitespace
+joins the previous one (`555-0142`, `2.5` stay whole); word edges drop the
+silence (and a neighbor's sliver before a pause) that DTW hands to a word,
+using 20 ms frame energy of the input; and speech that DTW gives to trailing
+punctuation (`Yes` ending where `.` starts) goes back to the word.
+
 Words are whitespace-trimmed with punctuation attached (`"country."`), carry
 absolute times in ms, and are clamped to the window's real audio, so a word
 never ends after the input does. Starts are non-decreasing and consecutive

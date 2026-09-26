@@ -263,11 +263,30 @@ void test_trim_silent_edges() {
     wa::trim_silent_edges(st, en, blip.data(), 40, 0.0);
     CHECK(near(st[0], 0.26, 1e-9) && near(en[0], 0.42, 1e-9));
 
+    // extend_to continues an end that sits in speech, never across silence.
+    st                      = { 1.2, 1.0 };
+    en                      = { 1.3, 1.1 };
+    std::vector<double> ext = { 1.9, 1.5 };
+    wa::trim_silent_edges(st, en, db.data(), 30, 1.0, &ext);
+    CHECK(near(en[0], 1.4, 1e-9));
+    CHECK(near(en[1], 1.1, 1e-9));  // ends in silence: no extension
+
     // Out-of-window times and NaN never index out of range.
     st = { -5.0, std::numeric_limits<double>::quiet_NaN(), 99.0 };
     en = { 50.0, 1.2, 100.0 };
     wa::trim_silent_edges(st, en, db.data(), 30, 1.0);
     CHECK(near(st[0], 1.2, 1e-9) && near(en[0], 1.4, 1e-9));
+}
+
+void test_punct_end() {
+    const WordSpec spec[] = {
+        { " Yes", 0.0, 0.3 },
+        { ".",    0.3, 0.5 }
+    };
+    std::vector<wa::Word> w = make_words(spec, 2);
+    wa::merge_punctuations(w);
+    CHECK(w[0].text == " Yes." && near(w[0].end, 0.3, 1e-12) && near(w[0].punct_end, 0.5, 1e-12));
+    CHECK(w[1].text.empty());
 }
 
 void test_segment_heuristics() {
@@ -548,6 +567,7 @@ int main() {
     test_words_heuristics();
     test_segment_heuristics();
     test_join_unspaced();
+    test_punct_end();
     test_trim_silent_edges();
     test_split_words();
     test_heads();

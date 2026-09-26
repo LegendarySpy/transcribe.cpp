@@ -53,6 +53,7 @@ struct Word {
     int         n_tokens    = 0;
     double      start       = 0.0;
     double      end         = 0.0;
+    double      punct_end   = -1.0;  // end of absorbed appended punctuation, or -1
 };
 
 // Per-window segment: decoded times plus how many text tokens it owns (in
@@ -82,6 +83,8 @@ struct RunState {
 // Reusable buffers so windows do not reallocate.
 struct Scratch {
     std::vector<float>  weights;
+    std::vector<double> col_mean;
+    std::vector<double> col_var;
     std::vector<float>  row;
     std::vector<float>  matrix;
     std::vector<float>  cost;
@@ -140,6 +143,8 @@ bool is_no_space_language(const std::string & code);
 // sets max_duration (seconds).
 double apply_duration_heuristics(std::vector<Word> & words, double & max_duration);
 
+// OpenAI merge_punctuations. A word that absorbs appended punctuation keeps
+// its own times (as OpenAI) and records the punctuation's end in punct_end.
 void merge_punctuations(std::vector<Word> & words);
 
 // DEVIATION from OpenAI: after merge_punctuations, a word that does not start
@@ -155,11 +160,14 @@ void join_unspaced_words(std::vector<Word> & words);
 // >= 10), never the last speech run. Silent = below floor + 0.3 * (peak -
 // floor) of the window (10th / 99th percentile); windows with under 12 dB of
 // range are left alone. Times are absolute seconds; frame 0 is at offset_s.
-void trim_silent_edges(std::vector<double> & starts,
-                       std::vector<double> & ends,
-                       const float *         frame_db,
-                       int                   n_frames,
-                       double                offset_s);
+// With extend_to, a word whose end sits in speech continues through speech
+// frames up to extend_to[i] (never across a silent frame).
+void trim_silent_edges(std::vector<double> &       starts,
+                       std::vector<double> &       ends,
+                       const float *               frame_db,
+                       int                         n_frames,
+                       double                      offset_s,
+                       const std::vector<double> * extend_to = nullptr);
 
 // OpenAI add_word_timestamps segment rules for one segment's words (absolute
 // seconds): pause truncation of the first words, then prefer the segment

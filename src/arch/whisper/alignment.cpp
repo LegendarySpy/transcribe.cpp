@@ -230,6 +230,65 @@ size_t utf8_codepoints(std::string_view s) {
     return n;
 }
 
+// Median of 7 by a sorting network (16 compare-exchanges). NaN cannot reach
+// here (inputs are validated).
+float median7(float * v) {
+    auto cx = [&](int a, int b) {
+        const float lo = std::min(v[a], v[b]);
+        const float hi = std::max(v[a], v[b]);
+        v[a]           = lo;
+        v[b]           = hi;
+    };
+    cx(0, 6);
+    cx(2, 3);
+    cx(4, 5);
+    cx(0, 2);
+    cx(1, 4);
+    cx(3, 6);
+    cx(0, 1);
+    cx(2, 5);
+    cx(3, 4);
+    cx(1, 2);
+    cx(4, 6);
+    cx(2, 3);
+    cx(4, 5);
+    cx(1, 2);
+    cx(3, 4);
+    cx(5, 6);
+    return v[3];
+}
+
+// Same network over out[t] = median(in[t-3 .. t+3]) for t in [t0, t1), on
+// locals so the loop vectorizes.
+void median7_interior(const float * in, float * out, int t0, int t1) {
+    for (int t = t0; t < t1; ++t) {
+        float v0 = in[t - 3], v1 = in[t - 2], v2 = in[t - 1], v3 = in[t], v4 = in[t + 1], v5 = in[t + 2],
+              v6 = in[t + 3];
+        auto  cx = [](float & a, float & b) {
+            const float lo = std::min(a, b);
+            b              = std::max(a, b);
+            a              = lo;
+        };
+        cx(v0, v6);
+        cx(v2, v3);
+        cx(v4, v5);
+        cx(v0, v2);
+        cx(v1, v4);
+        cx(v3, v6);
+        cx(v0, v1);
+        cx(v2, v5);
+        cx(v3, v4);
+        cx(v1, v2);
+        cx(v4, v6);
+        cx(v2, v3);
+        cx(v4, v5);
+        cx(v1, v2);
+        cx(v3, v4);
+        cx(v5, v6);
+        out[t] = v3;
+    }
+}
+
 int reflect_index(int k, int T) {
     for (int guard = 0; guard < 4; ++guard) {
         if (k < 0) {
@@ -272,20 +331,15 @@ void median_filter_7(const float * in, float * out, int T) {
     }
     float w[2 * k_medfilt_pad + 1];
     for (int t = 0; t < T; ++t) {
+        if (t == k_medfilt_pad && T > 2 * k_medfilt_pad) {
+            median7_interior(in, out, k_medfilt_pad, T - k_medfilt_pad);
+            t = T - k_medfilt_pad - 1;
+            continue;
+        }
         for (int o = -k_medfilt_pad; o <= k_medfilt_pad; ++o) {
             w[o + k_medfilt_pad] = in[reflect_index(t + o, T)];
         }
-        // Insertion sort of 7; NaN cannot reach here (inputs are validated).
-        for (int i = 1; i < 2 * k_medfilt_pad + 1; ++i) {
-            const float v = w[i];
-            int         j = i - 1;
-            while (j >= 0 && w[j] > v) {
-                w[j + 1] = w[j];
-                --j;
-            }
-            w[j + 1] = v;
-        }
-        out[t] = w[k_medfilt_pad];
+        out[t] = median7(w);
     }
 }
 
@@ -330,23 +384,36 @@ bool alignment_matrix(const WindowInput & in, Scratch & s, std::vector<float> & 
 
     // std/mean over rows (unbiased=False). DEVIATION: a zero-variance column
     // becomes 0 instead of NaN.
+    s.col_mean.resize(static_cast<size_t>(T));
+    s.col_var.resize(static_cast<size_t>(T));
     for (int h = 0; h < H; ++h) {
         float * base = s.weights.data() + static_cast<size_t>(h) * plane;
+        std::fill(s.col_mean.begin(), s.col_mean.end(), 0.0);
+        std::fill(s.col_var.begin(), s.col_var.end(), 0.0);
+        for (int r = 0; r < R; ++r) {
+            const float * row = base + static_cast<size_t>(r) * T;
+            for (int t = 0; t < T; ++t) {
+                s.col_mean[t] += row[t];
+            }
+        }
         for (int t = 0; t < T; ++t) {
-            double mean = 0.0;
-            for (int r = 0; r < R; ++r) {
-                mean += base[static_cast<size_t>(r) * T + t];
+            s.col_mean[t] /= R;
+        }
+        for (int r = 0; r < R; ++r) {
+            const float * row = base + static_cast<size_t>(r) * T;
+            for (int t = 0; t < T; ++t) {
+                const double d = row[t] - s.col_mean[t];
+                s.col_var[t] += d * d;
             }
-            mean /= R;
-            double var = 0.0;
-            for (int r = 0; r < R; ++r) {
-                const double d = base[static_cast<size_t>(r) * T + t] - mean;
-                var += d * d;
-            }
-            const double sd = std::sqrt(var / R);
-            for (int r = 0; r < R; ++r) {
-                float & v = base[static_cast<size_t>(r) * T + t];
-                v         = sd < 1e-12 ? 0.0f : static_cast<float>((v - mean) / sd);
+        }
+        for (int t = 0; t < T; ++t) {
+            s.col_var[t] = std::sqrt(s.col_var[t] / R);  // now the std
+        }
+        for (int r = 0; r < R; ++r) {
+            float * row = base + static_cast<size_t>(r) * T;
+            for (int t = 0; t < T; ++t) {
+                const double sd = s.col_var[t];
+                row[t]          = sd < 1e-12 ? 0.0f : static_cast<float>((row[t] - s.col_mean[t]) / sd);
             }
         }
     }
@@ -560,6 +627,9 @@ void merge_punctuations(std::vector<Word> & words) {
             if (prev.n_tokens == 0) {
                 prev.first_token = next.first_token;
             }
+            if (next.n_tokens > 0) {
+                prev.punct_end = std::max({ prev.punct_end, next.end, next.punct_end });
+            }
             prev.n_tokens += next.n_tokens;
             next.text.clear();
             next.n_tokens = 0;
@@ -581,7 +651,8 @@ void join_unspaced_words(std::vector<Word> & words) {
             Word & p = words[static_cast<size_t>(prev)];
             p.text += w.text;
             p.n_tokens += w.n_tokens;
-            p.end = std::max(p.end, w.end);
+            p.end       = std::max(p.end, w.end);
+            p.punct_end = std::max(p.punct_end, w.punct_end);
             w.text.clear();
             w.n_tokens = 0;
             continue;
@@ -590,11 +661,12 @@ void join_unspaced_words(std::vector<Word> & words) {
     }
 }
 
-void trim_silent_edges(std::vector<double> & starts,
-                       std::vector<double> & ends,
-                       const float *         frame_db,
-                       int                   n_frames,
-                       double                offset_s) {
+void trim_silent_edges(std::vector<double> &       starts,
+                       std::vector<double> &       ends,
+                       const float *               frame_db,
+                       int                         n_frames,
+                       double                      offset_s,
+                       const std::vector<double> * extend_to) {
     constexpr float k_min_range  = 12.0f;
     // (speech frames at most, then silent frames at least): an edge blip
     // this short before a pause this long belongs to the neighbor word.
@@ -693,6 +765,20 @@ void trim_silent_edges(std::vector<double> & starts,
         }
         if (runs[hi - 1].end < b) {
             ends[i] = offset_s + runs[hi - 1].end * k_seconds_per_frame;
+        }
+        // Continue the end through speech frames only, up to extend_to.
+        if (extend_to != nullptr && i < extend_to->size() && (*extend_to)[i] > ends[i]) {
+            const double fe = std::round(((*extend_to)[i] - offset_s) / k_seconds_per_frame);
+            if (std::isfinite(fe)) {
+                const int g = static_cast<int>(std::clamp(fe, 0.0, static_cast<double>(n_frames)));
+                int       f = runs[hi - 1].end;
+                if (f == b) {
+                    while (f < g && frame_db[f] > thr) {
+                        ++f;
+                    }
+                    ends[i] = std::max(ends[i], offset_s + f * k_seconds_per_frame);
+                }
+            }
         }
     }
 }
@@ -852,7 +938,17 @@ bool compute_window_words(const WindowInput &    in,
             double seg_start = static_cast<double>(sg.t0_ms) / 1000.0;
             double seg_end   = static_cast<double>(sg.t1_ms) / 1000.0;
             apply_segment_heuristics(starts, ends, seg_start, seg_end, median_duration, max_duration, st.last_speech_s);
-            trim_silent_edges(starts, ends, in.frame_db, in.n_frames, offset_s);
+            // DEVIATION: speech OpenAI leaves to appended punctuation ("Yes"
+            // ends where "." starts) goes back to the word.
+            std::vector<double> extend_to(ws_k.size(), -1.0);
+            for (size_t i = 0; i < ws_k.size(); ++i) {
+                const double pe = words[ws_k[i].word].punct_end;
+                if (pe >= 0.0) {
+                    extend_to[i] = offset_s + pe;
+                }
+            }
+            trim_silent_edges(starts, ends, in.frame_db, in.n_frames, offset_s, &extend_to);
+            seg_end = std::max(seg_end, ends.back());
             for (size_t i = 0; i < ws_k.size(); ++i) {
                 t0s[ws_k[i].word] = starts[i];
                 t1s[ws_k[i].word] = ends[i];
