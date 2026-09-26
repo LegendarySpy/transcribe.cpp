@@ -18,7 +18,7 @@
     "transcribe": {"supported":true,"verified":false},
     "translate": {"supported":false},
     "lang_detect": {"supported":false},
-    "timestamps": {"supported":true,"granularities":["segment"],"verified":false},
+    "timestamps": {"supported":true,"granularities":["word"],"verified":false},
     "streaming": {"supported":false},
     "diarize": {"supported":false},
     "batching": {"supported":true,"verified":false}

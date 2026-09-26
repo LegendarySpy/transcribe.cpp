@@ -579,6 +579,7 @@ transcribe_status load_from_bin(const char *                                path
 
     // ---- Capabilities + language list ----
     apply_caps_and_languages(*m, bm);
+    resolve_alignment_heads(*m);
 
     // ---- ctx_meta + tensor catalog ----
     // Sized like the GGUF path: roughly n_tensors * tensor_overhead,

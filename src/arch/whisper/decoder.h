@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "alignment.h"
 #include "ggml.h"
 
 #include <vector>
@@ -112,6 +113,33 @@ DecoderBuild build_decoder_graph_kv(ggml_context *         compute_ctx,
                                     int                    kv_pad           = 1,
                                     bool                   skip_log_softmax = false,
                                     bool                   use_flash        = true);
+
+// Teacher-forced alignment pass for word timestamps. Runs decoder layers
+// [0, heads.back().layer] over n_tokens rows (n_past = 0, self K/V written at
+// [0, n_tokens)), with flash attention everywhere, and additionally computes
+// raw Q.K^T (unscaled) of the cross-attention in the alignment layers with a
+// plain mul_mat. qk_out[i] is heads[i] as [T_audio, n_tokens] f32, real
+// frames only. Stops after the last alignment layer (no final LN, no head).
+struct AlignBuild {
+    ggml_tensor *              token_ids_in   = nullptr;  // i32 [n_tokens]
+    ggml_tensor *              pos_ids_in     = nullptr;  // i32 [n_tokens]
+    ggml_tensor *              causal_mask_in = nullptr;  // f32 [n_kv, n_tokens]
+    ggml_tensor *              cross_mask_in  = nullptr;  // f32 [T_enc_pad, n_tokens], may be null
+    std::vector<ggml_tensor *> qk_out;
+    ggml_cgraph *              graph = nullptr;
+};
+
+// heads must be sorted by (layer, head) and in range; 1 <= T_audio <= T_enc.
+AlignBuild build_alignment_graph(ggml_context *                 compute_ctx,
+                                 const WhisperWeights &         weights,
+                                 const WhisperHParams &         hp,
+                                 WhisperKvCache &               kv_cache,
+                                 int                            n_tokens,
+                                 int                            T_enc,
+                                 int                            T_audio,
+                                 int                            kv_pad,
+                                 const std::vector<AlignHead> & heads,
+                                 bool                           use_flash);
 
 // Static-topology single-token decoder graph. Built once per tier
 // after the prompt pass and reused for every step in the tier's

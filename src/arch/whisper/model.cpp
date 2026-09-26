@@ -348,6 +348,11 @@ void print_whisper_perf(const WhisperPerf & p) {
             "compute=%6.1f  tget=%6.1f  cpu=%6.1f",
             avg_us(p.step_build), avg_us(p.step_alloc), avg_us(p.step_compute), avg_us(p.step_tensor_get),
             avg_us(p.step_cpu));
+    if (p.align_compute.count > 0 || p.align_host.count > 0) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+                "[whisper-perf] align  windows=%d  graph=%7.2f ms  compute=%7.2f  host=%7.2f", p.align_host.count,
+                ms(p.align_graph.total_us), ms(p.align_compute.total_us), ms(p.align_host.total_us));
+    }
 
     // CPU sub-section breakdown — opt-in via TRANSCRIBE_PERF_DEBUG values
     // that contain "cpu" or "all". Keeps the default profile output
@@ -503,6 +508,7 @@ transcribe_status whisper_load(Loader &                             loader,
     // Capabilities: apply family invariants, then let the GGUF KV
     // override, then install the language list from general.languages.
     apply_family_invariants(*m);
+    resolve_alignment_heads(*m);
     m->caps.n_languages = 0;
     m->caps.languages   = nullptr;
 
@@ -1095,6 +1101,8 @@ struct WhisperSegmentResult {
     std::vector<transcribe_session::SegmentEntry> segments;
     std::vector<std::vector<int32_t>>             prev_chunk_segments;
     int                                           segment_offset_frames = 0;
+    // [begin, end) into generated_ids for each entry of `segments`.
+    std::vector<std::pair<int, int>>              segment_token_ranges;
 };
 
 // Port of HF generation_whisper.py:_retrieve_segment, shared by serial +
@@ -1197,6 +1205,7 @@ WhisperSegmentResult whisper_retrieve_segment(const std::vector<int32_t> &  gene
                 seg.text = decode_range(last_slice, current_slice);
                 if (!seg.text.empty()) {
                     out.segments.push_back(std::move(seg));
+                    out.segment_token_ranges.emplace_back(last_slice, current_slice);
                 }
             }
             out.prev_chunk_segments.emplace_back(generated_ids.begin() + last_slice,
@@ -1225,6 +1234,7 @@ WhisperSegmentResult whisper_retrieve_segment(const std::vector<int32_t> &  gene
             seg.text  = decode_range(0, gn);
             if (!seg.text.empty()) {
                 out.segments.push_back(std::move(seg));
+                out.segment_token_ranges.emplace_back(0, gn);
             }
         }
         if (gn > 0) {
@@ -1264,6 +1274,185 @@ std::string whisper_decode_raw(const transcribe::Tokenizer & tok,
     }
     flush();
     return out;
+}
+
+// Word timestamps for one window: teacher-forced alignment pass over
+// [sot, (lang, task), notimestamps, text..., eot] with the window's final
+// text tokens, then the host pipeline in alignment.cpp. Any graph failure
+// hands a null QK to the host code, which falls back to proportional timing.
+struct AlignWindowArgs {
+    int32_t       lang_token      = -1;
+    int32_t       task_token      = -1;
+    int           eos_id          = 0;
+    int           T_enc           = 0;
+    int           align_frames    = 0;  // real mel frames in this window
+    int64_t       time_offset_ms  = 0;
+    bool          is_multilingual = true;
+    // Run PCM, for the per-frame energy used to trim silent word edges.
+    const float * pcm             = nullptr;
+    int           n_samples       = 0;
+    int           first_sample    = 0;  // sample index of this window's frame 0
+};
+
+void whisper_align_window(WhisperSession *              cc,
+                          const WhisperModel *          cm,
+                          const WhisperSegmentResult &  seg_res,
+                          const std::vector<int32_t> &  generated_ids,
+                          const AlignWindowArgs &       a,
+                          align::RunState &             st,
+                          std::vector<align::Segment> & segs,
+                          std::vector<align::OutWord> & out) {
+    const int            gn = static_cast<int>(generated_ids.size());
+    std::vector<int32_t> text_ids;
+    segs.assign(seg_res.segments.size(), align::Segment{});
+    for (size_t k = 0; k < seg_res.segments.size(); ++k) {
+        segs[k].t0_ms = seg_res.segments[k].t0_ms;
+        segs[k].t1_ms = seg_res.segments[k].t1_ms;
+        if (k >= seg_res.segment_token_ranges.size()) {
+            continue;
+        }
+        const auto [b, e] = seg_res.segment_token_ranges[k];
+        for (int i = std::max(0, b); i < std::min(e, gn); ++i) {
+            if (generated_ids[i] >= 0 && generated_ids[i] < a.eos_id) {
+                text_ids.push_back(generated_ids[i]);
+                segs[k].n_text += 1;
+            }
+        }
+    }
+    out.clear();
+    if (text_ids.empty()) {
+        return;
+    }
+
+    std::vector<int32_t> align_ids;
+    align_ids.push_back(cm->hparams.decoder_start_token_id);
+    if (a.is_multilingual) {
+        align_ids.push_back(a.lang_token);
+        align_ids.push_back(a.task_token);
+    }
+    const int sot_len = static_cast<int>(align_ids.size());
+    align_ids.push_back(cm->hparams.no_timestamps_token_id);
+    align_ids.insert(align_ids.end(), text_ids.begin(), text_ids.end());
+    align_ids.push_back(a.eos_id);
+    const int n_rows  = static_cast<int>(align_ids.size());
+    const int T_audio = std::min(a.align_frames / 2, a.T_enc);
+
+    bool space_split = true;
+    for (size_t i = 0; a.is_multilingual && i < cm->lang_token_ids.size() && i < cm->lang_codes.size(); ++i) {
+        if (cm->lang_token_ids[i] == a.lang_token) {
+            space_split = !align::is_no_space_language(cm->lang_codes[i]);
+            break;
+        }
+    }
+
+    align::WindowInput in;
+    in.n_heads     = static_cast<int>(cm->align_heads.size());
+    in.n_rows      = n_rows;
+    in.n_frames    = T_audio;
+    in.sot_len     = sot_len;
+    in.qk_scale    = 1.0f / std::sqrt(static_cast<float>(cm->hparams.dec_head_dim()));
+    in.space_split = space_split;
+
+    // 20 ms frame energy (dB) over the window's real audio.
+    std::vector<float> frame_db;
+    if (a.pcm != nullptr && T_audio > 0) {
+        frame_db.resize(static_cast<size_t>(T_audio));
+        for (int j = 0; j < T_audio; ++j) {
+            const int64_t b0  = static_cast<int64_t>(a.first_sample) + static_cast<int64_t>(j) * 320;
+            const int64_t b1  = std::min<int64_t>(b0 + 320, a.n_samples);
+            double        acc = 0.0;
+            for (int64_t k = b0; k < b1; ++k) {
+                acc += static_cast<double>(a.pcm[k]) * a.pcm[k];
+            }
+            const double mean                = b1 > b0 ? acc / static_cast<double>(b1 - b0) : 0.0;
+            frame_db[static_cast<size_t>(j)] = static_cast<float>(10.0 * std::log10(mean + 1e-10));
+        }
+        in.frame_db = frame_db.data();
+    }
+    in.win_start_ms = a.time_offset_ms;
+    in.win_end_ms   = a.time_offset_ms + static_cast<int64_t>(std::max(0, a.align_frames)) * 10;
+
+    const char * fail = nullptr;
+    if (T_audio < 1) {
+        fail = "window too short";
+    } else if (cm->align_heads.empty()) {
+        fail = "no alignment heads";
+    } else if (n_rows > cc->kv_cache.n_ctx) {
+        fail = "too many tokens";
+    }
+
+    const int64_t t_graph = ggml_time_us();
+    AlignBuild    ab{};
+    if (fail == nullptr) {
+        const int kv_pad = kv_pad_self_attn(cm->plan.primary_kind, cc->decoder_use_flash);
+        if (!ensure_compute_ctx(cc, 16 * 1024 * 1024)) {
+            fail = "compute ctx";
+        } else {
+            ab = build_alignment_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, n_rows, a.T_enc,
+                                       T_audio, kv_pad, cm->align_heads, cc->decoder_use_flash);
+            if (ab.graph == nullptr) {
+                fail = "graph build";
+            }
+        }
+    }
+    if (fail == nullptr) {
+        ggml_backend_sched_reset(cc->sched);
+        if (!ggml_backend_sched_alloc_graph(cc->sched, ab.graph)) {
+            fail = "graph alloc";
+        }
+    }
+    if (fail == nullptr) {
+        ggml_backend_tensor_set(ab.token_ids_in, align_ids.data(), 0, align_ids.size() * sizeof(int32_t));
+        std::vector<int32_t> pos(static_cast<size_t>(n_rows));
+        for (int i = 0; i < n_rows; ++i) {
+            pos[static_cast<size_t>(i)] = i;
+        }
+        ggml_backend_tensor_set(ab.pos_ids_in, pos.data(), 0, pos.size() * sizeof(int32_t));
+
+        const int          n_kv = static_cast<int>(ab.causal_mask_in->ne[0]);
+        std::vector<float> mask(static_cast<size_t>(n_kv) * n_rows);
+        for (int q = 0; q < n_rows; ++q) {
+            for (int k = 0; k < n_kv; ++k) {
+                mask[static_cast<size_t>(q) * n_kv + k] = (k < n_rows && k <= q) ? 0.0f : -1e9f;
+            }
+        }
+        ggml_backend_tensor_set(ab.causal_mask_in, mask.data(), 0, mask.size() * sizeof(float));
+        if (ab.cross_mask_in != nullptr) {
+            const int n_cross = static_cast<int>(ab.cross_mask_in->ne[0]);
+            mask.assign(static_cast<size_t>(n_cross) * n_rows, 0.0f);
+            for (int q = 0; q < n_rows; ++q) {
+                for (int k = a.T_enc; k < n_cross; ++k) {
+                    mask[static_cast<size_t>(q) * n_cross + k] = -1e9f;
+                }
+            }
+            ggml_backend_tensor_set(ab.cross_mask_in, mask.data(), 0, mask.size() * sizeof(float));
+        }
+        cc->perf.align_graph.add(ggml_time_us() - t_graph);
+
+        const int64_t t_compute = ggml_time_us();
+        if (ggml_backend_sched_graph_compute(cc->sched, ab.graph) != GGML_STATUS_SUCCESS) {
+            fail = "graph compute";
+        }
+        cc->perf.align_compute.add(ggml_time_us() - t_compute);
+    }
+
+    const int64_t t_host = ggml_time_us();
+    if (fail == nullptr) {
+        const size_t plane = static_cast<size_t>(n_rows) * static_cast<size_t>(T_audio);
+        cc->align_qk.resize(plane * ab.qk_out.size());
+        for (size_t h = 0; h < ab.qk_out.size(); ++h) {
+            ggml_backend_tensor_get(ab.qk_out[h], cc->align_qk.data() + h * plane, 0, plane * sizeof(float));
+        }
+        in.qk = cc->align_qk.data();
+    } else {
+        log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "whisper words: alignment pass skipped (%s), using proportional timing",
+                fail);
+    }
+
+    int64_t * prev_t1 = cc->words.empty() ? nullptr : &cc->words.back().t1_ms;
+    align::compute_window_words(in, align::split_words(cm->tok, text_ids, space_split), segs, st, cc->align_scratch,
+                                prev_t1, out);
+    cc->perf.align_host.add(ggml_time_us() - t_host);
 }
 
 }  // namespace
@@ -1390,11 +1579,17 @@ transcribe_status whisper_run(transcribe_session *          session,
 
     const transcribe_timestamp_kind requested_timestamps =
         params != nullptr ? params->timestamps : TRANSCRIBE_TIMESTAMPS_NONE;
-    if (requested_timestamps == TRANSCRIBE_TIMESTAMPS_WORD) {
-        return TRANSCRIBE_ERR_UNSUPPORTED_TIMESTAMPS;
-    }
-    const bool want_segment_timestamps =
-        requested_timestamps == TRANSCRIBE_TIMESTAMPS_AUTO || requested_timestamps == TRANSCRIBE_TIMESTAMPS_SEGMENT;
+    // WORD decodes exactly like SEGMENT (same prefix, same timestamp rules)
+    // and adds one alignment pass per window, so the text is identical.
+    const bool want_words              = requested_timestamps == TRANSCRIBE_TIMESTAMPS_WORD;
+    const bool want_segment_timestamps = want_words || requested_timestamps == TRANSCRIBE_TIMESTAMPS_AUTO ||
+                                         requested_timestamps == TRANSCRIBE_TIMESTAMPS_SEGMENT;
+
+    // Real audio frames (short-form mel is padded to 30 s): alignment only
+    // looks at encoder positions that carry audio.
+    const int       hop            = cm->hparams.fe_hop_length > 0 ? cm->hparams.fe_hop_length : 160;
+    const int       content_frames = mel_from_ref ? total_mel_frames : std::min(total_mel_frames, n_samples / hop);
+    align::RunState align_state;
 
     // Multilingual variants emit <|lang|> + <|task|> in the decoder prefix;
     // .en variants have just <|sot|> and no translate/transcribe/language
@@ -1509,8 +1704,14 @@ transcribe_status whisper_run(transcribe_session *          session,
         }
         cc->raw_text    = whisper_decode_raw(cm->tok, all_raw_ids, timestamp_begin);
         cc->full_text   = std::move(text);
-        cc->result_kind = want_segment_timestamps ? TRANSCRIBE_TIMESTAMPS_SEGMENT : TRANSCRIBE_TIMESTAMPS_NONE;
-        cc->has_result  = true;
+        cc->result_kind = want_words              ? TRANSCRIBE_TIMESTAMPS_WORD :
+                          want_segment_timestamps ? TRANSCRIBE_TIMESTAMPS_SEGMENT :
+                                                    TRANSCRIBE_TIMESTAMPS_NONE;
+        if (align_state.n_fallback > 0) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "whisper words: %d windows used proportional timing",
+                    align_state.n_fallback);
+        }
+        cc->has_result = true;
 
         if (whisper_perf_enabled()) {
             print_whisper_perf(cc->perf);
@@ -2480,7 +2681,46 @@ transcribe_status whisper_run(transcribe_session *          session,
         // pairs" branch, full-chunk advance, no per-chunk segment emission.
         WhisperSegmentResult seg_res = whisper_retrieve_segment(generated_ids, cm->tok, time_offset_ms, seek_num_frames,
                                                                 want_segment_timestamps, timestamp_begin, vocab_size);
-        for (auto & seg : seg_res.segments) {
+        std::vector<align::Segment> window_segs;
+        std::vector<align::OutWord> window_words;
+        if (want_words && !no_speech_fired_this_chunk && !seg_res.segments.empty()) {
+            if (cc->poll_abort()) {
+                commit_result();
+                return TRANSCRIBE_ERR_ABORTED;
+            }
+            AlignWindowArgs aa;
+            aa.lang_token      = lang_token;
+            aa.task_token      = task_token;
+            aa.eos_id          = eos_id;
+            aa.T_enc           = T_enc_local;
+            aa.align_frames    = std::clamp(content_frames - seek, 0, seek_num_frames);
+            aa.time_offset_ms  = time_offset_ms;
+            aa.is_multilingual = is_multilingual;
+            aa.pcm             = pcm;
+            aa.n_samples       = n_samples;
+            aa.first_sample    = static_cast<int>(std::min<int64_t>(static_cast<int64_t>(seek) * hop, n_samples));
+            whisper_align_window(cc, cm, seg_res, generated_ids, aa, align_state, window_segs, window_words);
+        }
+        const size_t seg_base = cc->segments.size();
+        for (size_t k = 0; k < seg_res.segments.size(); ++k) {
+            auto & seg = seg_res.segments[k];
+            if (k < window_segs.size()) {
+                seg.t0_ms      = window_segs[k].t0_ms;
+                seg.t1_ms      = window_segs[k].t1_ms;
+                seg.first_word = static_cast<int>(cc->words.size());
+                seg.n_words    = 0;
+                for (auto & ww : window_words) {
+                    if (ww.seg == static_cast<int>(k)) {
+                        transcribe_session::WordEntry we{};
+                        we.text      = std::move(ww.text);
+                        we.t0_ms     = ww.t0_ms;
+                        we.t1_ms     = ww.t1_ms;
+                        we.seg_index = static_cast<int>(seg_base + k);
+                        cc->words.push_back(std::move(we));
+                        seg.n_words += 1;
+                    }
+                }
+            }
             cc->segments.push_back(std::move(seg));
         }
         int                                 segment_offset_frames = seg_res.segment_offset_frames;

@@ -799,6 +799,113 @@ DecoderBuild build_decoder_graph_kv(ggml_context *         ctx,
     return db;
 }
 
+AlignBuild build_alignment_graph(ggml_context *                 ctx,
+                                 const WhisperWeights &         w,
+                                 const WhisperHParams &         hp,
+                                 WhisperKvCache &               kv_cache,
+                                 int                            n_tokens,
+                                 int                            T_enc,
+                                 int                            T_audio,
+                                 int                            kv_pad,
+                                 const std::vector<AlignHead> & heads,
+                                 bool                           use_flash) {
+    AlignBuild ab{};
+
+    const int n_blocks = static_cast<int>(w.dec_blocks.size());
+    if (ctx == nullptr || heads.empty() || n_tokens <= 0 || n_tokens > kv_cache.n_ctx || T_enc <= 0 || T_audio <= 0 ||
+        T_audio > T_enc || kv_cache.cross_k == nullptr || heads.back().layer >= n_blocks) {
+        return ab;
+    }
+
+    const int kv_pad_eff = kv_pad > 0 ? kv_pad : 1;
+    int       n_kv       = n_tokens;
+    if (kv_pad_eff > 1) {
+        n_kv = std::min(kv_cache.n_ctx, std::max(kv_pad_eff, static_cast<int>(GGML_PAD(n_tokens, kv_pad_eff))));
+    }
+
+    const int d_model   = hp.dec_d_model;
+    const int n_heads   = hp.dec_n_heads;
+    const int head_dim  = d_model / n_heads;
+    const int T_enc_pad = kv_cache.T_enc_pad > 0 ? kv_cache.T_enc_pad : T_enc;
+
+    ab.token_ids_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    named(ab.token_ids_in, "align.token_ids");
+    ggml_set_input(ab.token_ids_in);
+
+    ab.pos_ids_in = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+    named(ab.pos_ids_in, "align.pos_ids");
+    ggml_set_input(ab.pos_ids_in);
+
+    ab.causal_mask_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tokens);
+    named(ab.causal_mask_in, "align.causal_mask");
+    ggml_set_input(ab.causal_mask_in);
+    ggml_tensor * causal_mask = ggml_cast(ctx, ab.causal_mask_in, GGML_TYPE_F16);
+
+    ggml_tensor * cross_mask = nullptr;
+    if (T_enc_pad > T_enc) {
+        ab.cross_mask_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_enc_pad, n_tokens);
+        named(ab.cross_mask_in, "align.cross_mask");
+        ggml_set_input(ab.cross_mask_in);
+        cross_mask = ggml_cast(ctx, ab.cross_mask_in, GGML_TYPE_F16);
+    }
+
+    ggml_tensor * x = ggml_add(ctx, ggml_get_rows(ctx, w.dec_top.token_embd_w, ab.token_ids_in),
+                               ggml_get_rows(ctx, w.dec_top.pos_emb_w, ab.pos_ids_in));
+
+    ab.graph = ggml_new_graph_custom(ctx, 8192, false);
+    if (ab.graph == nullptr) {
+        return ab;
+    }
+
+    const int    last_layer = heads.back().layer;
+    const size_t k_elem     = ggml_element_size(kv_cache.cross_k);
+    size_t       hi         = 0;
+    for (int i = 0; i <= last_layer; ++i) {
+        const auto & b = w.dec_blocks[i];
+        {
+            ggml_tensor * y = layer_norm(ctx, x, b.norm_self_w, b.norm_self_b);
+            y = mha_self_cached(ctx, ab.graph, y, kv_cache, causal_mask, b.self_q_w, b.self_q_b, b.self_k_w, b.self_v_w,
+                                b.self_v_b, b.self_out_w, b.self_out_b, n_heads, d_model, i, /*n_past=*/0, n_tokens,
+                                n_kv, use_flash);
+            x = ggml_add(ctx, x, y);
+        }
+        ggml_tensor * y = layer_norm(ctx, x, b.norm_cross_w, b.norm_cross_b);
+        if (hi < heads.size() && heads[hi].layer == i) {
+            ggml_tensor * q = ggml_mul_mat(ctx, b.cross_q_w, y);
+            if (b.cross_q_b != nullptr) {
+                q = ggml_add(ctx, q, b.cross_q_b);
+            }
+            q = ggml_permute(ctx, ggml_reshape_3d(ctx, q, head_dim, n_heads, n_tokens), 0, 2, 1, 3);
+            ggml_tensor * K =
+                ggml_view_3d(ctx, kv_cache.cross_k, head_dim, T_enc_pad, n_heads, k_elem * d_model, k_elem * head_dim,
+                             k_elem * static_cast<size_t>(static_cast<int64_t>(i) * T_enc_pad * d_model));
+            ggml_tensor * kq = ggml_mul_mat(ctx, K, q);  // [T_enc_pad, n_tokens, n_heads]
+            for (; hi < heads.size() && heads[hi].layer == i; ++hi) {
+                ggml_tensor * v = ggml_view_2d(ctx, kq, T_audio, n_tokens, kq->nb[1],
+                                               static_cast<size_t>(heads[hi].head) * kq->nb[2]);
+                v               = ggml_cont(ctx, v);
+                ggml_set_output(v);
+                ggml_build_forward_expand(ab.graph, v);
+                ab.qk_out.push_back(v);
+            }
+        }
+        if (i == last_layer) {
+            break;
+        }
+        y = mha_cross_cached(ctx, y, kv_cache, cross_mask, b.cross_q_w, b.cross_q_b, b.cross_out_w, b.cross_out_b,
+                             n_heads, d_model, i, T_enc, use_flash);
+        x = ggml_add(ctx, x, y);
+        y = layer_norm(ctx, x, b.norm_ffn_w, b.norm_ffn_b);
+        y = ffn(ctx, y, b.ffn_fc1_w, b.ffn_fc1_b, b.ffn_fc2_w, b.ffn_fc2_b);
+        x = ggml_add(ctx, x, y);
+    }
+    if (ab.qk_out.size() != heads.size()) {
+        ab.qk_out.clear();
+        ab.graph = nullptr;
+    }
+    return ab;
+}
+
 // Static-topology single-token step graph (GPU dispatch path).
 StepBuild build_step_graph(ggml_context *         ctx,
                            const WhisperWeights & w,

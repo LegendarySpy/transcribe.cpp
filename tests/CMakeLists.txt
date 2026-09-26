@@ -1105,7 +1105,7 @@ endif()
 # Loads a real Whisper GGUF and verifies the public capabilities match the
 # runtime behavior: language detection runs when no language hint is supplied,
 # default params use no-timestamp decode, explicit SEGMENT returns segment
-# timestamps, and WORD timestamps are rejected until the DTW alignment path lands.
+# timestamps, and WORD returns aligned word timestamps with identical text.
 
 if(TRANSCRIBE_BUILD_REAL_MODEL_TESTS)
     add_executable(transcribe_whisper_e2e_smoke

@@ -55,6 +55,10 @@ struct WhisperHParams {
     std::vector<int32_t> suppress_tokens;        // applied every step
     std::vector<int32_t> begin_suppress_tokens;  // applied on first generated step only
 
+    // Word-timestamp cross-attention heads, flat [l0, h0, l1, h1, ...]
+    // (stt.whisper.alignment_heads, optional; empty = built-in table).
+    std::vector<int32_t> alignment_heads;
+
     // Frontend (WhisperFeatureExtractor).
     std::string fe_type;
     int32_t     fe_num_mels    = 0;

@@ -44,21 +44,21 @@ matrix (F32/F16/Q8_0/Q6_K/Q5_K_M/Q4_K_M) and a discussion of how our
 numbers compare to OpenAI's self-reported figures. Numbers come from single Metal-backed runs; Metal's non-deterministic parallel reductions add ~0.1pp run-to-run variance on the noise floor.
 
 <!-- catalog:family variants=breeze-asr-25,whisper-tiny,whisper-tiny.en,whisper-base,whisper-base.en,whisper-small,whisper-small.en,whisper-medium,whisper-medium.en,whisper-large,whisper-large-v2,whisper-large-v3,whisper-large-v3-turbo -->
-| Variant                  | Params | Languages                   | Q8_0 size | Benchmark                    |  Q8_0 | Capabilities                  | Doc |
+| Variant                  | Params | Languages                   | Q8_0 size | Benchmark                    |  Q8_0 | Capabilities               | Doc |
 | --- | ---: | --- | ---: | --- | ---: | --- | --- |
-| `breeze-asr-25`          |   1.5B | zh, en + auto-detect        |   1.67 GB | LibriSpeech test-clean (WER) | 2.27% | translate, segment timestamps | [handy-computer/Breeze-ASR-25-gguf](https://huggingface.co/handy-computer/Breeze-ASR-25-gguf) |
-| `whisper-tiny`           |    38M | 99 languages + auto-detect  |     46 MB | LibriSpeech test-clean (WER) | 7.52% | translate, segment timestamps | [whisper-tiny.md](whisper-tiny.md) |
-| `whisper-tiny.en`        |    38M | en                          |     46 MB | LibriSpeech test-clean (WER) | 5.72% | segment timestamps            | [whisper-tiny.en.md](whisper-tiny.en.md) |
-| `whisper-base`           |    73M | 99 languages + auto-detect  |     85 MB | LibriSpeech test-clean (WER) | 5.12% | translate, segment timestamps | [whisper-base.md](whisper-base.md) |
-| `whisper-base.en`        |    73M | en                          |     85 MB | LibriSpeech test-clean (WER) | 4.16% | segment timestamps            | [whisper-base.en.md](whisper-base.en.md) |
-| `whisper-small`          |   242M | 99 languages + auto-detect  |    270 MB | LibriSpeech test-clean (WER) | 3.33% | translate, segment timestamps | [whisper-small.md](whisper-small.md) |
-| `whisper-small.en`       |   242M | en                          |    270 MB | LibriSpeech test-clean (WER) | 3.09% | segment timestamps            | [whisper-small.en.md](whisper-small.en.md) |
-| `whisper-medium`         |   764M | 99 languages + auto-detect  |    832 MB | LibriSpeech test-clean (WER) | 2.64% | translate, segment timestamps | [whisper-medium.md](whisper-medium.md) |
-| `whisper-medium.en`      |   764M | en                          |    831 MB | LibriSpeech test-clean (WER) | 2.72% | segment timestamps            | [whisper-medium.en.md](whisper-medium.en.md) |
-| `whisper-large`          |   1.5B | 99 languages + auto-detect  |   1.67 GB | LibriSpeech test-clean (WER) | 2.71% | translate, segment timestamps | [whisper-large.md](whisper-large.md) |
-| `whisper-large-v2`       |   1.5B | 99 languages + auto-detect  |   1.67 GB | LibriSpeech test-clean (WER) | 2.97% | translate, segment timestamps | [whisper-large-v2.md](whisper-large-v2.md) |
-| `whisper-large-v3`       |   1.5B | 100 languages + auto-detect |   1.67 GB | LibriSpeech test-clean (WER) | 1.82% | translate, segment timestamps | [whisper-large-v3.md](whisper-large-v3.md) |
-| `whisper-large-v3-turbo` |   809M | 100 languages + auto-detect |    886 MB | LibriSpeech test-clean (WER) | 2.01% | segment timestamps            | [whisper-large-v3-turbo.md](whisper-large-v3-turbo.md) |
+| `breeze-asr-25`          |   1.5B | zh, en + auto-detect        |   1.67 GB | LibriSpeech test-clean (WER) | 2.27% | translate, word timestamps | [handy-computer/Breeze-ASR-25-gguf](https://huggingface.co/handy-computer/Breeze-ASR-25-gguf) |
+| `whisper-tiny`           |    38M | 99 languages + auto-detect  |     46 MB | LibriSpeech test-clean (WER) | 7.52% | translate, word timestamps | [whisper-tiny.md](whisper-tiny.md) |
+| `whisper-tiny.en`        |    38M | en                          |     46 MB | LibriSpeech test-clean (WER) | 5.72% | word timestamps            | [whisper-tiny.en.md](whisper-tiny.en.md) |
+| `whisper-base`           |    73M | 99 languages + auto-detect  |     85 MB | LibriSpeech test-clean (WER) | 5.12% | translate, word timestamps | [whisper-base.md](whisper-base.md) |
+| `whisper-base.en`        |    73M | en                          |     85 MB | LibriSpeech test-clean (WER) | 4.16% | word timestamps            | [whisper-base.en.md](whisper-base.en.md) |
+| `whisper-small`          |   242M | 99 languages + auto-detect  |    270 MB | LibriSpeech test-clean (WER) | 3.33% | translate, word timestamps | [whisper-small.md](whisper-small.md) |
+| `whisper-small.en`       |   242M | en                          |    270 MB | LibriSpeech test-clean (WER) | 3.09% | word timestamps            | [whisper-small.en.md](whisper-small.en.md) |
+| `whisper-medium`         |   764M | 99 languages + auto-detect  |    832 MB | LibriSpeech test-clean (WER) | 2.64% | translate, word timestamps | [whisper-medium.md](whisper-medium.md) |
+| `whisper-medium.en`      |   764M | en                          |    831 MB | LibriSpeech test-clean (WER) | 2.72% | word timestamps            | [whisper-medium.en.md](whisper-medium.en.md) |
+| `whisper-large`          |   1.5B | 99 languages + auto-detect  |   1.67 GB | LibriSpeech test-clean (WER) | 2.71% | translate, word timestamps | [whisper-large.md](whisper-large.md) |
+| `whisper-large-v2`       |   1.5B | 99 languages + auto-detect  |   1.67 GB | LibriSpeech test-clean (WER) | 2.97% | translate, word timestamps | [whisper-large-v2.md](whisper-large-v2.md) |
+| `whisper-large-v3`       |   1.5B | 100 languages + auto-detect |   1.67 GB | LibriSpeech test-clean (WER) | 1.82% | translate, word timestamps | [whisper-large-v3.md](whisper-large-v3.md) |
+| `whisper-large-v3-turbo` |   809M | 100 languages + auto-detect |    886 MB | LibriSpeech test-clean (WER) | 2.01% | word timestamps            | [whisper-large-v3-turbo.md](whisper-large-v3-turbo.md) |
 <!-- /catalog -->
 
 Pre-built GGUFs for every variant and quant are hosted under
@@ -160,11 +160,51 @@ All Whisper variants support:
 - **Transcription** of 16 kHz mono WAV input.
 - **Long-form audio** via 30-second chunked decoding with the
   prev-context window assembly described in the family doc.
-- **Segment timestamps** — the finest granularity the library emits for
-  Whisper (`max_timestamp_kind = segment`). Word-level timestamps are not
-  currently exposed.
+- **Segment timestamps** from the decoded timestamp tokens (`AUTO` and
+  `SEGMENT`).
+- **Word timestamps** on an explicit `TRANSCRIBE_TIMESTAMPS_WORD` request
+  (`max_timestamp_kind = word`; `AUTO` still means segments). See below.
 - **Translation** (any supported language → English) on multilingual
   checkpoints — `.en` variants are transcribe-only.
+
+### Word timestamps
+
+`--timestamps word` (C: `TRANSCRIBE_TIMESTAMPS_WORD`, Rust:
+`TimestampKind::Word`) decodes exactly like `SEGMENT`, so the transcript is
+byte-identical, and adds one alignment pass per 30-second window. The pass
+follows OpenAI whisper's `find_alignment`: a teacher-forced decoder pass over
+`<|startoftranscript|> [<|lang|> <|task|>] <|notimestamps|> text <|endoftext|>`
+that reads the cross-attention of the model's alignment heads over the real
+audio frames, then softmax, per-head normalization, a width-7 median filter,
+DTW, and OpenAI's word grouping, punctuation merge and duration rules. Only
+the Q·K product of the alignment layers runs without flash attention;
+decoding, the encoder and every other attention stay on flash. The pass stops
+after the last alignment layer and costs about one decode step per window.
+
+Words are whitespace-trimmed with punctuation attached (`"country."`), carry
+absolute times in ms, and are clamped to the window's real audio, so a word
+never ends after the input does. Starts are non-decreasing and consecutive
+words never overlap. `zh`, `ja`, `th`, `lo`, `my` and `yue` split per
+character, as OpenAI does. Segment times may be refined by the OpenAI rules
+(a segment starts at its first word unless that word is implausibly long).
+Token rows are not exposed (`transcribe_n_tokens` is 0 on word runs).
+
+Alignment heads, first match wins:
+
+1. The GGUF KV `stt.whisper.alignment_heads` (int32 array, flat
+   `[layer, head, layer, head, ...]`), written by `convert-whisper.py` from
+   the checkpoint's `generation_config.json` when it fits the decoder.
+2. OpenAI's per-model table, matched on exact geometry (encoder layers,
+   decoder layers, heads, mel bins, multilingual): tiny through large-v3,
+   large-v3-turbo, and distil-large-v3 / v3.5. This covers whisper.cpp
+   `.bin` files. large-v1 shares large-v2's geometry and needs the
+   `whisper-large-v1` variant string or the KV.
+3. Every head of the upper half of the decoder layers (OpenAI's default),
+   e.g. distil-medium.en and distil-small.en.
+
+A window whose alignment cannot run (under 20 ms of audio, a backend
+failure) falls back to timing proportional to word length inside its
+segment instead of failing the run; the log says how many windows did.
 
 What's not supported (consistent across the family): real-time
 streaming (whisper is not streaming-first; chunked 30-second windows

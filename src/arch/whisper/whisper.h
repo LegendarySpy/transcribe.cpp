@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "alignment.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
@@ -233,6 +234,11 @@ struct WhisperPerf {
     WhisperPerfStage step_cpu_sample;
     WhisperPerfStage step_cpu_logprob;
 
+    // Word-timestamp alignment pass (per window, only on TIMESTAMPS_WORD).
+    WhisperPerfStage align_graph;  // build + alloc + inputs
+    WhisperPerfStage align_compute;
+    WhisperPerfStage align_host;   // readback + host math
+
     int chunks = 0;
 
     void reset() {
@@ -261,6 +267,9 @@ struct WhisperPerf {
         step_cpu_timestamp.reset();
         step_cpu_sample.reset();
         step_cpu_logprob.reset();
+        align_graph.reset();
+        align_compute.reset();
+        align_host.reset();
         chunks = 0;
     }
 };
@@ -281,6 +290,9 @@ struct WhisperModel final : public transcribe_model {
     std::vector<std::string> lang_codes;  // owned copy; lifetime matches the model
     std::vector<int32_t>     lang_token_ids;
 
+    // Cross-attention heads used for word timestamps, sorted by (layer, head).
+    std::vector<AlignHead> align_heads;
+
     // C++ mel frontend (per_utterance / hann_periodic / reflect / Slaney).
     // Built from the filterbank + window baked into the GGUF. Optional so a
     // load failure still surfaces a model object for inspection.
@@ -291,6 +303,9 @@ struct WhisperModel final : public transcribe_model {
 
     const transcribe::Tokenizer * tokenizer() const override { return &tok; }
 };
+
+// Picks WhisperModel::align_heads from hparams + variant (see alignment.h).
+void resolve_alignment_heads(WhisperModel & m);
 
 struct WhisperSession final : public transcribe_session {
     // Currently-allocated capacity of compute_ctx (mem_size). Used by
@@ -330,6 +345,11 @@ struct WhisperSession final : public transcribe_session {
     // Reusable scratch for the multinomial T>0 sampler, sized to vocab_size on
     // first use to avoid a per-call double[vocab] allocation in the hot path.
     std::vector<double> sample_scratch;
+
+    // Word-timestamp scratch: alignment-pass readback [head][row][frame] and
+    // the host pipeline buffers.
+    std::vector<float> align_qk;
+    align::Scratch     align_scratch;
 
     WhisperSession() = default;
     ~WhisperSession() override;

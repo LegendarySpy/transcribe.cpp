@@ -29,7 +29,7 @@
     "transcribe": {"supported":true,"verified":false},
     "translate": {"supported":false},
     "lang_detect": {"supported":true,"verified":false},
-    "timestamps": {"supported":true,"verified":false,"granularities":["segment"],"note":"upstream exposes word-level via cross-attention alignment; this port ships segment"},
+    "timestamps": {"supported":true,"verified":false,"granularities":["word"],"note":"upstream exposes word-level via cross-attention alignment; this port ships segment"},
     "streaming": {"supported":false},
     "diarize": {"supported":false},
     "batching": {"supported":true,"verified":false}

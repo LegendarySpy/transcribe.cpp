@@ -3,8 +3,10 @@
 // Covers the runtime capability contract:
 // language detection is advertised and exercised by running without a
 // language hint, default params use no-timestamp decode, explicit
-// SEGMENT timestamps are advertised and returned, and no-timestamp
-// decode keeps the tensor-validation prompt available.
+// SEGMENT timestamps are advertised and returned, WORD timestamps come
+// from the alignment pass (text identical to SEGMENT, invariants hold on
+// every clip length), and no-timestamp decode keeps the tensor-validation
+// prompt available.
 
 #include "transcribe.h"
 #include "transcribe/whisper.h"
@@ -52,6 +54,37 @@ bool file_exists(const std::string & path) {
     return ::stat(path.c_str(), &st) == 0;
 }
 
+// Word rows after a WORD run: text present, inside the clip, starts
+// non-decreasing, no overlap, and segments cover the words exactly.
+void check_word_invariants(const transcribe_session * ctx, int64_t clip_ms) {
+    const int n_words = transcribe_n_words(ctx);
+    const int n_segs  = transcribe_n_segments(ctx);
+    int64_t   prev_t0 = 0;
+    int64_t   prev_t1 = 0;
+    for (int i = 0; i < n_words; ++i) {
+        transcribe_word w;
+        transcribe_word_init(&w);
+        CHECK_EQ_INT(transcribe_get_word(ctx, i, &w), TRANSCRIBE_OK);
+        CHECK(w.text != nullptr && w.text[0] != '\0');
+        CHECK(w.seg_index >= 0 && w.seg_index < n_segs);
+        CHECK(w.t0_ms >= 0 && w.t0_ms <= w.t1_ms && w.t1_ms <= clip_ms);
+        CHECK(w.t0_ms >= prev_t0);
+        CHECK(i == 0 || prev_t1 <= w.t0_ms);
+        prev_t0 = w.t0_ms;
+        prev_t1 = w.t1_ms;
+    }
+    int covered = 0;
+    for (int k = 0; k < n_segs; ++k) {
+        transcribe_segment seg;
+        transcribe_segment_init(&seg);
+        CHECK_EQ_INT(transcribe_get_segment(ctx, k, &seg), TRANSCRIBE_OK);
+        CHECK_EQ_INT(seg.first_word, covered);
+        covered += seg.n_words;
+        CHECK(seg.t0_ms <= seg.t1_ms);
+    }
+    CHECK_EQ_INT(covered, n_words);
+}
+
 }  // namespace
 
 int main() {
@@ -94,7 +127,7 @@ int main() {
         CHECK_EQ_INT(caps->native_sample_rate, 16000);
         CHECK(caps->supports_language_detect);
         CHECK(caps->supports_translate);
-        CHECK_EQ_INT(caps->max_timestamp_kind, TRANSCRIBE_TIMESTAMPS_SEGMENT);
+        CHECK_EQ_INT(caps->max_timestamp_kind, TRANSCRIBE_TIMESTAMPS_WORD);
         CHECK(caps->n_languages > 0);
         CHECK(caps->languages != nullptr);
 
@@ -125,6 +158,7 @@ int main() {
         CHECK(std::strstr(transcribe_full_text(ctx), "country") != nullptr);
         CHECK_EQ_INT(transcribe_returned_timestamp_kind(ctx), TRANSCRIBE_TIMESTAMPS_SEGMENT);
         CHECK(transcribe_n_segments(ctx) >= 1);
+        CHECK_EQ_INT(transcribe_n_words(ctx), 0);  // AUTO never runs the alignment pass
         {
             transcribe_segment seg;
             transcribe_segment_init(&seg);
@@ -133,6 +167,7 @@ int main() {
         }
     }
 
+    std::string segment_text;
     {
         transcribe_run_params rp;
         transcribe_run_params_init(&rp);
@@ -140,6 +175,7 @@ int main() {
         rp.timestamps = TRANSCRIBE_TIMESTAMPS_SEGMENT;
         st            = transcribe_run(ctx, pcm.data(), static_cast<int>(pcm.size()), &rp);
         CHECK(st == TRANSCRIBE_OK);
+        segment_text = transcribe_full_text(ctx);
         CHECK(std::strstr(transcribe_full_text(ctx), "country") != nullptr);
         CHECK_EQ_INT(transcribe_returned_timestamp_kind(ctx), TRANSCRIBE_TIMESTAMPS_SEGMENT);
         CHECK_EQ_INT(transcribe_n_segments(ctx), 1);
@@ -174,12 +210,87 @@ int main() {
         CHECK_EQ_INT(transcribe_returned_timestamp_kind(ctx), TRANSCRIBE_TIMESTAMPS_NONE);
     }
 
+    const int64_t clip_ms = static_cast<int64_t>(pcm.size()) / 16;
     {
         transcribe_run_params rp;
         transcribe_run_params_init(&rp);
+        rp.language   = "en";
         rp.timestamps = TRANSCRIBE_TIMESTAMPS_WORD;
         st            = transcribe_run(ctx, pcm.data(), static_cast<int>(pcm.size()), &rp);
-        CHECK(st == TRANSCRIBE_ERR_UNSUPPORTED_TIMESTAMPS);
+        CHECK_EQ_INT(st, TRANSCRIBE_OK);
+        CHECK_EQ_INT(transcribe_returned_timestamp_kind(ctx), TRANSCRIBE_TIMESTAMPS_WORD);
+        CHECK(segment_text == transcribe_full_text(ctx));
+        CHECK(transcribe_n_words(ctx) >= 20);
+        check_word_invariants(ctx, clip_ms);
+        // "country" (first) is spoken around 5.8-6.4 s in jfk.wav.
+        bool found = false;
+        for (int i = 0; i < transcribe_n_words(ctx) && !found; ++i) {
+            transcribe_word w;
+            transcribe_word_init(&w);
+            transcribe_get_word(ctx, i, &w);
+            if (w.text != nullptr && std::strncmp(w.text, "country", 7) == 0) {
+                found = true;
+                CHECK(w.t0_ms >= 5400 && w.t0_ms <= 6400);
+            }
+        }
+        CHECK(found);
+    }
+
+    // Short-window crash guard: every slice of jfk.wav from 10 ms to 600 ms,
+    // plus 110 ms of silence, runs WORD without error.
+    {
+        std::vector<std::vector<float>> clips;
+        for (int ms = 10; ms <= 600; ms += 10) {
+            clips.emplace_back(pcm.begin(), pcm.begin() + ms * 16);
+        }
+        clips.emplace_back(static_cast<size_t>(110 * 16), 0.0f);
+        for (const auto & clip : clips) {
+            transcribe_run_params rp;
+            transcribe_run_params_init(&rp);
+            rp.language   = "en";
+            rp.timestamps = TRANSCRIBE_TIMESTAMPS_WORD;
+            st            = transcribe_run(ctx, clip.data(), static_cast<int>(clip.size()), &rp);
+            CHECK_EQ_INT(st, TRANSCRIBE_OK);
+            CHECK_EQ_INT(transcribe_returned_timestamp_kind(ctx), TRANSCRIBE_TIMESTAMPS_WORD);
+            check_word_invariants(ctx, static_cast<int64_t>(clip.size()) / 16);
+        }
+    }
+
+    // Batched WORD peels to serial: words equal three serial runs.
+    {
+        const std::vector<float> a(pcm.begin(), pcm.begin() + 3 * 16000);
+        const std::vector<float> b(pcm.begin() + 3 * 16000, pcm.end());
+        const float *            ptrs[3] = { pcm.data(), a.data(), b.data() };
+        const int lens[3] = { static_cast<int>(pcm.size()), static_cast<int>(a.size()), static_cast<int>(b.size()) };
+        transcribe_run_params rp;
+        transcribe_run_params_init(&rp);
+        rp.language   = "en";
+        rp.timestamps = TRANSCRIBE_TIMESTAMPS_WORD;
+        CHECK_EQ_INT(transcribe_run_batch(ctx, ptrs, lens, 3, &rp), TRANSCRIBE_OK);
+        std::vector<std::vector<transcribe_word>> batch_words(3);
+        std::vector<std::vector<std::string>>     batch_text(3);
+        for (int i = 0; i < 3 && transcribe_batch_n_results(ctx) == 3; ++i) {
+            CHECK_EQ_INT(transcribe_batch_status(ctx, i), TRANSCRIBE_OK);
+            for (int j = 0; j < transcribe_batch_n_words(ctx, i); ++j) {
+                transcribe_word w;
+                transcribe_word_init(&w);
+                transcribe_batch_get_word(ctx, i, j, &w);
+                batch_text[i].emplace_back(w.text != nullptr ? w.text : "");
+                w.text = nullptr;
+                batch_words[i].push_back(w);
+            }
+        }
+        for (int i = 0; i < 3; ++i) {
+            CHECK_EQ_INT(transcribe_run(ctx, ptrs[i], lens[i], &rp), TRANSCRIBE_OK);
+            CHECK_EQ_INT(transcribe_n_words(ctx), static_cast<int>(batch_words[i].size()));
+            for (int j = 0; j < transcribe_n_words(ctx) && j < static_cast<int>(batch_words[i].size()); ++j) {
+                transcribe_word w;
+                transcribe_word_init(&w);
+                transcribe_get_word(ctx, j, &w);
+                CHECK(batch_text[i][j] == (w.text != nullptr ? w.text : ""));
+                CHECK(batch_words[i][j].t0_ms == w.t0_ms && batch_words[i][j].t1_ms == w.t1_ms);
+            }
+        }
     }
 
     // Abort callback exercises the per-step poll inside the greedy
