@@ -54,8 +54,10 @@ CoreMLEncoder * coreml_encoder_load(const char * path,
                     return nullptr;
                 }
                 MLModelDescription * desc           = encoder->model.modelDescription;
+                // One variant, or a comma-separated list for encoders shared across checkpoints.
                 NSString *           source_variant = desc.metadata[MLModelCreatorDefinedKey][@"transcribe.variant"];
-                if (![source_variant isEqualToString:[NSString stringWithUTF8String:variant]]) {
+                NSArray *            variants       = [source_variant componentsSeparatedByString:@","];
+                if (![variants containsObject:[NSString stringWithUTF8String:variant]]) {
                     log_error("encoder checkpoint does not match GGUF variant", nil);
                     return nullptr;
                 }
