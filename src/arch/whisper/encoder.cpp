@@ -90,6 +90,13 @@ ggml_tensor * mha_encoder(ggml_context * ctx,
     q = ggml_reshape_3d(ctx, q, head_dim, n_heads, T);
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
 
+    // Like whisper.cpp, flash attention takes F16 K/V and reads the
+    // permuted views in place.
+    if (use_flash) {
+        k = ggml_cast(ctx, k, GGML_TYPE_F16);
+        v = ggml_cast(ctx, v, GGML_TYPE_F16);
+    }
+
     k = ggml_reshape_3d(ctx, k, head_dim, n_heads, T);
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
 
@@ -98,12 +105,8 @@ ggml_tensor * mha_encoder(ggml_context * ctx,
 
     ggml_tensor * o;
     if (use_flash) {
-        // flash_attn_ext wants q/k/v contiguous.
-        ggml_tensor * q_c = ggml_cont(ctx, q);
-        ggml_tensor * k_c = ggml_cont(ctx, k);
-        ggml_tensor * v_c = ggml_cont(ctx, v);
-        o                 = ggml_flash_attn_ext(ctx, q_c, k_c, v_c, nullptr, scale, 0.0f, 0.0f);
-        o                 = ggml_reshape_2d(ctx, o, d_model, T);
+        o = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        o = ggml_reshape_2d(ctx, o, d_model, T);
     } else {
         // Manual attention path: mul_mat(K, Q) gives [T_k, T_q, n_heads]
         // per the standard cohere pattern.
