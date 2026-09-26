@@ -1421,6 +1421,24 @@ add_test(NAME transcribe_whisper_bin_suppress_unit
     COMMAND transcribe_whisper_bin_suppress_unit)
 
 # -----------------------------------------------------------------------------
+# Whisper word-timestamp host math (alignment.cpp) vs numpy timing.py ports
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_whisper_alignment_unit
+    whisper_alignment_unit.cpp)
+
+target_link_libraries(transcribe_whisper_alignment_unit PRIVATE transcribe)
+
+target_include_directories(transcribe_whisper_alignment_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR})
+
+transcribe_apply_warnings(transcribe_whisper_alignment_unit)
+
+add_test(NAME transcribe_whisper_alignment_unit
+    COMMAND transcribe_whisper_alignment_unit)
+
+# -----------------------------------------------------------------------------
 # Whisper .bin parser unit test
 # -----------------------------------------------------------------------------
 #
