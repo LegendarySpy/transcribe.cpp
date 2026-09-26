@@ -247,6 +247,30 @@ A window whose alignment cannot run (under 20 ms of audio, a backend
 failure) falls back to timing proportional to word length inside its
 segment instead of failing the run; the log says how many windows did.
 
+### Decoding
+
+The decode follows the HF / OpenAI recipe (greedy, temperature fallback on
+compression ratio and average log-probability, no-speech gate) with these
+rules on every run:
+
+- Audio past the input is never decoded. A window starts only if more than
+  100 ms of real audio remains after the seek point (input of 100 ms or
+  less gives an empty transcript), and a window stops generating once a
+  timestamp reaches the last 100 ms of the audio. Both are whisper.cpp's;
+  without them text is decoded from the zero padding of the last window.
+- Long-form input (over 30 s) always decodes timestamp tokens; `NONE`
+  only drops the segments. Blind 30-second advances under
+  `<|notimestamps|>` cut words at window edges and made windows stop early.
+- The transcript is built from the kept segments: a window's unfinished
+  tail after its last closed timestamp pair is decoded again by the next
+  window and appears once.
+- `initial_prompt` text that looks like a special token (`<|en|>`) is
+  encoded as plain text.
+- With `condition_on_prev_tokens`, the carried tokens keep each window's
+  closing timestamp pair, and no prior context is used once less than 5 s
+  of audio remains (both as in whisper.cpp; the short final window tended
+  to repeat or continue the carried text).
+
 What's not supported (consistent across the family): real-time
 streaming (whisper is not streaming-first; chunked 30-second windows
 only), VAD, speaker diarization. See the family doc for the full

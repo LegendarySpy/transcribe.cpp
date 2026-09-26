@@ -116,7 +116,9 @@ struct transcribe_whisper_run_ext {
      * prior chunk's tokens is prepended (under <|startofprev|>) to the
      * next chunk's prefix, capped at max_prev_context_tokens. Auto-
      * disables for the next chunk when the prior chunk was accepted at
-     * temperature >= 0.5 (matches HF ":1090-1093").
+     * temperature >= 0.5 (matches HF ":1090-1093"). Like whisper.cpp,
+     * the carried tokens keep each chunk's closing timestamp pair, and
+     * no prior context is used once less than 5 s of audio remains.
      */
     bool condition_on_prev_tokens;
 

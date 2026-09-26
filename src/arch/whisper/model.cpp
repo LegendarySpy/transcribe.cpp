@@ -960,6 +960,16 @@ float logprob_of_token_hf(const std::vector<float> & logits, int token_id, float
     return logits[token_id] * rescale_T - log_Z;
 }
 
+// Real audio shorter than this (10 mel frames = 100 ms) past the seek point
+// is not decoded, and a window stops generating once a timestamp reaches
+// that close to the audio end (whisper.cpp's delta_min): text past the end
+// would be decoded from the zero padding.
+constexpr int k_min_tail_frames = 10;
+
+bool whisper_ts_reaches_audio_end(int id, int timestamp_begin, int seek, int content_frames) {
+    return id > timestamp_begin && seek + 2 * (id - timestamp_begin) + k_min_tail_frames >= content_frames;
+}
+
 #ifdef TRANSCRIBE_ENABLE_VALIDATION_HOOKS
 // Load 3000 * 80 f32 floats from <dir>/enc.mel.in.f32. Layout on disk
 // matches the reference dump: row-major (3000, 80) — exactly what we
@@ -1243,6 +1253,21 @@ WhisperSegmentResult whisper_retrieve_segment(const std::vector<int32_t> &  gene
         out.segment_offset_frames = seek_num_frames;
     }
     return out;
+}
+
+// Text ids of the slices a window keeps. A tail after the last closed
+// timestamp pair is decoded again by the next window, so it is not part of
+// the transcript (HF builds its text from the same slices).
+std::vector<int32_t> whisper_slice_text_ids(const WhisperSegmentResult & sr, int timestamp_begin) {
+    std::vector<int32_t> ids;
+    for (const auto & slice : sr.prev_chunk_segments) {
+        for (const int32_t id : slice) {
+            if (id >= 0 && id < 50257 && id < timestamp_begin) {
+                ids.push_back(id);
+            }
+        }
+    }
+    return ids;
 }
 
 // Render an accepted raw token stream for transcribe_raw_text. Timestamp
@@ -1588,6 +1613,12 @@ transcribe_status whisper_run(transcribe_session *          session,
     const bool want_words              = requested_timestamps == TRANSCRIBE_TIMESTAMPS_WORD;
     const bool want_segment_timestamps = want_words || requested_timestamps == TRANSCRIBE_TIMESTAMPS_AUTO ||
                                          requested_timestamps == TRANSCRIBE_TIMESTAMPS_SEGMENT;
+    // Long-form always decodes timestamp tokens: without them each 30 s
+    // window must advance blindly, and <|notimestamps|> decoding of a window
+    // that starts mid-sentence tends to stop early, dropping the rest of the
+    // window (HF rejects long-form without timestamps for the same reason).
+    // NONE then only drops the segments from the result.
+    const bool decode_timestamps       = want_segment_timestamps || !is_short_form;
 
     // Real audio frames (short-form mel is padded to 30 s): alignment only
     // looks at encoder positions that carry audio.
@@ -1657,9 +1688,6 @@ transcribe_status whisper_run(transcribe_session *          session,
                 logits[static_cast<size_t>(id)] = -INFINITY;
             }
         }
-    };
-    auto token_is_timestamp = [&](int id) {
-        return id >= timestamp_begin && id < static_cast<int>(vocab_size);
     };
 
     // ----- Chunk loop -----
@@ -1833,12 +1861,11 @@ transcribe_status whisper_run(transcribe_session *          session,
         prompt_text_ids.erase(prompt_text_ids.begin(), prompt_text_ids.end() - max_prev_cap);
     }
 
-    // History stored as segment token slices (not one flat vector) because
-    // skip_ending_double_timestamps applies per-segment. FIRST_SEGMENT puts the
-    // prompt at the head; ALL_SEGMENTS starts empty and re-prepends per chunk.
-    std::vector<std::vector<int32_t>> prev_history_segments;
-    if (wp->prompt_condition == TRANSCRIBE_WHISPER_PROMPT_FIRST_SEGMENT && !prompt_text_ids.empty()) {
-        prev_history_segments.push_back(prompt_text_ids);
+    // Carried context tokens. FIRST_SEGMENT puts the prompt at the head;
+    // ALL_SEGMENTS starts empty and re-prepends it per chunk.
+    std::vector<int32_t> prev_history;
+    if (wp->prompt_condition == TRANSCRIBE_WHISPER_PROMPT_FIRST_SEGMENT) {
+        prev_history = prompt_text_ids;
     }
 
     // Per-chunk; HF auto-disables when the previous chunk's accepted
@@ -1846,7 +1873,7 @@ transcribe_status whisper_run(transcribe_session *          session,
     bool do_condition_on_prev_tokens = wp->condition_on_prev_tokens;
 
     int seek = 0;
-    while (seek < total_mel_frames) {
+    while (seek < total_mel_frames && seek + k_min_tail_frames < content_frames) {
         if (cc->poll_abort()) {
             commit_result();
             return TRANSCRIBE_ERR_ABORTED;
@@ -1945,31 +1972,27 @@ transcribe_status whisper_run(transcribe_session *          session,
         // Per-chunk prefix assembly. Mirrors HF
         // _prepare_decoder_input_ids: decoder input is prev_tokens + init.
         //   condition_on_prev + history: bos + history[-cut_off:], where bos is
-        //     [<|startofprev|>(, prompt for ALL_SEGMENTS)]; drop a trailing
-        //     double-timestamp per skip_ending_double_timestamps.
+        //     [<|startofprev|>(, prompt for ALL_SEGMENTS)].
         //   else if initial prompt: [<|startofprev|>, prompt_text_ids...]
         //     (ALL_SEGMENTS every chunk; FIRST_SEGMENT first chunk only).
         //   else: empty.
         // We diverge from HF for FIRST_SEGMENT (the default): prime only the
-        // first window, matching whisper.cpp / OpenAI.
+        // first window, matching whisper.cpp / OpenAI. Like whisper.cpp, the
+        // history keeps each window's closing timestamp pair (HF drops the
+        // second one), and a window starting less than 5 s before the audio
+        // end gets no prior context: on a short final window the carried
+        // text tends to make the decoder repeat or continue it.
+        constexpr int        k_prompt_tail_frames = 500;
         std::vector<int32_t> prev_tokens;
-        if (do_condition_on_prev_tokens && !prev_history_segments.empty() && prev_sot_id >= 0) {
+        if (!is_first_chunk && seek + k_prompt_tail_frames >= content_frames) {
+            prev_history.clear();
+        } else if (do_condition_on_prev_tokens && !prev_history.empty() && prev_sot_id >= 0) {
             prev_tokens.push_back(prev_sot_id);
             if (wp->prompt_condition == TRANSCRIBE_WHISPER_PROMPT_ALL_SEGMENTS && !prompt_text_ids.empty()) {
                 prev_tokens.insert(prev_tokens.end(), prompt_text_ids.begin(), prompt_text_ids.end());
             }
-            std::vector<int32_t> hist;
-            for (const auto & seg : prev_history_segments) {
-                size_t n = seg.size();
-                if (n > 2 && token_is_timestamp(seg[n - 2])) {
-                    // skip_ending_double_timestamps: drop the last token of any
-                    // segment whose penultimate token is a timestamp.
-                    --n;
-                }
-                hist.insert(hist.end(), seg.begin(), seg.begin() + n);
-            }
-            const int cap = std::min<int>(static_cast<int>(hist.size()), max_prev_cap);
-            prev_tokens.insert(prev_tokens.end(), hist.end() - cap, hist.end());
+            const int cap = std::min<int>(static_cast<int>(prev_history.size()), max_prev_cap);
+            prev_tokens.insert(prev_tokens.end(), prev_history.end() - cap, prev_history.end());
         } else if (!prompt_text_ids.empty() && prev_sot_id >= 0 &&
                    (is_first_chunk || wp->prompt_condition == TRANSCRIBE_WHISPER_PROMPT_ALL_SEGMENTS)) {
             // FIRST_SEGMENT primes the initial prompt on the first window
@@ -1990,7 +2013,7 @@ transcribe_status whisper_run(transcribe_session *          session,
             prompt_ids.push_back(lang_token);
             prompt_ids.push_back(task_token);
         }
-        if (!want_segment_timestamps) {
+        if (!decode_timestamps) {
             prompt_ids.push_back(cm->hparams.no_timestamps_token_id);
         }
         const int seq_len = static_cast<int>(prompt_ids.size());
@@ -2012,16 +2035,7 @@ transcribe_status whisper_run(transcribe_session *          session,
 
         // Per-chunk generated state.
         std::vector<int32_t> generated_ids;
-        std::vector<int32_t> generated_text_ids;
         generated_ids.reserve(128);
-        generated_text_ids.reserve(64);
-
-        auto consume_generated_token = [&](int id) {
-            generated_ids.push_back(static_cast<int32_t>(id));
-            if (!token_is_timestamp(id) && id >= 0 && id < 50257) {
-                generated_text_ids.push_back(static_cast<int32_t>(id));
-            }
-        };
 
         // max_initial_timestamp_index: HF WhisperTimeStampLogitsProcessor masks
         // timestamps above timestamp_begin + this index on the first generated
@@ -2046,9 +2060,8 @@ transcribe_status whisper_run(transcribe_session *          session,
         //      timestamp_begin + max_initial_timestamp_index (HF
         //      logits_process.py:2040-2042).
         auto apply_timestamp_rules = [&](std::vector<float> & logits) {
-            apply_whisper_timestamp_rules(logits, generated_ids, want_segment_timestamps,
-                                          cm->hparams.no_timestamps_token_id, timestamp_begin, vocab_size, eos_id,
-                                          max_initial_timestamp_index);
+            apply_whisper_timestamp_rules(logits, generated_ids, decode_timestamps, cm->hparams.no_timestamps_token_id,
+                                          timestamp_begin, vocab_size, eos_id, max_initial_timestamp_index);
         };
 
         int next_id = 0;
@@ -2068,7 +2081,6 @@ transcribe_status whisper_run(transcribe_session *          session,
         // Accepted-tier output (commits every tier so the last-fallback
         // is returned when no tier passes thresholds).
         std::vector<int32_t> accepted_generated_ids;
-        std::vector<int32_t> accepted_generated_text_ids;
         float                accepted_T           = 0.0f;
         float                accepted_compression = 0.0f;
         float                accepted_avg_logprob = 0.0f;
@@ -2167,7 +2179,6 @@ transcribe_status whisper_run(transcribe_session *          session,
             cc->kv_cache.n    = 0;
             cc->kv_cache.head = 0;
             generated_ids.clear();
-            generated_text_ids.clear();
             tier_hit_eos             = false;
             double sum_logprob       = 0.0;
             int    n_logprob_samples = 0;
@@ -2419,7 +2430,10 @@ transcribe_status whisper_run(transcribe_session *          session,
                     commit_result();
                     return TRANSCRIBE_ERR_ABORTED;
                 }
-                consume_generated_token(next_id);
+                generated_ids.push_back(static_cast<int32_t>(next_id));
+                if (decode_timestamps && whisper_ts_reaches_audio_end(next_id, timestamp_begin, seek, content_frames)) {
+                    break;
+                }
 
                 if (n_past + 1 > static_cast<int>(n_ctx_decoder)) {
                     break;
@@ -2595,12 +2609,11 @@ transcribe_status whisper_run(transcribe_session *          session,
             // Commit the tier's output unconditionally so the last-tried tier
             // wins when no tier passes (matches HF generate_with_fallback). A
             // no_speech_should_skip is discarded below after recording metrics.
-            accepted_generated_ids      = generated_ids;
-            accepted_generated_text_ids = generated_text_ids;
-            accepted_T                  = tier_T;
-            accepted_compression        = tier_comp_ratio;
-            accepted_avg_logprob        = tier_avg_logprob;
-            accepted_n_fallbacks        = static_cast<int>(ti);
+            accepted_generated_ids = generated_ids;
+            accepted_T             = tier_T;
+            accepted_compression   = tier_comp_ratio;
+            accepted_avg_logprob   = tier_avg_logprob;
+            accepted_n_fallbacks   = static_cast<int>(ti);
 
             if (no_speech_should_skip) {
                 no_speech_fired_this_chunk = true;
@@ -2613,11 +2626,9 @@ transcribe_status whisper_run(transcribe_session *          session,
 
         // Hand off the accepted tier to segment emission. A no-speech-fired
         // chunk discards its output but still advances seek a full window.
-        generated_ids      = accepted_generated_ids;
-        generated_text_ids = accepted_generated_text_ids;
+        generated_ids = std::move(accepted_generated_ids);
         if (no_speech_fired_this_chunk) {
             generated_ids.clear();
-            generated_text_ids.clear();
         }
 
         // Commit per-chunk trace over [time_offset_ms, +seek_num_frames*10ms):
@@ -2650,8 +2661,9 @@ transcribe_status whisper_run(transcribe_session *          session,
         //   - >=1 closed pair, not single-ended: discard the unfinished tail,
         //     advance by the last closed ts position * input_stride(2) frames.
         //   - no pairs: emit one full-chunk segment, advance seek_num_frames.
-        // TIMESTAMPS_NONE includes <|notimestamps|>, so no ts tokens -> "no
-        // pairs" branch, full-chunk advance, no per-chunk segment emission.
+        // Short-form TIMESTAMPS_NONE includes <|notimestamps|>, so no ts
+        // tokens -> "no pairs" branch, full-chunk advance. NONE never emits
+        // per-chunk segments.
         WhisperSegmentResult seg_res = whisper_retrieve_segment(generated_ids, cm->tok, time_offset_ms, seek_num_frames,
                                                                 want_segment_timestamps, timestamp_begin, vocab_size);
         std::vector<align::Segment> window_segs;
@@ -2697,18 +2709,23 @@ transcribe_status whisper_run(transcribe_session *          session,
             }
             cc->segments.push_back(std::move(seg));
         }
-        int                                 segment_offset_frames = seg_res.segment_offset_frames;
-        std::vector<std::vector<int32_t>> & prev_chunk_segments   = seg_res.prev_chunk_segments;
+        int segment_offset_frames = seg_res.segment_offset_frames;
+        // A decode stopped at the audio end may end in a closed pair; nothing
+        // is left to re-decode from its first timestamp.
+        if (!generated_ids.empty() &&
+            whisper_ts_reaches_audio_end(generated_ids.back(), timestamp_begin, seek, content_frames)) {
+            segment_offset_frames = seek_num_frames;
+        }
 
         // Update prev-context history from the _retrieve_segment slices, not
         // accepted_generated_ids directly: the closed-pair branch discards the
         // unfinished tail, and carrying it would leak into the next prompt.
-        if (!no_speech_fired_this_chunk && !prev_chunk_segments.empty()) {
-            prev_history_segments.insert(prev_history_segments.end(), prev_chunk_segments.begin(),
-                                         prev_chunk_segments.end());
+        for (const auto & slice : seg_res.prev_chunk_segments) {
+            prev_history.insert(prev_history.end(), slice.begin(), slice.end());
         }
 
-        all_text_ids.insert(all_text_ids.end(), generated_text_ids.begin(), generated_text_ids.end());
+        const std::vector<int32_t> window_text_ids = whisper_slice_text_ids(seg_res, timestamp_begin);
+        all_text_ids.insert(all_text_ids.end(), window_text_ids.begin(), window_text_ids.end());
         all_raw_ids.insert(all_raw_ids.end(), generated_ids.begin(), generated_ids.end());
 
         // Seek advance. HF (generation_whisper.py, 5.6.1) runs ONE seek loop
@@ -2834,6 +2851,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
     const int     n_mels                 = hp.enc_num_mel_bins;
     const int     n_mel_frames_per_chunk = hp.fe_nb_max_frames > 0 ? hp.fe_nb_max_frames : 3000;
     const int     n_samples_per_chunk    = hp.fe_n_samples > 0 ? hp.fe_n_samples : 480000;
+    const int     hop                    = hp.fe_hop_length > 0 ? hp.fe_hop_length : 160;
     const bool    is_multilingual        = cm->caps.supports_language_detect;
     constexpr int k_max_new              = 256;
     // Short-form: PCM padded to one 30s window, so the whole chunk is one
@@ -2957,7 +2975,9 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
             have_result[b]    = 1;
             continue;
         }
-        if (n_samples[b] > n_samples_per_chunk) {
+        // Long-form, and clips too short to decode (the serial path returns
+        // an empty transcript for them), run serially.
+        if (n_samples[b] > n_samples_per_chunk || n_samples[b] / hop <= k_min_tail_frames) {
             needs_serial[b] = 1;
             continue;
         }
@@ -3307,18 +3327,15 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
             }
         }
     };
-    auto token_is_timestamp = [&](int id) {
-        return id >= timestamp_begin && id < static_cast<int>(vocab_size);
-    };
 
     // Per-utterance working + accepted state.
-    std::vector<std::vector<int32_t>> gen(static_cast<size_t>(n)), gen_text(static_cast<size_t>(n));
+    std::vector<std::vector<int32_t>> gen(static_cast<size_t>(n));
     std::vector<double>               sumlp(static_cast<size_t>(n), 0.0);
     std::vector<int>                  nlp(static_cast<size_t>(n), 0);
     std::vector<char>                 fin(static_cast<size_t>(n), 0), hit_eos(static_cast<size_t>(n), 0);
     std::vector<int32_t>              next_tok(static_cast<size_t>(n), 0);
     std::vector<float>                ns_prob(static_cast<size_t>(n), 0.0f);
-    std::vector<std::vector<int32_t>> acc_gen(static_cast<size_t>(n)), acc_gen_text(static_cast<size_t>(n));
+    std::vector<std::vector<int32_t>> acc_gen(static_cast<size_t>(n));
     std::vector<char>                 acc_hit_eos(static_cast<size_t>(n), 0);
     std::vector<char>                 accepted_done(static_cast<size_t>(n), 0);
     std::vector<std::mt19937>         rng(static_cast<size_t>(n));
@@ -3354,7 +3371,6 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
         std::fill(smask.begin(), smask.end(), f16_ninf);
         for (int b = 0; b < n; ++b) {
             gen[b].clear();
-            gen_text[b].clear();
             sumlp[b]    = 0.0;
             nlp[b]      = 0;
             hit_eos[b]  = 0;
@@ -3417,9 +3433,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
                 hit_eos[b] = 1;
             } else {
                 gen[b].push_back(id);
-                if (!token_is_timestamp(id) && id >= 0 && id < 50257) {
-                    gen_text[b].push_back(id);
-                }
+                fin[b] = want_ts && whisper_ts_reaches_audio_end(id, timestamp_begin, 0, n_samples[b] / hop);
             }
         }
         for (int produced = 1; produced < k_max_new; ++produced, ++pos) {
@@ -3457,9 +3471,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
                     hit_eos[b] = 1;
                 } else {
                     gen[b].push_back(id);
-                    if (!token_is_timestamp(id) && id >= 0 && id < 50257) {
-                        gen_text[b].push_back(id);
-                    }
+                    fin[b] = want_ts && whisper_ts_reaches_audio_end(id, timestamp_begin, 0, n_samples[b] / hop);
                 }
             }
         }
@@ -3481,7 +3493,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
         }
         return s.substr(a, b - a);
     };
-    auto finalize = [&](int b, const std::vector<int32_t> & g, const std::vector<int32_t> & gt) {
+    auto finalize = [&](int b, const std::vector<int32_t> & g) {
         // Continuation peel: a decode that ends in a consecutive-timestamp
         // pair re-enters the serial seek loop at that timestamp (HF's unified
         // seek loop; the short-form advance matches long-form). The
@@ -3491,12 +3503,15 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
         // return_timestamps=False too), so check both timestamp modes.
         WhisperSegmentResult sr = whisper_retrieve_segment(g, cm->tok, /*time_offset_ms=*/0, seek_num_frames, want_ts,
                                                            timestamp_begin, vocab_size);
-        if (sr.segment_offset_frames > 0 && sr.segment_offset_frames < seek_num_frames) {
+        const bool           at_audio_end =
+            !g.empty() && whisper_ts_reaches_audio_end(g.back(), timestamp_begin, 0, n_samples[b] / hop);
+        if (sr.segment_offset_frames > 0 && sr.segment_offset_frames < seek_num_frames && !at_audio_end) {
             needs_serial[b]  = 1;
             accepted_done[b] = 1;
             return;
         }
         transcribe_session::ResultSet rs;
+        const std::vector<int32_t>    gt = whisper_slice_text_ids(sr, timestamp_begin);
         std::vector<int>              tids(gt.begin(), gt.end());
         std::string                   text =
             tids.empty() ? std::string() : trim_ws(cm->tok.decode(tids.data(), static_cast<int>(tids.size())));
@@ -3551,17 +3566,16 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
             const float avg_lp =
                 nlp[b] > 0 ? static_cast<float>(sumlp[b] / nlp[b]) : -std::numeric_limits<float>::infinity();
             // Record this tier's output (last tier wins if none accepts).
-            acc_gen[b]      = gen[b];
-            acc_gen_text[b] = gen_text[b];
-            acc_hit_eos[b]  = hit_eos[b];
+            acc_gen[b]     = gen[b];
+            acc_hit_eos[b] = hit_eos[b];
 
             const bool comp_ok = comp_ratio <= wp->compression_ratio_thold;
             const bool lp_ok   = avg_lp >= wp->logprob_thold;
             const bool ns_skip = ns_prob[b] > wp->no_speech_thold && avg_lp < wp->logprob_thold;
             if (ns_skip) {
-                finalize(b, std::vector<int32_t>{}, std::vector<int32_t>{});
+                finalize(b, std::vector<int32_t>{});
             } else if (comp_ok && lp_ok) {
-                finalize(b, acc_gen[b], acc_gen_text[b]);
+                finalize(b, acc_gen[b]);
             }
             // else: escalate to the next tier.
         }
@@ -3571,7 +3585,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
         if (!valid[b] || accepted_done[b]) {
             continue;
         }
-        finalize(b, acc_gen[b], acc_gen_text[b]);
+        finalize(b, acc_gen[b]);
     }
     dec_us += ggml_time_us() - t_dec0;
     // Patch decode timings now that dec_us is known (finalize ran earlier).
