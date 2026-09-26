@@ -173,6 +173,7 @@ with `TRANSCRIBE_ERR_INPUT_TOO_LONG` (one-shot and batch) or surfaced via
 | Over-length, hard-cap family | `TRANSCRIBE_ERR_INPUT_TOO_LONG` | `ERROR` via callback | no transcript (rejected before the decode) |
 | Generation ran long mid-decode | `TRANSCRIBE_ERR_OUTPUT_TRUNCATED` | `WARN` via callback | partial transcript readable; `transcribe_was_truncated() == true` |
 | Greedy decode started repeating | `TRANSCRIBE_ERR_OUTPUT_REPETITION` | `WARN` via callback | partial transcript readable, repeats dropped; `transcribe_was_truncated() == true` |
+| TDT frame stuck repeating (Parakeet) | `TRANSCRIBE_OK` | `DEBUG` | full transcript, repeats at that frame dropped (one copy kept) |
 | Over-window, soft-window family | `TRANSCRIBE_OK` | `WARN` via callback | full transcript (accuracy may be degraded) |
 | Chunked / unbounded family | `TRANSCRIBE_OK` | — | full transcript |
 | Cache/graph allocation failed | `TRANSCRIBE_ERR_OOM` | `ERROR` via callback | no transcript (no silent context shrink) |

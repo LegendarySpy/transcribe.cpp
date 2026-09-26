@@ -17,6 +17,7 @@
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
 #include "transcribe-log.h"
+#include "transcribe-repetition-guard.h"
 #include "weights.h"
 
 // ggml-backend.h, not ggml-cpu.h: under GGML_BACKEND_DL the CPU backend
@@ -1008,6 +1009,33 @@ float token_confidence(const float * token_logits, int n_token_classes, std::vec
     return static_cast<float>(1.0 - entropy / max_entropy);
 }
 
+// A TDT frame that emits max_symbols tokens without advancing is stuck.
+// When the tokens it emitted end in a repeating block, keep one copy
+// (transcribe-repetition-guard.h); the forced advance then moves on.
+void trim_stuck_frame(std::vector<TdtToken> & toks, int step, int max_symbols) {
+    if (!repetition_guard_enabled()) {
+        return;
+    }
+    size_t start = toks.size();
+    while (start > 0 && toks[start - 1].step_at_emit == step) {
+        --start;
+    }
+    std::vector<int32_t> ids;
+    for (size_t i = start; i < toks.size(); ++i) {
+        ids.push_back(toks[i].id);
+    }
+    const int       n     = static_cast<int>(ids.size());
+    const RepeatBar bar   = { max_symbols / 2, 2, 0, max_symbols, 2 };
+    const int       block = repeating_tail_block(ids.data(), n, bar);
+    if (block == 0) {
+        return;
+    }
+    const int kept = trim_repeating_tail(ids.data(), n, block);
+    toks.resize(start + static_cast<size_t>(kept));
+    log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "parakeet decoder: dropped %d tokens of a repeating %d-token block at frame %d",
+            n - kept, block, step);
+}
+
 // Greedy TDT / RNN-T decode with phrase boosting (boost.h). The step rules
 // are the unboosted loops' own. `main` is the committed path; its tokens go
 // straight to `out`. When the boosted pick differs from the model's token,
@@ -1116,6 +1144,7 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
         if (duration != 0) {
             c.new_symbols = 0;
         } else if (w.tdt_max_symbols > 0 && c.new_symbols >= w.tdt_max_symbols) {
+            trim_stuck_frame(dst, frame_offset + c.step, w.tdt_max_symbols);
             c.step += 1;
             c.new_symbols = 0;
         } else if (is_blank && w.tdt_max_symbols > 0) {
@@ -1458,6 +1487,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
         if (duration != 0) {
             new_symbols = 0;
         } else if (w.tdt_max_symbols > 0 && new_symbols >= w.tdt_max_symbols) {
+            trim_stuck_frame(out_tokens, step, w.tdt_max_symbols);
             step += 1;
             new_symbols = 0;
         } else if (is_blank && w.tdt_max_symbols > 0) {
