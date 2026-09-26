@@ -1001,6 +1001,28 @@ bool whisper_is_repetitive(const std::vector<int32_t> & ids, int timestamp_begin
     return entropy < thold;
 }
 
+// whisper.cpp's avg_logprob: the mean over the result, which ends at the last
+// timestamp token (tokens after it are decoded again by the next window);
+// with no timestamp it covers every sampled token, EOT included.
+// token_lps[i] is the log-probability of the i-th sampled token.
+float whisper_avg_logprob(const std::vector<int32_t> & ids, const std::vector<float> & token_lps, int timestamp_begin) {
+    size_t n = token_lps.size();
+    for (size_t i = ids.size(); i > 0; --i) {
+        if (ids[i - 1] > timestamp_begin) {
+            n = i;
+            break;
+        }
+    }
+    if (n == 0) {
+        return -std::numeric_limits<float>::infinity();
+    }
+    double sum = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        sum += token_lps[i];
+    }
+    return static_cast<float>(sum / static_cast<double>(n));
+}
+
 // Real audio shorter than this (10 mel frames = 100 ms) past the seek point
 // is not decoded, and a window stops generating once a timestamp reaches
 // that close to the audio end (whisper.cpp's delta_min): text past the end
@@ -2157,8 +2179,9 @@ transcribe_status whisper_run(transcribe_session *          session,
         // Temperature fallback setup. Per-chunk tuple [t0, t0+dt, ...] up to
         // 1.0; default [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]. A tier is accepted when
         // compression_ratio < thold AND avg_logprob > thold AND the output is
-        // not repetitive (entropy_thold); if all fail, keep the last tier's
-        // output. Thresholds use INF sentinels to mean disabled.
+        // neither repetitive (entropy_thold) nor empty short of the audio end;
+        // if all fail, keep the last tier's output. Thresholds use INF
+        // sentinels to mean disabled.
         std::vector<float> temperatures;
         temperatures.push_back(wp->temperature);
         if (wp->temperature_inc > 0.0f) {
@@ -2272,12 +2295,13 @@ transcribe_status whisper_run(transcribe_session *          session,
 
             // best_of candidates at T > 0, one greedy decode at T == 0. The
             // tier keeps the candidate with the best average log-probability,
-            // preferring one that passes the repetition check (whisper.cpp).
+            // preferring one that does not fail whisper.cpp's checks.
             const int            n_candidates = tier_T > 0.0f ? std::clamp(wp->best_of, 1, 8) : 1;
             std::vector<int32_t> tier_ids;
             bool                 tier_eos         = false;
-            bool                 tier_repetitive  = false;
+            bool                 tier_failed      = false;
             float                tier_avg_logprob = -std::numeric_limits<float>::infinity();
+            std::vector<float>   token_lps;
             for (int cand = 0; cand < n_candidates; ++cand) {
                 // Per-candidate reset. Self-cache resets every decode (each
                 // generates its own token sequence); cross-cache stays
@@ -2285,9 +2309,8 @@ transcribe_status whisper_run(transcribe_session *          session,
                 cc->kv_cache.n    = 0;
                 cc->kv_cache.head = 0;
                 generated_ids.clear();
-                tier_hit_eos             = false;
-                double sum_logprob       = 0.0;
-                int    n_logprob_samples = 0;
+                tier_hit_eos = false;
+                token_lps.clear();
 
                 // Dump gate: references were captured at T=0, so only tier 0 of the
                 // first chunk emits intermediates.
@@ -2449,7 +2472,7 @@ transcribe_status whisper_run(transcribe_session *          session,
                         const int64_t t_prompt_sample_start = ggml_time_us();
                         float         lp                    = 0.0f;
                         next_id                             = sample_argmax_and_logprob(last_logits, &lp);
-                        sum_logprob += lp;
+                        token_lps.push_back(lp);
                         cc->perf.prompt_cpu_sample.add(ggml_time_us() - t_prompt_sample_start);
                     } else {
                         const int64_t t_prompt_sample_start = ggml_time_us();
@@ -2457,10 +2480,9 @@ transcribe_status whisper_run(transcribe_session *          session,
                         cc->perf.prompt_cpu_sample.add(ggml_time_us() - t_prompt_sample_start);
 
                         const int64_t t_prompt_lp_start = ggml_time_us();
-                        sum_logprob += logprob_of_token(last_logits, next_id);
+                        token_lps.push_back(logprob_of_token(last_logits, next_id));
                         cc->perf.prompt_cpu_logprob.add(ggml_time_us() - t_prompt_lp_start);
                     }
-                    n_logprob_samples += 1;
                     cc->perf.prompt_cpu.add(ggml_time_us() - t_prompt_cpu_start);
                 }
 
@@ -2671,7 +2693,7 @@ transcribe_status whisper_run(transcribe_session *          session,
                         const int64_t t_step_sample_start = ggml_time_us();
                         float         lp                  = 0.0f;
                         next_id                           = sample_argmax_and_logprob(last_logits, &lp);
-                        sum_logprob += lp;
+                        token_lps.push_back(lp);
                         cc->perf.step_cpu_sample.add(ggml_time_us() - t_step_sample_start);
                     } else {
                         const int64_t t_step_sample_start = ggml_time_us();
@@ -2679,21 +2701,28 @@ transcribe_status whisper_run(transcribe_session *          session,
                         cc->perf.step_cpu_sample.add(ggml_time_us() - t_step_sample_start);
 
                         const int64_t t_step_lp_start = ggml_time_us();
-                        sum_logprob += logprob_of_token(last_logits, next_id);
+                        token_lps.push_back(logprob_of_token(last_logits, next_id));
                         cc->perf.step_cpu_logprob.add(ggml_time_us() - t_step_lp_start);
                     }
-                    n_logprob_samples += 1;
                     cc->perf.step_cpu.add(ggml_time_us() - t_step_cpu_start);
                 }
 
-                const float avg_logprob = n_logprob_samples > 0 ? static_cast<float>(sum_logprob / n_logprob_samples) :
-                                                                  -std::numeric_limits<float>::infinity();
-                const bool  repetitive  = whisper_is_repetitive(generated_ids, timestamp_begin, wp->entropy_thold);
-                if (cand == 0 || (tier_repetitive && !repetitive) ||
-                    (repetitive == tier_repetitive && avg_logprob > tier_avg_logprob)) {
+                const float avg_logprob = whisper_avg_logprob(generated_ids, token_lps, timestamp_begin);
+                // whisper.cpp also fails a decode that ends without any
+                // timestamp after <|0.00|> in a window short of the audio end
+                // (an empty window would skip 30 s of speech).
+                bool        has_ts      = false;
+                for (const int32_t id : generated_ids) {
+                    has_ts = has_ts || id > timestamp_begin;
+                }
+                const bool failed =
+                    whisper_is_repetitive(generated_ids, timestamp_begin, wp->entropy_thold) ||
+                    (tier_hit_eos && !has_ts && seek + n_mel_frames_per_chunk + k_min_tail_frames < content_frames);
+                if (cand == 0 || (tier_failed && !failed) ||
+                    (failed == tier_failed && avg_logprob > tier_avg_logprob)) {
                     tier_ids         = generated_ids;
                     tier_eos         = tier_hit_eos;
-                    tier_repetitive  = repetitive;
+                    tier_failed      = failed;
                     tier_avg_logprob = avg_logprob;
                 }
             }  // candidates
@@ -2714,7 +2743,7 @@ transcribe_status whisper_run(transcribe_session *          session,
             // `comp_ratio > thold` or `avg_logprob < thold`; equality does NOT
             // trigger, so a tier is accepted under `<= / >=`. INF sentinels work
             // (<= +INF and >= -INF are always true: disabled thresholds pass).
-            const bool comp_ok = tier_comp_ratio <= wp->compression_ratio_thold && !tier_repetitive;
+            const bool comp_ok = tier_comp_ratio <= wp->compression_ratio_thold && !tier_failed;
             const bool lp_ok   = tier_avg_logprob >= wp->logprob_thold;
 
             // HF _need_fallback sets should_skip (and halts fallback) when BOTH
@@ -3443,8 +3472,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
 
     // Per-utterance working + accepted state.
     std::vector<std::vector<int32_t>> gen(static_cast<size_t>(n));
-    std::vector<double>               sumlp(static_cast<size_t>(n), 0.0);
-    std::vector<int>                  nlp(static_cast<size_t>(n), 0);
+    std::vector<std::vector<float>>   lps(static_cast<size_t>(n));
     std::vector<char>                 fin(static_cast<size_t>(n), 0), hit_eos(static_cast<size_t>(n), 0);
     std::vector<int32_t>              next_tok(static_cast<size_t>(n), 0);
     std::vector<float>                ns_prob(static_cast<size_t>(n), 0.0f);
@@ -3474,8 +3502,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
             id = sample_from_logits(lb, rng[b], &cc->sample_scratch);
             lp = logprob_of_token(lb, id);
         }
-        sumlp[b] += lp;
-        nlp[b] += 1;
+        lps[b].push_back(lp);
         return id;
     };
 
@@ -3485,8 +3512,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
         std::fill(smask.begin(), smask.end(), f16_ninf);
         for (int b = 0; b < n; ++b) {
             gen[b].clear();
-            sumlp[b]    = 0.0;
-            nlp[b]      = 0;
+            lps[b].clear();
             hit_eos[b]  = 0;
             fin[b]      = !valid[b];
             next_tok[b] = 0;
@@ -3677,11 +3703,10 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
                 comp_tail.push_back(static_cast<int32_t>(eos_id));
             }
             const float comp_ratio = compute_compression_ratio_hf(comp_tail, vocab_size);
-            const float avg_lp =
-                nlp[b] > 0 ? static_cast<float>(sumlp[b] / nlp[b]) : -std::numeric_limits<float>::infinity();
+            const float avg_lp     = whisper_avg_logprob(gen[b], lps[b], timestamp_begin);
             // Record this tier's output (last tier wins if none accepts).
-            acc_gen[b]     = gen[b];
-            acc_hit_eos[b] = hit_eos[b];
+            acc_gen[b]             = gen[b];
+            acc_hit_eos[b]         = hit_eos[b];
 
             const bool comp_ok = comp_ratio <= wp->compression_ratio_thold &&
                                  !whisper_is_repetitive(gen[b], timestamp_begin, wp->entropy_thold);
