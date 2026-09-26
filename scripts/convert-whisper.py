@@ -104,6 +104,9 @@ KV emitted:
     stt.whisper.tie_word_embeddings = True
     stt.whisper.decoder.scale_embedding = False   (HF config.scale_embedding)
     stt.whisper.suppress_tokens / begin_suppress_tokens
+    stt.whisper.alignment_heads (flat [layer, head, ...] from
+        generation_config.alignment_heads, word timestamps; omitted when absent
+        or out of range for the decoder)
 
     stt.frontend.type / num_mels / sample_rate / n_fft / win_length /
                  hop_length / window / normalize / pad_mode /
@@ -292,6 +295,18 @@ def read_hparams(config: dict, gen_config: dict, preproc: dict) -> dict:
     suppress_tokens  = [int(x) for x in gen_config.get("suppress_tokens",  []) or []]
     begin_suppress   = [int(x) for x in gen_config.get("begin_suppress_tokens", []) or []]
 
+    # Word-timestamp cross-attention heads. Some fine-tunes copy a parent's
+    # list verbatim (distil-small.en carries small.en's 12-layer list on a
+    # 4-layer decoder); drop lists that don't fit this decoder.
+    alignment_heads = []
+    raw_heads = gen_config.get("alignment_heads") or []
+    if raw_heads:
+        if all(len(p) == 2 and 0 <= int(p[0]) < dec_layers and 0 <= int(p[1]) < dec_heads for p in raw_heads):
+            alignment_heads = [int(v) for p in raw_heads for v in p]
+        else:
+            print(f"warning: generation_config alignment_heads out of range for "
+                  f"{dec_layers}x{dec_heads} decoder; not written")
+
     # Frontend (WhisperFeatureExtractor fields are canonical; the exact
     # mel_filters array comes out as a tensor, not a KV — see convert()).
     sample_rate  = int(preproc.get("sampling_rate", 16000))
@@ -329,6 +344,7 @@ def read_hparams(config: dict, gen_config: dict, preproc: dict) -> dict:
         "prev_sot_token_id":       prev_sot_id,
         "suppress_tokens":         suppress_tokens,
         "begin_suppress_tokens":   begin_suppress,
+        "alignment_heads":         alignment_heads,
 
         "fe_type":        "mel",
         "fe_sample_rate": sample_rate,
@@ -621,6 +637,8 @@ def convert(model_dir: Path, out_path: Path, variant: str, repo_id: str | None =
             writer.add_array("stt.whisper.suppress_tokens",       hp["suppress_tokens"])
         if hp["begin_suppress_tokens"]:
             writer.add_array("stt.whisper.begin_suppress_tokens", hp["begin_suppress_tokens"])
+        if hp["alignment_heads"]:
+            writer.add_array("stt.whisper.alignment_heads",       hp["alignment_heads"])
 
         # ---- stt.frontend.* (WhisperFeatureExtractor) ----
         writer.add_string ("stt.frontend.type",          hp["fe_type"])
