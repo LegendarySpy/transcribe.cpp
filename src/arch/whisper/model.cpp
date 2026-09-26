@@ -1778,8 +1778,9 @@ transcribe_status whisper_run(transcribe_session *          session,
     // Resolve initial prompt -> text-only token ids (library prepends
     // <|startofprev|>). Two paths: prompt_tokens (caller-owned, verbatim,
     // text-side only); or initial_prompt string, tokenized as HF's
-    // get_prompt_ids form ("<|startofprev|> " + strip) with any special token
-    // (id >= eos_id) in the text rejected (tokenization_whisper.py).
+    // get_prompt_ids form ("<|startofprev|> " + strip). The byte-level BPE
+    // never emits special ids, so special-token literals such as "<|en|>"
+    // encode as plain text, like whisper.cpp (HF rejects them).
     const int max_prev_cap =
         wp->max_prev_context_tokens > 0 ? wp->max_prev_context_tokens : (cm->hparams.dec_max_target_positions / 2 - 1);
     std::vector<int32_t> prompt_text_ids;
@@ -1810,38 +1811,6 @@ transcribe_status whisper_run(transcribe_session *          session,
         if (b > a) {
             std::string text(" ");
             text.append(s.data() + a, b - a);
-
-            // Pre-check for special-token literals (`<|...|>`) before
-            // BPE-encoding. HF's get_prompt_ids relies on the
-            // tokenizer's added-token recognition to surface specials
-            // as single ids and rejects any with id >=
-            // all_special_ids[0] (== eos_id). Our gpt-2 BPE encoder
-            // doesn't recognize specials, so without this scan a
-            // literal "<|en|>" in user text would silently BPE-encode
-            // byte-by-byte and slip through. Mirror HF's intent by
-            // checking each "<|...|>" substring against the vocab
-            // directly.
-            for (size_t i = 0; i + 1 < text.size();) {
-                if (text[i] == '<' && text[i + 1] == '|') {
-                    const size_t end = text.find("|>", i + 2);
-                    if (end != std::string::npos) {
-                        const size_t close = end + 2;
-                        std::string  piece = text.substr(i, close - i);
-                        const int    id    = cm->tok.find(piece);
-                        if (id >= eos_id) {
-                            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                                    "whisper run: initial_prompt contains "
-                                    "disallowed special token \"%s\" (id %d)",
-                                    piece.c_str(), id);
-                            return TRANSCRIBE_ERR_INVALID_ARG;
-                        }
-                        i = close;
-                        continue;
-                    }
-                }
-                ++i;
-            }
-
             if (cm->tok.encode(text, prompt_text_ids) != TRANSCRIBE_OK) {
                 log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                         "whisper run: tokenizer.encode failed on "
@@ -2941,20 +2910,6 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
             if (b > a) {
                 std::string text(" ");
                 text.append(s.data() + a, b - a);
-                for (size_t i = 0; i + 1 < text.size();) {
-                    if (text[i] == '<' && text[i + 1] == '|') {
-                        const size_t end = text.find("|>", i + 2);
-                        if (end != std::string::npos) {
-                            std::string piece = text.substr(i, end + 2 - i);
-                            if (cm->tok.find(piece) >= eos_id) {
-                                return whisper_run_batch_serial(cc, pcm, n_samples, n, params);
-                            }
-                            i = end + 2;
-                            continue;
-                        }
-                    }
-                    ++i;
-                }
                 if (cm->tok.encode(text, ptext) != TRANSCRIBE_OK) {
                     return whisper_run_batch_serial(cc, pcm, n_samples, n, params);
                 }

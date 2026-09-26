@@ -230,26 +230,13 @@ void test_multilingual(const char * model_path) {
         }
     }
 
-    // Special-token literals embedded in initial_prompt must be
-    // rejected with INVALID_ARG, matching the GGUF path. The .bin
-    // vocab does not store "<|en|>" / "<|notimestamps|>" / "<|0.00|>"
-    // strings directly; the bin adapter synthesizes them into the
-    // tokenizer's special-piece map so find() can resolve them. A
-    // gap here would let users smuggle special bytes into the
-    // decoder context.
+    // Special-token literals embedded in initial_prompt encode as plain
+    // text (whisper.cpp behavior, matching the GGUF path): the run
+    // succeeds, and no special id reaches the decoder context.
     {
         const char * literals[] = {
-            "transcribe <|en|> address",
-            "use <|notimestamps|> please",
-            "<|0.00|> beginning",
-            "<|30.00|> end",
-            "<|translate|> task",
-            // EOS — locks the eos_id == 50257 case explicitly. The
-            // first-line check at model.cpp:1442 catches this via
-            // find(); the second-line id-vs-eos_id check would also
-            // catch it, but a literal in user text should never reach
-            // the encoder in the first place.
-            "ending <|endoftext|> here",
+            "transcribe <|en|> address", "use <|notimestamps|> please", "<|0.00|> beginning", "<|30.00|> end",
+            "<|translate|> task",        "ending <|endoftext|> here",
         };
         for (const char * t : literals) {
             transcribe_run_params rp;
@@ -260,7 +247,8 @@ void test_multilingual(const char * model_path) {
             wp.initial_prompt = t;
             rp.family         = &wp.ext;
             st                = transcribe_run(ctx, jfk.data(), static_cast<int>(jfk.size()), &rp);
-            CHECK(st == TRANSCRIBE_ERR_INVALID_ARG);
+            CHECK(st == TRANSCRIBE_OK);
+            CHECK(contains(transcribe_full_text(ctx), "country"));
         }
     }
 

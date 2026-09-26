@@ -585,13 +585,9 @@ int main() {
         CHECK_EQ_INT(st, TRANSCRIBE_ERR_INVALID_ARG);
     }
 
-    // initial_prompt rejects literal special-token strings ("<|en|>",
-    // "<|notimestamps|>", etc.). HF's get_prompt_ids relies on its
-    // tokenizer's added-token recognition to surface specials and
-    // rejects ids >= all_special_ids[0]. Our gpt-2 BPE encoder doesn't
-    // recognize specials, so we precheck for "<|...|>" patterns
-    // directly against the vocab. "<|en|>" is a real id (50259 for
-    // multilingual whisper) and must be rejected before any compute.
+    // initial_prompt text that looks like a special token ("<|en|>" is a
+    // real id, 50259 for multilingual whisper) encodes as plain text, like
+    // whisper.cpp: the run succeeds and still transcribes.
     {
         transcribe_run_params rp;
         transcribe_run_params_init(&rp);
@@ -600,7 +596,8 @@ int main() {
         wp.initial_prompt = "Inaugural <|en|> address";
         rp.family         = &wp.ext;
         st                = transcribe_run(ctx, pcm.data(), static_cast<int>(pcm.size()), &rp);
-        CHECK_EQ_INT(st, TRANSCRIBE_ERR_INVALID_ARG);
+        CHECK_EQ_INT(st, TRANSCRIBE_OK);
+        CHECK(std::strstr(transcribe_full_text(ctx), "country") != nullptr);
     }
 
     // prompt_tokens must NOT include <|startofprev|> at index 0 — the

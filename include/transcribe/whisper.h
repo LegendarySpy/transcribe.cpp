@@ -97,10 +97,9 @@ struct transcribe_whisper_run_ext {
      *       Tokenize as HF's get_prompt_ids does:
      *           "<|startofprev|>" + " " + initial_prompt.strip()
      *       The leading space is mandatory (matches
-     *       transformers tokenization_whisper.py:710-722). Any special
-     *       token (<|...|>) found in the tokenized prompt text is
-     *       rejected with TRANSCRIBE_ERR_INVALID_ARG, mirroring HF's
-     *       own check.
+     *       transformers tokenization_whisper.py:710-722). Text that
+     *       looks like a special token (e.g. "<|en|>") is encoded as
+     *       plain text, like whisper.cpp does.
      *
      *   Else: no initial prompt.
      */
