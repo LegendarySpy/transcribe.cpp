@@ -4,7 +4,8 @@
 // Covers, against a real GGUF (env-gated, RC 77 skip):
 //
 //   1. transcribe_model_accepts_ext_kind: SFST accepted on _RUN only;
-//      foreign kinds rejected.
+//      foreign kinds and the live stream kind (SFLV, Nemotron-3 only)
+//      rejected.
 //   2. transcribe_sortformer_stream_ext_init stamps size/kind/preset.
 //   3. Pre-clear rejection: a wrong-kind ext and an out-of-range preset
 //      both fail with INVALID_ARG and PRESERVE the previous result
@@ -114,6 +115,7 @@ int main() {
     CHECK(transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_RUN, TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM));
     CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_STREAM, TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM));
     CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_RUN, 0x4E524857u /* WHRN */));
+    CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_STREAM, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
 
     // 2. Init function stamps the header + default.
     transcribe_sortformer_stream_ext ext;
@@ -152,6 +154,11 @@ int main() {
         transcribe_sortformer_stream_ext_init(&oor);
         oor.preset = static_cast<transcribe_sortformer_preset>(99);
         rp.family  = &oor.ext;
+        CHECK(transcribe_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_ERR_INVALID_ARG);
+        CHECK(same_segments(read_segments(session), env_rows));
+
+        // The sub-second presets are Nemotron-3 operating points only.
+        oor.preset = TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY;
         CHECK(transcribe_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_ERR_INVALID_ARG);
         CHECK(same_segments(read_segments(session), env_rows));
     }

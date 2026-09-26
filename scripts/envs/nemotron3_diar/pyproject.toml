@@ -1,0 +1,17 @@
+[project]
+name = "transcribe-nemotron3-diar-env"
+version = "0.1.0"
+description = "Python env for Nemotron-3 Diarization (Streaming Sortformer v3) reference dumps via HF Transformers"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch>=2.4",
+    # Nemotron3Diarization landed after the 5.x releases; pin the main commit
+    # the reference dumps were produced against.
+    "transformers @ git+https://github.com/huggingface/transformers.git@c8b81b63232be35ab1774dd3cabbf499d8b9808f",
+    "huggingface-hub>=0.30",
+    "safetensors>=0.4",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "numpy>=1.26",
+    "gguf>=0.10.0",
+]

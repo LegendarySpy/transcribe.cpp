@@ -80,6 +80,9 @@ NORM = [
     "tf.blocks.0.norm_1.weight",            # sortformer transformer post-LN (norm_ prefix)
     "tf.blocks.0.attn.q.bias",              # sortformer transformer attn bias (.bias)
     "diar.spk_head.bias",                   # sortformer diarization head bias (.bias)
+    "diar.silence_emb",                     # nemotron3_diar learned AOSC silence slot
+    "enc.norm_in.weight",                   # nemotron3_diar input LayerNorm
+    "enc.blocks.0.norm_attn.weight",        # nemotron3_diar pre-LN attention norm
     "dec.pos_enc",                          # cohere sinusoidal pos table
     "enc.pos_emb.weight",                   # whisper encoder pos_emb
     "dec.pos_emb.weight",                   # whisper decoder pos_emb
@@ -118,6 +121,9 @@ LINEAR = [
     "tf.blocks.0.ff.in.weight",             # sortformer transformer FFN matrix
     "diar.encoder_proj.weight",             # sortformer 512->192 projection
     "diar.spk_head.weight",                 # sortformer diarization head (4 sigmoid outputs)
+    "enc.embed.proj.weight",                # nemotron3_diar 8-frame stacking projection
+    "diar.upsample.tap1.weight",            # nemotron3_diar sub-pixel upsampler tap
+    "diar.head.out.weight",                 # nemotron3_diar 8-speaker output head
     # granite/granite5_ctc Shaw relative-position table, [head_dim, 2*max+1].
     # NOT a near-miss for the ".pos_emb.weight" Norm rule above: the separator
     # before "pos_emb" is an underscore ("rel_pos_emb"), not a dot, so both

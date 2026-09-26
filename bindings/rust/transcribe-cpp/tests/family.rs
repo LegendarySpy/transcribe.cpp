@@ -1,10 +1,11 @@
 //! Per-family stream-extension happy-path tests (parakeet cache-aware,
-//! parakeet buffered, voxtral realtime). Each proves the extension end to end:
-//! the typed options materialize a kind-tagged struct, the model ACCEPTS the
-//! kind on its stream slot, `stream_begin` consumes it, and a short feed +
-//! finalize emits text. NOT a transcription-accuracy check (that is the family
-//! port's C-level / WER job) — a short feed keeps these fast even for the 4B
-//! voxtral model, so we assert the stream ran and produced non-empty text.
+//! parakeet buffered, voxtral realtime, Nemotron-3 live diarization). Each
+//! proves the extension end to end: the typed options materialize a
+//! kind-tagged struct, the model ACCEPTS the kind on its stream slot,
+//! `stream_begin` consumes it, and a short feed + finalize emits output. NOT
+//! a transcription-accuracy check (that is the family port's C-level / WER
+//! job) — a short feed keeps these fast even for the 4B voxtral model, so we
+//! assert the stream ran and produced non-empty text.
 //!
 //! Mirrors Swift's `FamilyStreamTests`. Each gates on its own per-family GGUF
 //! and skips cleanly when absent (parakeet runs in CI once the canary repos
@@ -16,11 +17,12 @@ mod common;
 
 use transcribe_cpp::sys::{
     TRANSCRIBE_EXT_KIND_PARAKEET_BUFFERED_STREAM, TRANSCRIBE_EXT_KIND_PARAKEET_STREAM,
-    TRANSCRIBE_EXT_KIND_VOXTRAL_REALTIME_STREAM,
+    TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE, TRANSCRIBE_EXT_KIND_VOXTRAL_REALTIME_STREAM,
 };
 use transcribe_cpp::{
-    ExtSlot, Model, ParakeetBufferedStreamOptions, ParakeetStreamOptions, RunOptions, Stream,
-    StreamExtension, StreamOptions, VoxtralRealtimeStreamOptions,
+    ExtSlot, Model, ParakeetBufferedStreamOptions, ParakeetStreamOptions, RunExtension, RunOptions,
+    SortformerLiveOptions, SortformerPreset, SortformerStreamOptions, Stream, StreamExtension,
+    StreamOptions, VoxtralRealtimeStreamOptions,
 };
 
 /// Feed the first ~2 s of `pcm` in 100 ms chunks, finalize, and return
@@ -142,4 +144,60 @@ fn voxtral_realtime_streams_with_extension() {
     let (is_final, text) = short_feed_text(&mut stream, &pcm);
     assert!(is_final);
     assert!(!text.trim().is_empty(), "voxtral produced no text");
+}
+
+#[test]
+fn nemotron3_diar_live_rows_match_run() {
+    let (Some(model_path), Some(pcm)) =
+        (common::smoke_nemotron3_diar_model(), common::diar_audio())
+    else {
+        eprintln!("skip nemotron3_diar_live_rows_match_run: model/audio absent");
+        return;
+    };
+    let model = Model::load(&model_path).unwrap();
+    assert!(model.accepts_ext(ExtSlot::Stream, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
+    let mut session = model.session().unwrap();
+
+    let run = RunOptions {
+        family: Some(RunExtension::Sortformer(SortformerStreamOptions {
+            preset: Some(SortformerPreset::LowLatency),
+        })),
+        ..Default::default()
+    };
+    let want = session.run(&pcm, &run).unwrap().speaker_segments;
+    assert!(!want.is_empty());
+
+    let opts = StreamOptions {
+        family: Some(StreamExtension::SortformerLive(SortformerLiveOptions {
+            preset: Some(SortformerPreset::LowLatency),
+        })),
+        ..Default::default()
+    };
+    let mut stream = session.stream(&RunOptions::default(), &opts).unwrap();
+    let mut saw_rows = false;
+    for piece in pcm.chunks(8_000) {
+        let update = stream.feed(piece).unwrap();
+        for row in stream.snapshot().speaker_segments {
+            saw_rows = true;
+            // Closed rows are final rows; an open row (t1 == frontier) is the
+            // start of one.
+            let open = row.t1_ms == update.audio_committed_ms;
+            assert!(want.iter().any(|w| w.speaker_id == row.speaker_id
+                && w.t0_ms == row.t0_ms
+                && if open {
+                    w.t1_ms >= row.t1_ms
+                } else {
+                    w.t1_ms == row.t1_ms
+                }));
+        }
+    }
+    assert!(saw_rows, "no rows before finalize");
+    assert!(stream.finalize().unwrap().is_final);
+    // `p` is NaN (no confidence), so compare the timing and speaker fields.
+    let key = |rows: &[transcribe_cpp::SpeakerSegment]| {
+        rows.iter()
+            .map(|r| (r.t0_ms, r.t1_ms, r.speaker_id))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(key(&stream.snapshot().speaker_segments), key(&want));
 }

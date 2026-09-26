@@ -56,6 +56,10 @@ public enum SortformerPreset: Sendable {
     case veryHighLatency
     case highLatency
     case lowLatency
+    /// ~0.64 s lookahead (Nemotron-3 Diarization only).
+    case veryLowLatency
+    /// ~0.32 s lookahead (Nemotron-3 Diarization only).
+    case ultraLowLatency
 
     var cValue: transcribe_sortformer_preset {
         switch self {
@@ -63,6 +67,8 @@ public enum SortformerPreset: Sendable {
         case .veryHighLatency: return TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY
         case .highLatency: return TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY
         case .lowLatency: return TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY
+        case .veryLowLatency: return TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY
+        case .ultraLowLatency: return TRANSCRIBE_SORTFORMER_PRESET_ULTRA_LOW_LATENCY
         }
     }
 }

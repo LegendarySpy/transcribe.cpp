@@ -31,6 +31,10 @@ typedef struct ggml_backend *        ggml_backend_t;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 typedef struct ggml_backend_sched *  ggml_backend_sched_t;
 
+namespace transcribe {
+struct CoreMLEncoder;
+}
+
 namespace transcribe::parakeet {
 
 // Output length of one stride-2, kernel-3 pre-encode convolution.
@@ -75,6 +79,7 @@ void apply_family_invariants(transcribe_model & model);
 // data buffer; the destructor frees it, invalidating every borrowed
 // ggml_tensor* in `weights`.
 struct ParakeetModel final : public transcribe_model {
+    bool            decoder_only = false;
     Tokenizer       tok;
     ParakeetHParams hparams;
     ParakeetWeights weights;
@@ -237,6 +242,8 @@ struct ParakeetStreamingDecoderState {
 // scheduler that dispatches encoder graph ops to the best available backend
 // are owned by the transcribe_session base (sched / compute_ctx).
 struct ParakeetSession final : public transcribe_session {
+    CoreMLEncoder * coreml_encoder = nullptr;
+
     // Encoder forward output, borrowed into compute_ctx; invalidated when
     // compute_ctx is reset next run().
     ggml_tensor * encoder_out = nullptr;

@@ -98,6 +98,9 @@ SortformerStreamParams resolve_stream_params(const SortformerHParams & hp, trans
         case TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY:
             ext_name = "low_latency";
             break;
+        case TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY:
+        case TRANSCRIBE_SORTFORMER_PRESET_ULTRA_LOW_LATENCY:
+            break;  // rejected by run_validate
     }
     if (ext_name != nullptr) {
         for (const Preset & pr : k_presets) {

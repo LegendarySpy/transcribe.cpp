@@ -6,6 +6,9 @@
 
 #include "transcribe-arch.h"
 
+#include "transcribe-env.h"
+
+#include <cstddef>
 #include <cstring>
 
 namespace transcribe {
@@ -87,6 +90,20 @@ namespace sortformer {
 extern const Arch arch;
 }
 
+namespace nemotron3_diar {
+extern const Arch arch;
+}
+
+const char * session_coreml_encoder_path(const transcribe_session_params * params, const char * env_name) {
+    if (params != nullptr &&
+        params->struct_size >=
+            offsetof(transcribe_session_params, coreml_encoder_path) + sizeof(params->coreml_encoder_path) &&
+        params->coreml_encoder_path != nullptr && params->coreml_encoder_path[0] != '\0') {
+        return params->coreml_encoder_path;
+    }
+    return transcribe::env::str(env_name);
+}
+
 const Arch * find_arch(const char * name) {
     if (name == nullptr) {
         return nullptr;
@@ -96,7 +113,7 @@ const Arch * find_arch(const char * name) {
         &parakeet::arch,         &cohere::arch,      &canary::arch,     &qwen3_asr::arch,    &voxtral::arch,
         &voxtral_realtime::arch, &canary_qwen::arch, &whisper::arch,    &moonshine::arch,    &moonshine_streaming::arch,
         &sensevoice::arch,       &funasr_nano::arch, &gigaam::arch,     &granite::arch,      &granite_nar::arch,
-        &medasr::arch,           &moss::arch,        &sortformer::arch, &granite5_ctc::arch,
+        &medasr::arch,           &moss::arch,        &sortformer::arch, &granite5_ctc::arch, &nemotron3_diar::arch,
     };
     constexpr size_t k_n = sizeof(k_archs) / sizeof(k_archs[0]);
 

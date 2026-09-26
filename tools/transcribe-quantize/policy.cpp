@@ -136,6 +136,12 @@ Bucket classify_tensor(const std::string & name, int64_t ne0) {
     if (name == "enc.pos_emb.weight" || name == "dec.pos_emb.weight") {
         return Bucket::Norm;
     }
+    // nemotron3_diar: learned AOSC silence embedding. Copied verbatim into
+    // the speaker cache's reserved silence slots, so it stays F32 like the
+    // activations it sits beside.
+    if (name == "diar.silence_emb") {
+        return Bucket::Norm;
+    }
     // Cohere: mel frontend buffers (filterbank + window) — stored as
     // F32 by the converter and consumed as-is by the mel stage.
     if (name == "frontend.mel_filterbank" || name == "frontend.window") {

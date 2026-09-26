@@ -391,6 +391,7 @@ struct ParakeetWeights {
 // indeterminate (the caller throws the model away).
 transcribe_status build_parakeet_weights(ggml_context *          ctx_meta,
                                          const ParakeetHParams & hp,
-                                         ParakeetWeights &       weights);
+                                         ParakeetWeights &       weights,
+                                         bool                    include_encoder = true);
 
 }  // namespace transcribe::parakeet

@@ -122,6 +122,13 @@ option(TRANSCRIBE_BUILD_TOOLS    "Build inspect / quantize" OFF)  # post pass 2
 option(TRANSCRIBE_ENABLE_VALIDATION_HOOKS
                                  "Compile in numerical-parity validation hooks" OFF)
 option(TRANSCRIBE_METAL          "Enable Metal backend"     ${TRANSCRIBE_IS_APPLE_SILICON})
+option(TRANSCRIBE_COREML         "Enable Core ML speech encoders (Apple Silicon)" OFF)
+if(TRANSCRIBE_COREML)
+    if(NOT TRANSCRIBE_IS_APPLE_SILICON)
+        message(FATAL_ERROR "TRANSCRIBE_COREML requires Apple Silicon")
+    endif()
+    enable_language(OBJC OBJCXX)
+endif()
 option(TRANSCRIBE_VULKAN         "Enable Vulkan backend"    OFF)  # post-v1
 option(TRANSCRIBE_CUDA           "Enable CUDA backend"      OFF)  # opt-in; Linux + nvcc
 option(TRANSCRIBE_HIP            "Enable HIP/ROCm backend"  OFF)  # opt-in; Linux + ROCm 6.1+

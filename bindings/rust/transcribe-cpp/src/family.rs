@@ -17,6 +17,12 @@ use transcribe_cpp_sys as sys;
 
 use crate::error::Result;
 
+/// Qwen3-ASR vocabulary/background context for recognition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Qwen3AsrRunOptions {
+    pub context: Option<String>,
+}
+
 /// Whisper run-extension knobs (run slot): initial prompt, temperature
 /// fallback, and decode thresholds. `None` keeps the family default.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -74,6 +80,10 @@ pub enum SortformerPreset {
     /// ~1.04 s lookahead; the real-time point (compute-heavy per audio
     /// second — many small windows).
     LowLatency,
+    /// ~0.64 s lookahead (Nemotron-3 Diarization only).
+    VeryLowLatency,
+    /// ~0.32 s lookahead (Nemotron-3 Diarization only).
+    UltraLowLatency,
 }
 
 impl SortformerPreset {
@@ -91,6 +101,12 @@ impl SortformerPreset {
             SortformerPreset::LowLatency => {
                 sys::transcribe_sortformer_preset::TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY
             }
+            SortformerPreset::VeryLowLatency => {
+                sys::transcribe_sortformer_preset::TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY
+            }
+            SortformerPreset::UltraLowLatency => {
+                sys::transcribe_sortformer_preset::TRANSCRIBE_SORTFORMER_PRESET_ULTRA_LOW_LATENCY
+            }
         }
     }
 }
@@ -103,10 +119,26 @@ pub struct SortformerStreamOptions {
     pub preset: Option<SortformerPreset>,
 }
 
+/// Push-audio live diarization knobs (stream slot, Nemotron-3 Diarization).
+/// Accepts `LowLatency` (the default when `None`), `VeryLowLatency` and
+/// `UltraLowLatency`; other presets are rejected at `stream` with
+/// [`Error::InvalidArgument`](crate::Error). Read rows from
+/// [`Stream::snapshot`](crate::Stream::snapshot)`.speaker_segments` after each
+/// feed: a row whose `t1_ms` equals the feed's
+/// [`StreamUpdate::audio_committed_ms`](crate::StreamUpdate) is still open
+/// (the speaker is talking at the processed frontier); every other row is
+/// final. After `finalize` all rows are final and equal a `run` at the same
+/// preset.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SortformerLiveOptions {
+    pub preset: Option<SortformerPreset>,
+}
+
 /// A family extension for the run slot (offline `run`/`run_batch`).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum RunExtension {
+    Qwen3Asr(Qwen3AsrRunOptions),
     Whisper(WhisperRunOptions),
     Sortformer(SortformerStreamOptions),
 }
@@ -119,6 +151,7 @@ pub enum StreamExtension {
     ParakeetBuffered(ParakeetBufferedStreamOptions),
     MoonshineStreaming(MoonshineStreamingOptions),
     VoxtralRealtime(VoxtralRealtimeStreamOptions),
+    SortformerLive(SortformerLiveOptions),
 }
 
 /// Owns a materialized run-slot C extension struct (and any strings it points
@@ -126,6 +159,10 @@ pub enum StreamExtension {
 /// stays valid for the duration of the native call. Boxed for a stable address
 /// across moves of the holder.
 pub(crate) enum RunExtRaw {
+    Qwen3Asr {
+        ext: Box<sys::transcribe_qwen3_asr_run_ext>,
+        _context: Option<CString>,
+    },
     Whisper {
         ext: Box<sys::transcribe_whisper_run_ext>,
         _prompt: Option<CString>,
@@ -137,6 +174,9 @@ impl RunExtRaw {
     pub(crate) fn ext_ptr(&self) -> *const sys::transcribe_ext {
         match self {
             // `ext` is field 0, so &ext == &the family struct.
+            RunExtRaw::Qwen3Asr { ext, .. } => {
+                (&**ext) as *const sys::transcribe_qwen3_asr_run_ext as *const sys::transcribe_ext
+            }
             RunExtRaw::Whisper { ext, .. } => {
                 (&**ext) as *const sys::transcribe_whisper_run_ext as *const sys::transcribe_ext
             }
@@ -150,6 +190,18 @@ impl RunExtRaw {
 impl RunExtension {
     pub(crate) fn materialize(&self) -> Result<RunExtRaw> {
         match self {
+            RunExtension::Qwen3Asr(o) => {
+                let mut ext: sys::transcribe_qwen3_asr_run_ext = unsafe { std::mem::zeroed() };
+                unsafe { sys::transcribe_qwen3_asr_run_ext_init(&mut ext) };
+                let context = o.context.as_deref().map(CString::new).transpose()?;
+                if let Some(value) = context.as_ref() {
+                    ext.context = value.as_ptr();
+                }
+                Ok(RunExtRaw::Qwen3Asr {
+                    ext: Box::new(ext),
+                    _context: context,
+                })
+            }
             RunExtension::Whisper(o) => {
                 let mut ext: sys::transcribe_whisper_run_ext = unsafe { std::mem::zeroed() };
                 unsafe { sys::transcribe_whisper_run_ext_init(&mut ext) };
@@ -192,6 +244,7 @@ pub(crate) enum StreamExtRaw {
     ParakeetBuffered(Box<sys::transcribe_parakeet_buffered_stream_ext>),
     MoonshineStreaming(Box<sys::transcribe_moonshine_streaming_stream_ext>),
     VoxtralRealtime(Box<sys::transcribe_voxtral_realtime_stream_ext>),
+    SortformerLive(Box<sys::transcribe_sortformer_live_ext>),
 }
 
 impl StreamExtRaw {
@@ -211,6 +264,9 @@ impl StreamExtRaw {
             StreamExtRaw::VoxtralRealtime(e) => {
                 (&**e) as *const sys::transcribe_voxtral_realtime_stream_ext
                     as *const sys::transcribe_ext
+            }
+            StreamExtRaw::SortformerLive(e) => {
+                (&**e) as *const sys::transcribe_sortformer_live_ext as *const sys::transcribe_ext
             }
         }
     }
@@ -248,6 +304,12 @@ impl StreamExtension {
                 set(&mut e.num_delay_tokens, o.num_delay_tokens);
                 set(&mut e.min_decode_interval_ms, o.min_decode_interval_ms);
                 StreamExtRaw::VoxtralRealtime(Box::new(e))
+            }
+            StreamExtension::SortformerLive(o) => {
+                let mut e: sys::transcribe_sortformer_live_ext = unsafe { std::mem::zeroed() };
+                unsafe { sys::transcribe_sortformer_live_ext_init(&mut e) };
+                set(&mut e.preset, o.preset.map(SortformerPreset::to_sys));
+                StreamExtRaw::SortformerLive(Box::new(e))
             }
         }
     }

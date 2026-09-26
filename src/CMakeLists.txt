@@ -64,6 +64,9 @@ add_library(transcribe
     arch/sortformer/stream.cpp
     arch/sortformer/capabilities.cpp
     arch/sortformer/weights.cpp
+    arch/nemotron3_diar/model.cpp
+    arch/nemotron3_diar/stream.cpp
+    arch/nemotron3_diar/weights.cpp
     arch/voxtral/model.cpp
     arch/voxtral/capabilities.cpp
     arch/voxtral/weights.cpp
@@ -194,6 +197,14 @@ target_link_libraries(transcribe
     PRIVATE
         ggml
 )
+
+if(TRANSCRIBE_COREML)
+    target_sources(transcribe PRIVATE transcribe-coreml.mm)
+    set_target_properties(transcribe PROPERTIES OBJCXX_VISIBILITY_PRESET hidden)
+    set_source_files_properties(transcribe-coreml.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_compile_definitions(transcribe PRIVATE TRANSCRIBE_COREML)
+    target_link_libraries(transcribe PRIVATE "-framework CoreML" "-framework Foundation")
+endif()
 
 # BLAS for the host decoder (cblas_sgemv in decoder.cpp). On Apple we
 # link Accelerate directly; elsewhere we probe for OpenBLAS / MKL /

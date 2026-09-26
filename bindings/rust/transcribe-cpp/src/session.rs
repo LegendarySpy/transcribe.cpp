@@ -98,6 +98,18 @@ impl Session {
         params.n_threads = options.n_threads;
         params.kv_type = options.kv_type.to_raw();
         params.n_ctx = options.n_ctx;
+        // Owned for the duration of the init call; the library copies nothing
+        // and reads the path only during session init.
+        let coreml_path = match &options.coreml_encoder_path {
+            Some(path) => Some(
+                CString::new(crate::model::path_bytes(path)?)
+                    .map_err(|_| Error::InvalidArgument("coreml_encoder_path contains a NUL byte".into()))?,
+            ),
+            None => None,
+        };
+        if let Some(path) = &coreml_path {
+            params.coreml_encoder_path = path.as_ptr();
+        }
 
         let mut out: *mut sys::transcribe_session = std::ptr::null_mut();
         let status = unsafe { sys::transcribe_session_init(model.inner.ptr, &params, &mut out) };

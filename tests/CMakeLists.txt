@@ -54,6 +54,18 @@ target_link_libraries(transcribe_api_smoke PRIVATE transcribe)
 
 add_test(NAME transcribe_api_smoke COMMAND transcribe_api_smoke)
 
+if(TRANSCRIBE_COREML AND TRANSCRIBE_BUILD_EXAMPLES)
+    add_test(NAME transcribe_parakeet_coreml_smoke
+        COMMAND ${CMAKE_COMMAND}
+            -DCLI=$<TARGET_FILE:transcribe-cli>
+            -DAUDIO=${PROJECT_SOURCE_DIR}/samples/jfk.wav
+            -DFAMILY=PARAKEET
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/coreml_smoke.cmake)
+    set_tests_properties(transcribe_parakeet_coreml_smoke PROPERTIES
+        SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
+endif()
+
+
 add_test(
     NAME transcribe_extension_umbrella_check
     COMMAND ${CMAKE_COMMAND}
@@ -1279,6 +1291,37 @@ if(TRANSCRIBE_BUILD_REAL_MODEL_TESTS)
     add_test(NAME transcribe_sortformer_stream_ext_unit
         COMMAND transcribe_sortformer_stream_ext_unit)
     set_tests_properties(transcribe_sortformer_stream_ext_unit PROPERTIES
+        SKIP_RETURN_CODE 77)
+
+    # Nemotron-3 Diarization through the same SFST run ext: preset menu,
+    # rejection of HIGH_LATENCY (no v3 point), ext-vs-env parity. Gated by
+    # TRANSCRIBE_NEMOTRON3_DIAR_GGUF (RC 77 skip).
+    add_executable(transcribe_nemotron3_diar_ext_unit
+        nemotron3_diar_ext_unit.cpp)
+    target_link_libraries(transcribe_nemotron3_diar_ext_unit
+        PRIVATE transcribe transcribe-common-example)
+    target_compile_definitions(transcribe_nemotron3_diar_ext_unit PRIVATE
+        "TRANSCRIBE_TEST_SAMPLES_DIR=\"${CMAKE_SOURCE_DIR}/samples\"")
+    transcribe_apply_warnings(transcribe_nemotron3_diar_ext_unit)
+    add_test(NAME transcribe_nemotron3_diar_ext_unit
+        COMMAND transcribe_nemotron3_diar_ext_unit)
+    set_tests_properties(transcribe_nemotron3_diar_ext_unit PROPERTIES
+        SKIP_RETURN_CODE 77)
+
+    # Nemotron-3 Diarization push-audio streaming (SFLV, STREAM slot):
+    # streamed rows equal the batch run at the same preset for 1-sample to
+    # 1 s feeds, mid-stream rows only report final output. Gated by
+    # TRANSCRIBE_NEMOTRON3_DIAR_GGUF (RC 77 skip).
+    add_executable(transcribe_nemotron3_diar_stream_unit
+        nemotron3_diar_stream_unit.cpp)
+    target_link_libraries(transcribe_nemotron3_diar_stream_unit
+        PRIVATE transcribe transcribe-common-example)
+    target_compile_definitions(transcribe_nemotron3_diar_stream_unit PRIVATE
+        "TRANSCRIBE_TEST_SAMPLES_DIR=\"${CMAKE_SOURCE_DIR}/samples\"")
+    transcribe_apply_warnings(transcribe_nemotron3_diar_stream_unit)
+    add_test(NAME transcribe_nemotron3_diar_stream_unit
+        COMMAND transcribe_nemotron3_diar_stream_unit)
+    set_tests_properties(transcribe_nemotron3_diar_stream_unit PROPERTIES
         SKIP_RETURN_CODE 77)
 endif()
 

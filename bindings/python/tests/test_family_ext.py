@@ -84,7 +84,7 @@ def test_sortformer_preset_maps_to_enum_value():
 
 def test_sortformer_unknown_preset_rejected():
     with pytest.raises(ValueError, match="preset"):
-        t.SortformerStreamOptions(preset="ultra_low_latency")  # type: ignore[arg-type]
+        t.SortformerStreamOptions(preset="medium_latency")  # type: ignore[arg-type]
 
 
 # --- model-gated: resolve_family validation + a real extension run ----------

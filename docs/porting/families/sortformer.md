@@ -18,8 +18,9 @@ multitalker interop). Streaming posture: **natively streaming — PASS**; the
 chunk/lookahead contract is the preset menu in "Public API (run extension)"
 (default = GGUF-shipped checkpoint cfg; very_high_latency ~30.4 s lookahead
 ... low_latency ~1.04 s), exposed via `transcribe_sortformer_stream_ext`.
-Push-audio `transcribe_stream_*` entry point is future work (STREAM-slot
-kind reserved by design).
+Push-audio `transcribe_stream_*` is not implemented for v2.1: the
+STREAM-slot kind (`SFLV`, `transcribe_sortformer_live_ext`) is Nemotron-3
+Diarization only, and v2.1 rejects it.
 
 Streaming Sortformer is a **frame-level end-to-end neural speaker diarizer**
 (architecture pattern `encoder-diarizer`, new to this repo). It is NOT a
@@ -109,9 +110,9 @@ clean 16-meeting result cannot certify a k tier; the tiers also save
 little disk (139 -> 92 MB) and are slower than Q8_0 on CPU. Full
 evidence: `reports/diar/diar_streaming_sortformer_4spk-v2.1.ami-ihm-test-fa.summary.md`.
 
-A future push-audio entry point (`transcribe_stream_begin/feed`, live
-diarization) registers a separate STREAM-slot kind taking the same preset
-enum; the multitalker interop path (raw T x 4 supervision into parakeet's
+The push-audio entry point (`transcribe_stream_begin/feed`, live
+diarization) is a separate STREAM-slot kind taking the same preset enum
+(`SFLV`); only `nemotron3_diar` implements it. The multitalker interop path (raw T x 4 supervision into parakeet's
 layer-0 speaker kernel) is internal C++ and does not round-trip through
 this surface.
 

@@ -19,7 +19,12 @@
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
 #include "transcribe-repetition-guard.h"
+#include "transcribe/qwen3_asr.h"
 #include "weights.h"
+
+#ifdef TRANSCRIBE_COREML
+#    include "transcribe-coreml.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -35,6 +40,15 @@
 #include <unordered_map>
 #include <vector>
 
+extern "C" void transcribe_qwen3_asr_run_ext_init(transcribe_qwen3_asr_run_ext * ext) {
+    if (ext == nullptr) {
+        return;
+    }
+    std::memset(ext, 0, sizeof(*ext));
+    ext->ext.size = sizeof(*ext);
+    ext->ext.kind = TRANSCRIBE_EXT_KIND_QWEN3_ASR_RUN;
+}
+
 namespace transcribe::qwen3_asr {
 
 extern const Arch arch;
@@ -43,6 +57,9 @@ static_assert(std::is_base_of_v<transcribe_model, QwenAsrModel>);
 static_assert(std::is_base_of_v<transcribe_session, QwenAsrSession>);
 
 QwenAsrSession::~QwenAsrSession() {
+#ifdef TRANSCRIBE_COREML
+    coreml_encoder_free(coreml_encoder);
+#endif
     kv_cache.free();
     kv_cache_batch.free();
 }
@@ -324,6 +341,35 @@ transcribe_status init_context(transcribe_model *                model,
         }
     }
 
+    if (const char * path = transcribe::session_coreml_encoder_path(params, "TRANSCRIBE_QWEN3_ASR_COREML_MODEL")) {
+#ifdef TRANSCRIBE_COREML
+        const auto & hp    = cm->hparams;
+        // Capacity 0 reads the companion's; its row count is then
+        // capacity / mel_per_chunk chunks of aftercnn(mel_per_chunk) rows.
+        cc->coreml_encoder = coreml_encoder_load(path, model->variant.c_str(), hp.enc_num_mel_bins, 0,
+                                                 hp.enc_output_dim, 8, true, /*capacity_out=*/-1);
+        if (cc->coreml_encoder != nullptr) {
+            const int capacity = coreml_encoder_capacity(cc->coreml_encoder);
+            const int per      = hp.enc_n_window * 2;
+            const int rows     = capacity / per * aftercnn_len(per);
+            if (capacity % per != 0 || coreml_encoder_capacity_out(cc->coreml_encoder) != rows) {
+                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                        "qwen3_asr Core ML: capacity %d must be a multiple of %d mel frames with %d output rows",
+                        capacity, per, rows);
+                coreml_encoder_free(cc->coreml_encoder);
+                cc->coreml_encoder = nullptr;
+            }
+        }
+        if (cc->coreml_encoder == nullptr) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+#else
+        (void) path;
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr: rebuild with TRANSCRIBE_COREML=ON to use a Core ML encoder");
+        return TRANSCRIBE_ERR_INVALID_ARG;
+#endif
+    }
+
     *out_ctx = cc.release();
     return TRANSCRIBE_OK;
 }
@@ -357,18 +403,37 @@ transcribe_status resolve_chat_tokens(const transcribe::Tokenizer & tok, ChatTok
     return TRANSCRIBE_OK;
 }
 
-// Build the prompt token sequence + audio-position list, mirroring the
-// Qwen3-ASR chat template at the token level:
-//
-//   <|im_start|>system\n<|im_end|>\n
-//   <|im_start|>user\n<|audio_start|><|audio_pad|>*T_enc<|audio_end|><|im_end|>\n
-//   <|im_start|>assistant\n[language {Name}<asr_text>]?
-//
-// System prompt is empty. A non-null `lang_prefix_ids` (resolved via
-// encode_language_prefix) is appended after the trailing newline to force an
-// output language; kept out of here so this stays a pure token-id assembler.
+transcribe_status encode_context(const Tokenizer &             tok,
+                                 const transcribe_run_params * params,
+                                 std::vector<int32_t> &        ids) {
+    const auto * ext = params != nullptr ? params->family : nullptr;
+    const auto   status =
+        transcribe_ext_check(ext, TRANSCRIBE_EXT_KIND_QWEN3_ASR_RUN, sizeof(transcribe_qwen3_asr_run_ext));
+    if (status != TRANSCRIBE_OK || ext == nullptr) {
+        return status;
+    }
+    const char * context = reinterpret_cast<const transcribe_qwen3_asr_run_ext *>(ext)->context;
+    if (context == nullptr || context[0] == '\0') {
+        return TRANSCRIBE_OK;
+    }
+    size_t length = 0;
+    while (length <= 4096 && context[length] != '\0') {
+        ++length;
+    }
+    if (length > 4096) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    const auto encoded = tok.encode(std::string(context, length), ids);
+    if (encoded != TRANSCRIBE_OK) {
+        return encoded;
+    }
+    return ids.size() <= 1024 ? TRANSCRIBE_OK : TRANSCRIBE_ERR_INVALID_ARG;
+}
+
+// Match the upstream chat template; context belongs in the system turn.
 void build_prompt_tokens(const QwenAsrHParams &       hp,
                          const ChatTokens &           ct,
+                         const std::vector<int32_t> & context_ids,
                          int                          T_enc,
                          const std::vector<int32_t> * lang_prefix_ids,
                          std::vector<int32_t> &       out_ids,
@@ -379,6 +444,7 @@ void build_prompt_tokens(const QwenAsrHParams &       hp,
     out_ids.push_back(ct.im_start);
     out_ids.push_back(ct.role_system);
     out_ids.push_back(ct.newline);
+    out_ids.insert(out_ids.end(), context_ids.begin(), context_ids.end());
     out_ids.push_back(ct.im_end);
     out_ids.push_back(ct.newline);
 
@@ -506,6 +572,12 @@ namespace {  // reopen anon for the rest of the file's helpers.
 // Host-side pack [n_mels, T_mel] mel into batched chunks
 // [mel_per_chunk, n_mels, 1, n_chunks]. Chunks shorter than
 // mel_per_chunk are zero-padded.
+void try_dump(const char * name, ggml_tensor * t, const char * stage) {
+    if (t != nullptr) {
+        transcribe::debug::dump_tensor(name, t, stage);
+    }
+}
+
 void pack_mel_chunks(const float *         mel,  // [n_mels, T_mel]
                      int                   n_mels,
                      int                   n_mel_frames,
@@ -550,6 +622,10 @@ transcribe_status run(transcribe_session *          session,
     // "language X<asr_text>" prefix, stripped by the output parser below). A
     // non-null code is resolved to "language {Name}<asr_text>" tokens that seed
     // the assistant turn; a resolve failure surfaces as UNSUPPORTED_LANGUAGE.
+    std::vector<int32_t> context_ids;
+    if (const auto status = encode_context(cm->tok, params, context_ids); status != TRANSCRIBE_OK) {
+        return status;
+    }
     std::vector<int32_t>         lang_prefix_ids;
     const std::vector<int32_t> * lang_prefix_ptr = nullptr;
     if (params != nullptr && params->language != nullptr && params->language[0] != '\0') {
@@ -628,12 +704,6 @@ transcribe_status run(transcribe_session *          session,
         }
     }
 
-    // Build encoder graph.
-    EncoderBuild eb = build_encoder_graph(cc->compute_ctx, cm->weights, cm->hparams, timing, cc->encoder_use_flash);
-    if (eb.graph == nullptr || eb.out == nullptr) {
-        return TRANSCRIBE_ERR_GGUF;
-    }
-
     // Allocate + compute encoder graph.
     if (cc->sched == nullptr) {
         cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
@@ -643,75 +713,106 @@ transcribe_status run(transcribe_session *          session,
             return TRANSCRIBE_ERR_BACKEND;
         }
     }
-    ggml_backend_sched_reset(cc->sched);
-    if (!ggml_backend_sched_alloc_graph(cc->sched, eb.graph)) {
-        transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
-                            "qwen3_asr run: encoder graph allocation failed — out of memory.");
-        return TRANSCRIBE_ERR_OOM;
-    }
 
-    // Pack + upload mel.
-    std::vector<float> mel_batched;
-    pack_mel_chunks(cc->mel_buf.data(), mel_n_mels, mel_n_frames, timing, mel_batched);
-    ggml_backend_tensor_set(eb.mel_in, mel_batched.data(), 0, mel_batched.size() * sizeof(float));
-
-    // Positional embedding.
-    {
-        std::vector<float> pe = build_sinusoid_pe(cm->hparams.enc_d_model, timing.per_chunk_aftercnn);
-        ggml_backend_tensor_set(eb.pos_emb_in, pe.data(), 0, pe.size() * sizeof(float));
-    }
-
-    // Attention mask (block-diagonal from cu_seqlens).
-    {
-        std::vector<float> mask = build_cu_seqlens_mask(timing, cm->hparams);
-        if (cc->encoder_use_flash) {
-            std::vector<ggml_fp16_t> mask_f16(mask.size());
-            for (size_t i = 0; i < mask.size(); ++i) {
-                mask_f16[i] = ggml_fp32_to_fp16(mask[i]);
+    int  d_enc   = 0;
+    int  T_enc   = 0;
+    bool encoded = false;
+#ifdef TRANSCRIBE_COREML
+    if (cc->coreml_encoder != nullptr) {
+        if (mel_n_frames <= coreml_encoder_capacity(cc->coreml_encoder)) {
+            const int64_t t_enc_start = ggml_time_us();
+            if (!coreml_encoder_run(cc->coreml_encoder, cc->mel_buf.data(), mel_n_frames, /*time_major=*/false,
+                                    cc->enc_host, timing.T_enc)) {
+                return TRANSCRIBE_ERR_GGUF;
             }
-            ggml_backend_tensor_set(eb.mask_in, mask_f16.data(), 0, mask_f16.size() * sizeof(ggml_fp16_t));
+            cc->t_encode_us          = ggml_time_us() - t_enc_start;
+            d_enc                    = cm->hparams.enc_output_dim;
+            T_enc                    = timing.T_enc;
+            encoded                  = true;
+            const long long shape[2] = { T_enc, d_enc };
+            transcribe::debug::dump_host_f32("enc.proj.out", cc->enc_host.data(),
+                                             static_cast<long long>(cc->enc_host.size()), shape, 2, "enc.proj");
         } else {
-            ggml_backend_tensor_set(eb.mask_in, mask.data(), 0, mask.size() * sizeof(float));
+            log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
+                    "qwen3_asr Core ML: %d mel frames exceed encoder capacity %d; using ggml for this utterance",
+                    mel_n_frames, coreml_encoder_capacity(cc->coreml_encoder));
         }
     }
-
-    transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
-
-    const int64_t t_enc_start = ggml_time_us();
-    t_enc_build_us            = t_enc_start - t_enc_build_start;
-    if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: encoder graph compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_BACKEND;
-    }
-    cc->t_encode_us = ggml_time_us() - t_enc_start;
-
-    // Dump encoder intermediates.
-    auto try_dump = [](const char * name, ggml_tensor * t, const char * stage) {
-        if (t != nullptr) {
-            transcribe::debug::dump_tensor(name, t, stage);
+#endif
+    if (!encoded) {
+        // Build encoder graph.
+        EncoderBuild eb = build_encoder_graph(cc->compute_ctx, cm->weights, cm->hparams, timing, cc->encoder_use_flash);
+        if (eb.graph == nullptr || eb.out == nullptr) {
+            return TRANSCRIBE_ERR_GGUF;
         }
-    };
-    try_dump("enc.subsample.out", eb.dumps.subsample_out, "enc.subsample");
-    try_dump("enc.pos_add.out", eb.dumps.pos_add_out, "enc.pos_add");
-    try_dump("enc.block.0.out", eb.dumps.block_0_out, "enc.block.0");
-    {
-        char bname[64];
-        std::snprintf(bname, sizeof(bname), "enc.block.%d.out", cm->hparams.enc_n_layers - 1);
-        try_dump(bname, eb.dumps.block_last_out, "enc.block.last");
-    }
-    try_dump("enc.ln_post.out", eb.dumps.ln_post_out, "enc.ln_post");
-    try_dump("enc.proj.out", eb.dumps.proj_out, "enc.proj");
 
-    // Read encoder output to host for the LM prefill. The graph already
-    // dropped the aftercnn pad rows (see encoder.cpp), so eb.out is exactly
-    // [d_enc, T_enc] — the reference's `padded_embed[padded_mask_after_cnn]`
-    // shape.
-    const int d_enc = static_cast<int>(eb.out->ne[0]);
-    const int T_enc = static_cast<int>(eb.out->ne[1]);
-    cc->enc_host.resize(static_cast<size_t>(d_enc) * static_cast<size_t>(T_enc));
-    const int64_t t_d2h_start = ggml_time_us();
-    ggml_backend_tensor_get(eb.out, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
-    t_enc_d2h_us = ggml_time_us() - t_d2h_start;
+        // Allocate + compute encoder graph.
+        ggml_backend_sched_reset(cc->sched);
+        if (!ggml_backend_sched_alloc_graph(cc->sched, eb.graph)) {
+            transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                                "qwen3_asr run: encoder graph allocation failed — out of memory.");
+            return TRANSCRIBE_ERR_OOM;
+        }
+
+        // Pack + upload mel.
+        std::vector<float> mel_batched;
+        pack_mel_chunks(cc->mel_buf.data(), mel_n_mels, mel_n_frames, timing, mel_batched);
+        ggml_backend_tensor_set(eb.mel_in, mel_batched.data(), 0, mel_batched.size() * sizeof(float));
+
+        // Positional embedding.
+        {
+            std::vector<float> pe = build_sinusoid_pe(cm->hparams.enc_d_model, timing.per_chunk_aftercnn);
+            ggml_backend_tensor_set(eb.pos_emb_in, pe.data(), 0, pe.size() * sizeof(float));
+        }
+
+        // Attention mask (block-diagonal from cu_seqlens).
+        {
+            std::vector<float> mask = build_cu_seqlens_mask(timing, cm->hparams);
+            if (cc->encoder_use_flash) {
+                std::vector<ggml_fp16_t> mask_f16(mask.size());
+                for (size_t i = 0; i < mask.size(); ++i) {
+                    mask_f16[i] = ggml_fp32_to_fp16(mask[i]);
+                }
+                ggml_backend_tensor_set(eb.mask_in, mask_f16.data(), 0, mask_f16.size() * sizeof(ggml_fp16_t));
+            } else {
+                ggml_backend_tensor_set(eb.mask_in, mask.data(), 0, mask.size() * sizeof(float));
+            }
+        }
+
+        transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
+
+        const int64_t t_enc_start = ggml_time_us();
+        t_enc_build_us            = t_enc_start - t_enc_build_start;
+        if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: encoder graph compute failed (%d)",
+                    static_cast<int>(gs));
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+        cc->t_encode_us = ggml_time_us() - t_enc_start;
+
+        // Dump encoder intermediates.
+        try_dump("enc.subsample.out", eb.dumps.subsample_out, "enc.subsample");
+        try_dump("enc.pos_add.out", eb.dumps.pos_add_out, "enc.pos_add");
+        try_dump("enc.block.0.out", eb.dumps.block_0_out, "enc.block.0");
+        {
+            char bname[64];
+            std::snprintf(bname, sizeof(bname), "enc.block.%d.out", cm->hparams.enc_n_layers - 1);
+            try_dump(bname, eb.dumps.block_last_out, "enc.block.last");
+        }
+        try_dump("enc.ln_post.out", eb.dumps.ln_post_out, "enc.ln_post");
+        try_dump("enc.proj.out", eb.dumps.proj_out, "enc.proj");
+
+        // Read encoder output to host for the LM prefill. The graph already
+        // dropped the aftercnn pad rows (see encoder.cpp), so eb.out is exactly
+        // [d_enc, T_enc] — the reference's `padded_embed[padded_mask_after_cnn]`
+        // shape.
+        d_enc = static_cast<int>(eb.out->ne[0]);
+        T_enc = static_cast<int>(eb.out->ne[1]);
+        cc->enc_host.resize(static_cast<size_t>(d_enc) * static_cast<size_t>(T_enc));
+        const int64_t t_d2h_start = ggml_time_us();
+        ggml_backend_tensor_get(eb.out, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
+        t_enc_d2h_us = ggml_time_us() - t_d2h_start;
+    }
 
     // Decode phase begins. t_dec_start covers prompt + KV init + prefill
     // build/compute + step loop (prefill is part of "decode" to users).
@@ -721,7 +822,7 @@ transcribe_status run(transcribe_session *          session,
     // Prompt construction.
     std::vector<int32_t> prompt_ids;
     std::vector<int64_t> audio_positions;
-    build_prompt_tokens(cm->hparams, cm->chat_tokens, T_enc, lang_prefix_ptr, prompt_ids, audio_positions);
+    build_prompt_tokens(cm->hparams, cm->chat_tokens, context_ids, T_enc, lang_prefix_ptr, prompt_ids, audio_positions);
     const int T_prompt   = static_cast<int>(prompt_ids.size());
     const int prefix_len = audio_positions.empty() ? 0 : static_cast<int>(audio_positions.front());
     const int suffix_len = T_prompt - prefix_len - T_enc;
@@ -1507,13 +1608,17 @@ transcribe_status run_batch(transcribe_session *          session,
 
     // Batched decode requires the flash-attention step path and dump-free
     // operation. Fall back to the serial loop otherwise (same results).
-    if (!cc->decoder_use_flash || transcribe::debug::enabled() || n == 1) {
+    if (!cc->decoder_use_flash || transcribe::debug::enabled() || n == 1 || cc->coreml_encoder != nullptr) {
         return run_batch_serial(cc, pcm, n_samples, n, params);
     }
 
     transcribe::debug::init();
 
     // Shared language hint (v1: one run_params across the batch).
+    std::vector<int32_t> context_ids;
+    if (const auto status = encode_context(cm->tok, params, context_ids); status != TRANSCRIBE_OK) {
+        return status;
+    }
     std::vector<int32_t>         lang_prefix_ids;
     const std::vector<int32_t> * lang_prefix_ptr = nullptr;
     if (params != nullptr && params->language != nullptr && params->language[0] != '\0') {
@@ -1558,7 +1663,7 @@ transcribe_status run_batch(transcribe_session *          session,
             continue;
         }
         std::vector<int64_t> ap;
-        build_prompt_tokens(cm->hparams, cm->chat_tokens, T_enc[b], lang_prefix_ptr, prompt_ids[b], ap);
+        build_prompt_tokens(cm->hparams, cm->chat_tokens, context_ids, T_enc[b], lang_prefix_ptr, prompt_ids[b], ap);
         T_prompt[b] = static_cast<int>(prompt_ids[b].size());
         prefix_len  = ap.empty() ? 0 : static_cast<int>(ap.front());
         // Same gate as single-shot run(); the rest of the batch still runs.
@@ -1711,6 +1816,16 @@ transcribe_status run_batch(transcribe_session *          session,
 
 }  // namespace
 
+static bool accepts_ext_kind(const transcribe_model *, transcribe_ext_slot slot, uint32_t kind) {
+    return slot == TRANSCRIBE_EXT_SLOT_RUN && kind == TRANSCRIBE_EXT_KIND_QWEN3_ASR_RUN;
+}
+
+static transcribe_status run_validate(const transcribe_session * session, const transcribe_run_params * params) {
+    const auto *         model = static_cast<const QwenAsrModel *>(session->model);
+    std::vector<int32_t> ids;
+    return encode_context(model->tok, params, ids);
+}
+
 extern const Arch arch = {
     /* .name             = */ "qwen3_asr",
     /* .load             = */ load,
@@ -1722,7 +1837,8 @@ extern const Arch arch = {
     /* .stream_feed      = */ nullptr,
     /* .stream_finalize  = */ nullptr,
     /* .stream_reset     = */ nullptr,
-    /* .accepts_ext_kind = */ nullptr,
+    /* .accepts_ext_kind = */ accepts_ext_kind,
+    /* .run_validate     = */ run_validate,
 };
 
 }  // namespace transcribe::qwen3_asr

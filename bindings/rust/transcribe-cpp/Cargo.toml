@@ -24,6 +24,7 @@ path = "src/lib.rs"
 # feature to the -sys crate, which forwards it to the CMake build.
 default = ["metal"]
 metal = ["transcribe-cpp-sys/metal"]
+coreml = ["transcribe-cpp-sys/coreml"]
 vulkan = ["transcribe-cpp-sys/vulkan"]
 cuda = ["transcribe-cpp-sys/cuda"]
 rocm = ["transcribe-cpp-sys/rocm"]
