@@ -94,12 +94,13 @@ section.
 
 Whisper uses the [shared Core ML encoder runtime](../coreml.md).
 
-On Apple Silicon with macOS 13 or later, build with Core ML support and
-convert the encoder directly from the **same transcribe.cpp GGUF** used by the
-runtime. Only Handy's GGUF is downloaded; the converter reads its tensors,
-expands quantized weights, and emits an FP16 Core ML encoder. It records the
-GGUF's SHA-256 and variant in the model metadata. The decoder and frontend
-continue to use the GGUF through the existing runtime.
+On Apple Silicon with macOS 14 or later, build with Core ML support and
+convert the encoder from the model file the runtime loads: a transcribe.cpp
+GGUF or a whisper.cpp `.bin` (F16, F32 or quantized, including the
+distil-whisper `.bin` files). The converter reads the encoder tensors, expands
+quantized weights and emits an FP16 Core ML encoder with the source's SHA-256
+and variant in its metadata. The decoder and frontend continue to use the
+model file through the existing runtime.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -107,27 +108,62 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build --target transcribe-cli -j 2
 
 mkdir -p models
-curl -fL -o models/whisper-tiny-Q8_0.gguf \
-  https://huggingface.co/handy-computer/whisper-tiny-gguf/resolve/main/whisper-tiny-Q8_0.gguf
+curl -fL -o models/ggml-tiny.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
 
 uv run --python 3.11 scripts/convert-whisper-gguf-to-coreml.py \
-  models/whisper-tiny-Q8_0.gguf \
-  --output models/whisper-tiny-Q8_0-encoder.mlpackage --compile
+  models/ggml-tiny.bin \
+  --output models/whisper-tiny-encoder.mlpackage --compile
 
-TRANSCRIBE_WHISPER_COREML_MODEL=models/whisper-tiny-Q8_0-encoder.mlmodelc \
-  build/bin/transcribe-cli -m models/whisper-tiny-Q8_0.gguf --threads 2 samples/jfk.wav
+TRANSCRIBE_WHISPER_COREML_MODEL=models/whisper-tiny-encoder.mlmodelc \
+  build/bin/transcribe-cli -m models/ggml-tiny.bin --threads 2 samples/jfk.wav
 ```
 
 Conversion requires Xcode's `coremlcompiler`; `uv` supplies the conversion-only
-Python dependencies. No Python dependency is added to the C++ runtime. Use the
-same command for other Whisper variants and quantizations. Regenerate the
-encoder when changing the GGUF; using a separate unquantized encoder would test
-different weights. Conversion to FP16 still introduces numerical differences.
+Python dependencies. No Python dependency is added to the C++ runtime. One
+encoder serves every quantization of a variant, so export it once from the F16
+file. The distil-whisper encoders are bit-identical to their teachers
+(distil-large-v3.5 to large-v3, distil-medium.en to medium.en, distil-small.en
+to small.en; `large-v3-turbo` has its own). Their `.bin` files report the
+teacher's variant, their GGUFs their own, so export the teacher's encoder with
+`--also-variant distil-large-v3.5` (and so on) to serve both.
 
-Core ML uses `CPUAndNeuralEngine`, which excludes the GPU but lets macOS place
-unsupported operations on the CPU. This setting alone is not proof that every
-operation runs on ANE; inspect the Core ML compute plan or use Instruments to
-check placement. Leaving `TRANSCRIBE_METAL` enabled permits GPU decoding.
+The graph is laid out for the Neural Engine rather than translated from the
+ggml graph:
+
+- Activations stay channels-first `(1, C, 1, S)`; linears are 1x1 convs and
+  LayerNorm normalizes the channel axis.
+- Attention is split per head and into four query blocks. Each score tensor
+  is `(1, 1500, 1, 375)`, which the ANE runs 1.3 to 1.6x faster than a full
+  `1500 x 1500` block, at about 4x the first-load compile time.
+  `--query-blocks 1` restores the faster compile.
+- The ANE flushes FP16 products below 2^-14 to zero. Most of fc2's terms are
+  that small, which cost about 0.2% cosine similarity per layer. The residual
+  stream is therefore carried scaled per channel by a power of two, chosen
+  from an FP32 NumPy pass over synthetic input so the few outlier channels (up
+  to about 2700 in medium) keep a wide margin below the FP16 limit. LayerNorm
+  unscales on read.
+- Large-v3 and large-v3-turbo are split into two chained programs (a Core ML
+  pipeline in one `.mlmodelc`). The ANE compiler rejects the 1.2 GB
+  single-program encoder, and Core ML then runs it on the CPU without an error.
+  `--int8` stores per-channel int8 weights instead: half the size, one program,
+  slightly faster, but it changed punctuation on one test clip.
+
+FP16 still differs from ggml. Against the ggml encoder on the same model
+file, transcripts of `jfk`, a 12 s and a 60 s clip and a 298 s file matched
+word for word for most sizes; the rest differ in punctuation or a few words,
+except distil-medium.en, which fell into a repetition loop in one 30 s window
+of the long file.
+
+Check placement with the compute plan (`coremltools.models.compute_plan`); all
+operations of every exported size are planned on the Neural Engine. The runtime
+requests `CPUAndNeuralEngine`; `ALL` picks the same placement for these graphs.
+Leaving `TRANSCRIBE_METAL` enabled permits GPU decoding.
+
+The first load of each encoder on a machine compiles it for the ANE, which
+takes seconds for small models and over a minute for large ones (see
+[Core ML](../coreml.md)); macOS caches the result per app, and later loads
+take under half a second.
 
 Pass the compiled `.mlmodelc` in `transcribe_session_params::coreml_encoder_path`
 (Rust: `SessionOptions::coreml_encoder_path`); an unset path falls back to
@@ -136,9 +172,8 @@ session. Unset or empty leaves the ggml encoder active. An explicitly requested
 encoder that cannot load or predict returns an error instead of silently using
 ggml. Builds without Core ML support reject a nonempty path. Encoders without
 matching variant metadata are rejected. The SHA-256 is provenance metadata, not
-a runtime file-hash check.
-The session retains the Core ML model for reuse; first load may take longer
-while macOS specializes it. GGUF encoder weights remain loaded too.
+a runtime file-hash check. The session retains the Core ML model for reuse.
+The model file's encoder weights remain loaded too.
 
 The CLI's `backend` field describes the ggml decoder backend. The
 `Core ML encoder loaded` log identifies the separate encoder path. Tensor
@@ -148,8 +183,8 @@ Flash-attention flags apply only to the ggml portions of the run.
 Run the optional regression check after building the CLI:
 
 ```bash
-TRANSCRIBE_WHISPER_COREML_GGUF="$PWD/models/whisper-tiny-Q8_0.gguf" \
-TRANSCRIBE_WHISPER_COREML_MODEL="$PWD/models/whisper-tiny-Q8_0-encoder.mlmodelc" \
+TRANSCRIBE_WHISPER_COREML_GGUF="$PWD/models/ggml-tiny.bin" \
+TRANSCRIBE_WHISPER_COREML_MODEL="$PWD/models/whisper-tiny-encoder.mlmodelc" \
   ctest --test-dir build -R transcribe_whisper_coreml_smoke --output-on-failure
 ```
 

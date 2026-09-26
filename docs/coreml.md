@@ -25,8 +25,10 @@ Invalid paths, mismatched variants, and prediction failures return errors.
 - Input `logmel_data`: F32 `[1, n_mels, capacity]`.
 - Input `mel_length`: I32 `[1]`, the valid prefix length.
 - Output `output`: F32 `[1, capacity_out, d_model]`.
-- Creator metadata `transcribe.variant`: the loaded GGUF variant.
-- Creator metadata `transcribe.gguf.sha256` and `.filename`: export provenance.
+- Creator metadata `transcribe.variant`: the loaded model's variant, or a
+  comma-separated list when one encoder serves several checkpoints.
+- Creator metadata `transcribe.gguf.sha256` and `.filename`: export provenance
+  (the source model file, GGUF or whisper.cpp `.bin`).
 
 Qwen's chunked convolution emits 13 rows per 100 mel frames. Its adapter checks
 that row count and passes the valid output length to `coreml_encoder_run`.
@@ -54,13 +56,35 @@ flag. Builds with Core ML disabled retain the existing ggml path.
 ## Whisper
 
 The Whisper adapter loads the session companion through `coreml_encoder_path`
-or `TRANSCRIBE_WHISPER_COREML_MODEL`. Export from the exact GGUF using
-`scripts/convert-whisper-gguf-to-coreml.py`. The encoder has a fixed 3000-frame
-(30 second) input, matching the padded window Whisper always encodes, so there
-is no capacity fallback. `transcribe_whisper_coreml_smoke` exercises the
-supplied real model when `TRANSCRIBE_WHISPER_COREML_GGUF` and
-`TRANSCRIBE_WHISPER_COREML_MODEL` are set. See `docs/models/whisper.md` for
-details.
+or `TRANSCRIBE_WHISPER_COREML_MODEL`. Export it with
+`scripts/convert-whisper-gguf-to-coreml.py` from a transcribe.cpp GGUF or a
+whisper.cpp `.bin`; one encoder serves every quantization of a variant. The
+encoder has a fixed 3000-frame (30 second) input, matching the padded window
+Whisper always encodes, so there is no capacity fallback.
+
+The exported graph targets macOS 14 and runs entirely on the Neural Engine for
+every size (channels-first layout, per-head attention in query blocks,
+per-channel residual scaling against FP16 flush-to-zero, two chained programs
+for large-v3 and turbo). See `docs/models/whisper.md` for the design and the
+numbers behind it. Apple M2 Pro, encoder time per 30 second window inside each
+engine (median, shared machine):
+
+| Encoder | ANE ms | whisper.cpp Core ML ms | First load | Cached load |
+| --- | ---: | ---: | ---: | ---: |
+| tiny | 10 | 20 | 3 s | 0.05 s |
+| base | 20 | 39 | 6 s | 0.07 s |
+| small, small.en | 66 | 124 | 18 s | 0.1 s |
+| medium, medium.en | 206 | 530 | 52 s | 0.3 s |
+| large-v3 | 397 | 534 (GPU) | 82 s | 0.4 s |
+| large-v3-turbo | 396 | 702 (GPU) | 82 s | 0.4 s |
+
+"whisper.cpp Core ML" is `ggml-<size>-encoder.mlmodelc` loaded the way
+whisper.cpp loads it (`MLComputeUnitsAll`); it runs large-v3 and turbo on the
+GPU because the ANE compiler rejects them. First load is the one-time ANE
+compile; macOS caches it per app across launches.
+
+`transcribe_whisper_coreml_smoke` exercises the supplied real model when
+`TRANSCRIBE_WHISPER_COREML_GGUF` and `TRANSCRIBE_WHISPER_COREML_MODEL` are set.
 
 ## Parakeet TDT
 
