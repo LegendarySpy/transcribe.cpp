@@ -449,6 +449,17 @@ fn emit_link_lines(prefix: &Path, manifest_path: &Path) {
     }
     // System libraries the C++/backend archives drag in.
     for name in strs("system_libs") {
+        // The Windows `vulkan-1.lib` import lib only ships in the Vulkan SDK,
+        // which is not on the MSVC linker's default search path.
+        if name == "vulkan-1" {
+            println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+            if let Some(sdk) = env::var_os("VULKAN_SDK") {
+                println!(
+                    "cargo:rustc-link-search=native={}",
+                    Path::new(&sdk).join("Lib").display()
+                );
+            }
+        }
         println!("cargo:rustc-link-lib=dylib={name}");
     }
     // Apple frameworks (Metal/Foundation/Accelerate...).
