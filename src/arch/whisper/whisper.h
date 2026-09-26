@@ -16,8 +16,10 @@
 #include "weights.h"
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_context;
@@ -297,6 +299,11 @@ struct WhisperModel final : public transcribe_model {
     // Built from the filterbank + window baked into the GGUF. Optional so a
     // load failure still surfaces a model object for inspection.
     std::optional<transcribe::MelFrontend> mel;
+
+    // Raw bytes -> text token id, for whisper.cpp-style prompt tokenization.
+    // Built on first use.
+    mutable std::once_flag                           raw_piece_ids_once;
+    mutable std::unordered_map<std::string, int32_t> raw_piece_ids;
 
     WhisperModel() = default;
     ~WhisperModel() override;

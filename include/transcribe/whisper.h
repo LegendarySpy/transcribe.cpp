@@ -8,7 +8,7 @@
  *   - the disabled-threshold sentinel macros (+/-INF) and the prompt
  *     composition enum used by the run ext.
  *
- * Whisper exposes substantial real model-specific knobs (16 fields).
+ * Whisper exposes substantial real model-specific knobs (17 fields).
  * The PNC/ITN toggles that other families share via transcribe_run_params
  * do not apply: transcribe_model_supports(model, TRANSCRIBE_FEATURE_PNC)
  * and (..., TRANSCRIBE_FEATURE_ITN) both return false for whisper, and a
@@ -182,6 +182,14 @@ struct transcribe_whisper_run_ext {
      * TRANSCRIBE_WHISPER_LOGPROB_DISABLED (off); whisper.cpp uses 2.4.
      */
     float entropy_thold;
+
+    /*
+     * Tokenize initial_prompt like whisper.cpp: no leading space, and each
+     * word split greedily into the longest vocabulary pieces instead of BPE
+     * merges. Default false (HF get_prompt_ids). Small models are sensitive
+     * to the exact prompt ids, so callers replacing whisper.cpp set it.
+     */
+    bool greedy_prompt_tokens;
 };
 
 /* Fills ext.size/kind and the Whisper decoding recipe defaults. */

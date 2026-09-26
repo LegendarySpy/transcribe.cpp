@@ -44,6 +44,8 @@ pub struct WhisperRunOptions {
     pub best_of: Option<i32>,
     /// whisper.cpp's repetition fallback on the last 32 tokens (whisper.cpp: 2.4).
     pub entropy_thold: Option<f32>,
+    /// Tokenize `initial_prompt` like whisper.cpp (no leading space, greedy pieces).
+    pub greedy_prompt_tokens: Option<bool>,
 }
 
 /// Parakeet phrase boosting (run slot; also applied by `stream`). Phrases
@@ -273,6 +275,7 @@ impl RunExtension {
                 set(&mut ext.suppress_non_speech, o.suppress_non_speech);
                 set(&mut ext.best_of, o.best_of);
                 set(&mut ext.entropy_thold, o.entropy_thold);
+                set(&mut ext.greedy_prompt_tokens, o.greedy_prompt_tokens);
                 Ok(RunExtRaw::Whisper {
                     ext: Box::new(ext),
                     _prompt: prompt,

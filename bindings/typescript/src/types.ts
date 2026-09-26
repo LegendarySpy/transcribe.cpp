@@ -234,6 +234,7 @@ export interface WhisperRunOptions {
   suppressNonSpeech?: boolean;
   bestOf?: number;
   entropyThold?: number;
+  greedyPromptTokens?: boolean;
 }
 export interface MoonshineStreamingOptions {
   minDecodeIntervalMs?: number;

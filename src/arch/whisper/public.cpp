@@ -75,6 +75,7 @@ extern "C" void transcribe_whisper_run_ext_init(struct transcribe_whisper_run_ex
     p->suppress_non_speech     = true;
     p->best_of                 = 1;
     p->entropy_thold           = TRANSCRIBE_WHISPER_LOGPROB_DISABLED;
+    p->greedy_prompt_tokens    = false;
 }
 
 // Chunk-trace accessors.

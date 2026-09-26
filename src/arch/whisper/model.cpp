@@ -41,6 +41,7 @@
 #include <ios>
 #include <memory>
 #include <random>
+#include <regex>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -1053,19 +1054,14 @@ namespace {
 
 // Whisper timestamp logits processor, shared by whisper_run and
 // whisper_run_batch so per-step masking is identical. Mirrors transformers'
-// WhisperTimeStampLogitsProcessor. Mutates `logits` in place; no-op when
-// want_segment_timestamps is false.
+// WhisperTimeStampLogitsProcessor. Mutates `logits` in place.
 void apply_whisper_timestamp_rules(std::vector<float> &         logits,
                                    const std::vector<int32_t> & generated_ids,
-                                   bool                         want_segment_timestamps,
                                    int                          no_timestamps_token_id,
                                    int                          timestamp_begin,
                                    int64_t                      vocab_size,
                                    int                          eos_id,
                                    int                          max_initial_timestamp_index) {
-    if (!want_segment_timestamps) {
-        return;
-    }
     auto token_is_timestamp = [&](int id) {
         return id >= timestamp_begin && id < static_cast<int>(vocab_size);
     };
@@ -1329,7 +1325,8 @@ transcribe_status whisper_resolve_run_ext(const transcribe_run_params * params, 
         size_t n = k_min_whisper_run_ext_size;
         for (const size_t end : { offsetof(transcribe_whisper_run_ext, suppress_non_speech) + sizeof(bool),
                                   offsetof(transcribe_whisper_run_ext, best_of) + sizeof(int32_t),
-                                  offsetof(transcribe_whisper_run_ext, entropy_thold) + sizeof(float) }) {
+                                  offsetof(transcribe_whisper_run_ext, entropy_thold) + sizeof(float),
+                                  offsetof(transcribe_whisper_run_ext, greedy_prompt_tokens) + sizeof(bool) }) {
             if (ext->size >= end) {
                 n = end;
             }
@@ -1338,6 +1335,36 @@ transcribe_status whisper_resolve_run_ext(const transcribe_run_params * params, 
         out.ext.size = sizeof(out);
     }
     return TRANSCRIBE_OK;
+}
+
+// whisper.cpp's prompt tokenizer: split with its regex, then take the longest
+// vocabulary piece at each position (not BPE merges, no leading space).
+// Unknown bytes are skipped, as in whisper.cpp.
+std::vector<int32_t> whisper_greedy_tokenize(const WhisperModel & m, const std::string & text, int eos_id) {
+    std::call_once(m.raw_piece_ids_once, [&] {
+        for (int id = 0; id < eos_id; ++id) {
+            m.raw_piece_ids[m.tok.decode(&id, 1)] = id;
+        }
+    });
+    static const std::regex re(
+        R"('s|'t|'re|'ve|'m|'ll|'d| ?[[:alpha:]]+| ?[[:digit:]]+| ?[^\s[:alpha:][:digit:]]+|\s+(?!\S)|\s+)");
+    std::vector<int32_t> ids;
+    for (auto it = std::sregex_iterator(text.begin(), text.end(), re); it != std::sregex_iterator(); ++it) {
+        const std::string word = it->str();
+        size_t            i    = 0;
+        while (i < word.size()) {
+            size_t j = word.size();
+            for (; j > i; --j) {
+                const auto hit = m.raw_piece_ids.find(word.substr(i, j - i));
+                if (hit != m.raw_piece_ids.end()) {
+                    ids.push_back(hit->second);
+                    break;
+                }
+            }
+            i = j > i ? j : i + 1;
+        }
+    }
+    return ids;
 }
 
 // Render an accepted raw token stream for transcribe_raw_text. Timestamp
@@ -1695,12 +1722,11 @@ transcribe_status whisper_run(transcribe_session *          session,
     const bool want_words              = requested_timestamps == TRANSCRIBE_TIMESTAMPS_WORD;
     const bool want_segment_timestamps = want_words || requested_timestamps == TRANSCRIBE_TIMESTAMPS_AUTO ||
                                          requested_timestamps == TRANSCRIBE_TIMESTAMPS_SEGMENT;
-    // Long-form always decodes timestamp tokens: without them each 30 s
-    // window must advance blindly, and <|notimestamps|> decoding of a window
-    // that starts mid-sentence tends to stop early, dropping the rest of the
-    // window (HF rejects long-form without timestamps for the same reason).
-    // NONE then only drops the segments from the result.
-    const bool decode_timestamps       = want_segment_timestamps || !is_short_form;
+    // NONE decodes timestamp tokens too and only drops the segments, as
+    // whisper.cpp does. <|notimestamps|> decoding hallucinates on silence
+    // ("you" where timestamped decoding gives [BLANK_AUDIO]), and long-form
+    // windows that start mid-sentence stop early, dropping the rest of the
+    // window (HF rejects long-form without timestamps for this reason).
 
     // Real audio frames (short-form mel is padded to 30 s): alignment only
     // looks at encoder positions that carry audio.
@@ -1869,7 +1895,7 @@ transcribe_status whisper_run(transcribe_session *          session,
     // Resolve initial prompt -> text-only token ids (library prepends
     // <|startofprev|>). Two paths: prompt_tokens (caller-owned, verbatim,
     // text-side only); or initial_prompt string, tokenized as HF's
-    // get_prompt_ids form ("<|startofprev|> " + strip). The byte-level BPE
+    // geprompt_ids form ("<|startofprev|> " + strip). The byte-level BPE
     // never emits special ids, so special-token literals such as "<|en|>"
     // encode as plain text, like whisper.cpp (HF rejects them).
     const int max_prev_cap =
@@ -1902,7 +1928,9 @@ transcribe_status whisper_run(transcribe_session *          session,
         if (b > a) {
             std::string text(" ");
             text.append(s.data() + a, b - a);
-            if (cm->tok.encode(text, prompt_text_ids) != TRANSCRIBE_OK) {
+            if (wp->greedy_prompt_tokens) {
+                prompt_text_ids = whisper_greedy_tokenize(*cm, text.substr(1), eos_id);
+            } else if (cm->tok.encode(text, prompt_text_ids) != TRANSCRIBE_OK) {
                 log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                         "whisper run: tokenizer.encode failed on "
                         "initial_prompt");
@@ -2064,8 +2092,8 @@ transcribe_status whisper_run(transcribe_session *          session,
         }
 
         // Prefix for this chunk:
-        //   multilingual: prev_tokens + [SOT, lang, task, notimestamps?]
-        //   .en:          prev_tokens + [SOT,             notimestamps?]
+        //   multilingual: prev_tokens + [SOT, lang, task]
+        //   .en:          prev_tokens + [SOT]
         // .en vocab has no <|lang|>/<|task|> tokens; emitting them would land
         // on a garbage id.
         std::vector<int32_t> prompt_ids;
@@ -2075,9 +2103,6 @@ transcribe_status whisper_run(transcribe_session *          session,
         if (is_multilingual) {
             prompt_ids.push_back(lang_token);
             prompt_ids.push_back(task_token);
-        }
-        if (!decode_timestamps) {
-            prompt_ids.push_back(cm->hparams.no_timestamps_token_id);
         }
         const int seq_len = static_cast<int>(prompt_ids.size());
 
@@ -2123,8 +2148,8 @@ transcribe_status whisper_run(transcribe_session *          session,
         //      timestamp_begin + max_initial_timestamp_index (HF
         //      logits_process.py:2040-2042).
         auto apply_timestamp_rules = [&](std::vector<float> & logits) {
-            apply_whisper_timestamp_rules(logits, generated_ids, decode_timestamps, cm->hparams.no_timestamps_token_id,
-                                          timestamp_begin, vocab_size, eos_id, max_initial_timestamp_index);
+            apply_whisper_timestamp_rules(logits, generated_ids, cm->hparams.no_timestamps_token_id, timestamp_begin,
+                                          vocab_size, eos_id, max_initial_timestamp_index);
         };
 
         int next_id = 0;
@@ -2235,7 +2260,15 @@ transcribe_status whisper_run(transcribe_session *          session,
 
         // ----- Tier loop (temperature fallback) -----
         for (size_t ti = 0; ti < temperatures.size(); ++ti) {
-            const float tier_T = temperatures[ti];
+            const float                tier_T       = temperatures[ti];
+            // Like whisper.cpp, a tier at T >= 0.5 decodes without the prior
+            // context: when the prompt itself derails the decode (echoed back,
+            // or a hallucination on silence), the hot tiers recover.
+            const bool                 drop_context = tier_T >= 0.5f && sot_index > 0;
+            const std::vector<int32_t> t_prompt_ids =
+                drop_context ? std::vector<int32_t>(prompt_ids.begin() + sot_index, prompt_ids.end()) : prompt_ids;
+            const int t_seq_len   = static_cast<int>(t_prompt_ids.size());
+            const int t_sot_index = drop_context ? 0 : sot_index;
 
             // best_of candidates at T > 0, one greedy decode at T == 0. The
             // tier keeps the candidate with the best average log-probability,
@@ -2273,7 +2306,7 @@ transcribe_status whisper_run(transcribe_session *          session,
                     }
                     const int    kv_pad = kv_pad_self_attn(cm->plan.primary_kind, cc->decoder_use_flash);
                     DecoderBuild db = build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache,
-                                                             /*n_tokens=*/seq_len, /*n_past=*/0, T_enc_local,
+                                                             /*n_tokens=*/t_seq_len, /*n_past=*/0, T_enc_local,
                                                              /*kv_pad=*/kv_pad,
                                                              /*skip_log_softmax=*/false, cc->decoder_use_flash);
                     if (db.out == nullptr || db.graph == nullptr) {
@@ -2288,9 +2321,10 @@ transcribe_status whisper_run(transcribe_session *          session,
                         return TRANSCRIBE_ERR_OOM;
                     }
 
-                    ggml_backend_tensor_set(db.token_ids_in, prompt_ids.data(), 0, prompt_ids.size() * sizeof(int32_t));
-                    std::vector<int32_t> pos_ids(seq_len);
-                    for (int i = 0; i < seq_len; ++i) {
+                    ggml_backend_tensor_set(db.token_ids_in, t_prompt_ids.data(), 0,
+                                            t_prompt_ids.size() * sizeof(int32_t));
+                    std::vector<int32_t> pos_ids(t_seq_len);
+                    for (int i = 0; i < t_seq_len; ++i) {
                         pos_ids[i] = i;
                     }
                     ggml_tensor * pos_in = ggml_graph_get_tensor(db.graph, "dec.pos_ids");
@@ -2301,12 +2335,12 @@ transcribe_status whisper_run(transcribe_session *          session,
                         // db.causal_mask_in carries the runtime n_kv (may
                         // be padded beyond seq_len for FA alignment).
                         const int          n_kv_mask = static_cast<int>(db.causal_mask_in->ne[0]);
-                        std::vector<float> mask(static_cast<size_t>(n_kv_mask) * seq_len);
-                        for (int q = 0; q < seq_len; ++q) {
+                        std::vector<float> mask(static_cast<size_t>(n_kv_mask) * t_seq_len);
+                        for (int q = 0; q < t_seq_len; ++q) {
                             for (int k = 0; k < n_kv_mask; ++k) {
                                 // Causal in [0, seq_len), -inf for padded
                                 // slots in [seq_len, n_kv_mask).
-                                mask[static_cast<size_t>(q) * n_kv_mask + k] = (k < seq_len && k <= q) ? 0.0f : -1e9f;
+                                mask[static_cast<size_t>(q) * n_kv_mask + k] = (k < t_seq_len && k <= q) ? 0.0f : -1e9f;
                             }
                         }
                         ggml_backend_tensor_set(db.causal_mask_in, mask.data(), 0, mask.size() * sizeof(float));
@@ -2317,8 +2351,8 @@ transcribe_status whisper_run(transcribe_session *          session,
                         // for k in [0, T_enc), -inf for trailing padded
                         // slots — same for every query row.
                         const int          n_kv_cross = static_cast<int>(db.cross_mask_in->ne[0]);
-                        std::vector<float> mask(static_cast<size_t>(n_kv_cross) * seq_len);
-                        for (int q = 0; q < seq_len; ++q) {
+                        std::vector<float> mask(static_cast<size_t>(n_kv_cross) * t_seq_len);
+                        for (int q = 0; q < t_seq_len; ++q) {
                             for (int k = 0; k < n_kv_cross; ++k) {
                                 mask[static_cast<size_t>(q) * n_kv_cross + k] = (k < T_enc_local) ? 0.0f : -1e9f;
                             }
@@ -2333,8 +2367,8 @@ transcribe_status whisper_run(transcribe_session *          session,
                         return TRANSCRIBE_ERR_BACKEND;
                     }
                     cc->perf.prompt_compute.add(ggml_time_us() - t_prompt_compute_start);
-                    cc->kv_cache.n    = seq_len;
-                    cc->kv_cache.head = seq_len;
+                    cc->kv_cache.n    = t_seq_len;
+                    cc->kv_cache.head = t_seq_len;
 
                     tier_try_dump("dec.token_emb", db.dumps.token_emb, "decoder.embedding");
                     tier_try_dump("dec.pos_emb", db.dumps.pos_emb, "decoder.position_embedding");
@@ -2363,7 +2397,7 @@ transcribe_status whisper_run(transcribe_session *          session,
                         std::vector<float> sot_logits(static_cast<size_t>(vocab_size));
                         const int64_t      t_prompt_tget_sot = ggml_time_us();
                         ggml_backend_tensor_get(db.dumps.logits_raw, sot_logits.data(),
-                                                row_bytes * static_cast<size_t>(sot_index), row_bytes);
+                                                row_bytes * static_cast<size_t>(t_sot_index), row_bytes);
                         cc->perf.prompt_tensor_get.add(ggml_time_us() - t_prompt_tget_sot);
                         float max_l = -std::numeric_limits<float>::infinity();
                         for (auto l : sot_logits) {
@@ -2392,7 +2426,7 @@ transcribe_status whisper_run(transcribe_session *          session,
                     // Last-row logits → first generated token.
                     const int64_t t_prompt_tget_last = ggml_time_us();
                     ggml_backend_tensor_get(db.dumps.logits_raw, last_logits.data(),
-                                            row_bytes * static_cast<size_t>(seq_len - 1), row_bytes);
+                                            row_bytes * static_cast<size_t>(t_seq_len - 1), row_bytes);
                     cc->perf.prompt_tensor_get.add(ggml_time_us() - t_prompt_tget_last);
 
                     const int64_t t_prompt_cpu_start      = ggml_time_us();
@@ -2436,7 +2470,7 @@ transcribe_status whisper_run(transcribe_session *          session,
                 //     writes via ggml_set_rows at runtime kv_idx, FA reads a fixed
                 //     max_n_kv window with a runtime mask).
                 //   CPU/debug: per-step build_decoder_graph_kv with dynamic n_kv.
-                int        n_past         = seq_len;
+                int        n_past         = t_seq_len;
                 const bool primary_is_gpu = cm->plan.primary_kind != transcribe::BackendKind::Cpu &&
                                             cm->plan.primary_kind != transcribe::BackendKind::Accel &&
                                             cm->plan.primary_kind != transcribe::BackendKind::Unknown;
@@ -2445,7 +2479,7 @@ transcribe_status whisper_run(transcribe_session *          session,
                 // Sized to fit prompt + max generated tail, padded to next pow2,
                 // capped at n_ctx_decoder (448).
                 int max_n_kv = 256;
-                while (max_n_kv < seq_len + k_max_new_tokens) {
+                while (max_n_kv < t_seq_len + k_max_new_tokens) {
                     max_n_kv *= 2;
                 }
                 if (max_n_kv > static_cast<int>(n_ctx_decoder)) {
@@ -2478,7 +2512,7 @@ transcribe_status whisper_run(transcribe_session *          session,
                     // Self-attn mask: [0, seq_len) populated by prompt pass
                     // are attendable; [seq_len, max_n_kv) start as -inf.
                     step_mask.assign(max_n_kv, mask_neg_inf);
-                    for (int p = 0; p < seq_len; ++p) {
+                    for (int p = 0; p < t_seq_len; ++p) {
                         step_mask[p] = mask_zero;
                     }
 
@@ -2505,8 +2539,7 @@ transcribe_status whisper_run(transcribe_session *          session,
                         return TRANSCRIBE_ERR_ABORTED;
                     }
                     generated_ids.push_back(static_cast<int32_t>(next_id));
-                    if (decode_timestamps &&
-                        whisper_ts_reaches_audio_end(next_id, timestamp_begin, seek, content_frames)) {
+                    if (whisper_ts_reaches_audio_end(next_id, timestamp_begin, seek, content_frames)) {
                         break;
                     }
 
@@ -2747,9 +2780,7 @@ transcribe_status whisper_run(transcribe_session *          session,
         //   - >=1 closed pair, not single-ended: discard the unfinished tail,
         //     advance by the last closed ts position * input_stride(2) frames.
         //   - no pairs: emit one full-chunk segment, advance seek_num_frames.
-        // Short-form TIMESTAMPS_NONE includes <|notimestamps|>, so no ts
-        // tokens -> "no pairs" branch, full-chunk advance. NONE never emits
-        // per-chunk segments.
+        // NONE never emits per-chunk segments.
         WhisperSegmentResult seg_res = whisper_retrieve_segment(generated_ids, cm->tok, time_offset_ms, seek_num_frames,
                                                                 want_segment_timestamps, timestamp_begin, vocab_size);
         std::vector<align::Segment> window_segs;
@@ -2819,7 +2850,7 @@ transcribe_status whisper_run(transcribe_session *          session,
         // path, and max_frames for a padded short-form window is the full
         // 3000 frames. Short-form therefore uses the same dynamic advance as
         // long-form: a decode ending in a lone close-timestamp or with no
-        // timestamp pairs (always the case under <|notimestamps|>) advances
+        // timestamp pairs advances
         // the full window, so well-behaved short-form stays single-pass. Only
         // a consecutive-timestamp ending (<|t|><|t|>: the model closed a
         // segment early and the timestamp rules forced a reopen — issue #89)
@@ -3010,7 +3041,9 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
             if (b > a) {
                 std::string text(" ");
                 text.append(s.data() + a, b - a);
-                if (cm->tok.encode(text, ptext) != TRANSCRIBE_OK) {
+                if (wp->greedy_prompt_tokens) {
+                    ptext = whisper_greedy_tokenize(*cm, text.substr(1), eos_id);
+                } else if (cm->tok.encode(text, ptext) != TRANSCRIBE_OK) {
                     return whisper_run_batch_serial(cc, pcm, n_samples, n, params);
                 }
                 for (int32_t id : ptext) {
@@ -3181,16 +3214,13 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
             continue;
         }
 
-        // Per-utterance prompt: prev_tokens + SOT [lang task] [notimestamps?].
+        // Per-utterance prompt: prev_tokens + SOT [lang task].
         std::vector<int32_t> & pr = prompts[b];
         pr                        = prev_tokens;
         pr.push_back(hp.decoder_start_token_id);
         if (is_multilingual) {
             pr.push_back(lang_token);
             pr.push_back(task_token);
-        }
-        if (!want_ts) {
-            pr.push_back(hp.no_timestamps_token_id);
         }
     }
 
@@ -3434,8 +3464,8 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
         std::memcpy(lb.data(), row, static_cast<size_t>(vocab_size) * sizeof(float));
         scale_logits_for_temperature(lb, T);
         suppress_row(lb, begin);
-        apply_whisper_timestamp_rules(lb, gen[b], want_ts, hp.no_timestamps_token_id, timestamp_begin, vocab_size,
-                                      eos_id, max_initial_timestamp_index);
+        apply_whisper_timestamp_rules(lb, gen[b], hp.no_timestamps_token_id, timestamp_begin, vocab_size, eos_id,
+                                      max_initial_timestamp_index);
         float lp = 0.0f;
         int   id;
         if (T <= 0.0f) {
@@ -3517,7 +3547,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
                 hit_eos[b] = 1;
             } else {
                 gen[b].push_back(id);
-                fin[b] = want_ts && whisper_ts_reaches_audio_end(id, timestamp_begin, 0, n_samples[b] / hop);
+                fin[b] = whisper_ts_reaches_audio_end(id, timestamp_begin, 0, n_samples[b] / hop);
             }
         }
         for (int produced = 1; produced < k_max_new; ++produced, ++pos) {
@@ -3555,7 +3585,7 @@ transcribe_status whisper_run_batch(transcribe_session *          session,
                     hit_eos[b] = 1;
                 } else {
                     gen[b].push_back(id);
-                    fin[b] = want_ts && whisper_ts_reaches_audio_end(id, timestamp_begin, 0, n_samples[b] / hop);
+                    fin[b] = whisper_ts_reaches_audio_end(id, timestamp_begin, 0, n_samples[b] / hop);
                 }
             }
         }

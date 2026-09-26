@@ -258,9 +258,10 @@ rules on every run:
   less gives an empty transcript), and a window stops generating once a
   timestamp reaches the last 100 ms of the audio. Both are whisper.cpp's;
   without them text is decoded from the zero padding of the last window.
-- Long-form input (over 30 s) always decodes timestamp tokens; `NONE`
-  only drops the segments. Blind 30-second advances under
-  `<|notimestamps|>` cut words at window edges and made windows stop early.
+- Every run decodes timestamp tokens, as whisper.cpp does; `NONE` only
+  drops the segments. Under `<|notimestamps|>` silence decoded as "you"
+  (timestamped: `[BLANK_AUDIO]`), and long-form windows advanced blindly,
+  cut words at window edges and stopped early.
 - A fallback tier at temperature T divides the logits by T before the
   suppression and timestamp rules, and its average log-probability comes
   from those scaled logits (whisper.cpp's order).
@@ -272,12 +273,17 @@ rules on every run:
 - With `condition_on_prev_tokens`, the carried tokens keep each window's
   closing timestamp pair, and no prior context is used once less than 5 s
   of audio remains (both as in whisper.cpp; the short final window tended
-  to repeat or continue the carried text).
+  to repeat or continue the carried text). A fallback tier at T >= 0.5
+  decodes without the prior context, also as in whisper.cpp, so a prompt
+  that derails the decode (echoed back) can be recovered from.
 
 whisper.cpp's defaults, as used by whisper-rs, map to these run-ext fields
 (Rust `WhisperRunOptions`): `suppress_non_speech = false` (silence decodes
 as a tag such as `[BLANK_AUDIO]` instead of an invented "Thank you."),
 `best_of = 5`, `entropy_thold = 2.4`, `condition_on_prev_tokens = true`,
+`greedy_prompt_tokens = true` (whisper.cpp tokenizes the prompt without a
+leading space and by greedy longest match; tiny echoed a `<|en|>, Glimpse.`
+prompt back with HF tokenization and did not with whisper.cpp's ids),
 and `no_speech_thold = TRANSCRIBE_WHISPER_THOLD_DISABLED`. whisper.cpp
 reads its no-speech probability from a stale logits row, so its gate
 effectively never fires; disabling ours matches that. whisper.cpp has no

@@ -576,6 +576,7 @@ const FAMILY: Record<string, FamilyReg> = {
       suppress_non_speech: o.suppressNonSpeech,
       best_of: o.bestOf,
       entropy_thold: o.entropyThold,
+      greedy_prompt_tokens: o.greedyPromptTokens,
     }),
   },
   moonshine: {
