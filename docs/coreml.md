@@ -92,13 +92,15 @@ The offline Parakeet adapter loads the same session companion through
 `coreml_encoder_path` or `TRANSCRIBE_PARAKEET_COREML_MODEL`. Export from the exact
 GGUF using `scripts/convert-parakeet-gguf-to-coreml.py`. The default capacity is
 1501 mel frames (about 15 seconds); shorter inputs are length-masked and longer
-inputs use the existing ggml encoder. Streaming variants are rejected.
+inputs use the existing ggml encoder. Streaming-only variants are rejected;
+Unified's offline path is supported and its streaming path keeps ggml.
 
 The encoder uses CPU + Neural Engine, with GPU excluded. Its output feeds the
 existing host decoder. The layers are split into chained programs (four for
 the 0.6B models) because the ANE compiler rejects one 1.2 GB program and runs
 it on the CPU. On an Apple M2 Pro, TDT 0.6B V3 encodes a 15 second window in
-37 ms on the Neural Engine versus 104 ms for the single-program CPU build;
+37 ms on the Neural Engine versus 104 ms for the single-program CPU build,
+and Unified 0.6B in 34 ms versus 119 ms for the Metal ggml encoder;
 first load compiles for about 12 s, cached loads take 0.1 s. A missing or mismatched companion returns an error.
 `transcribe_parakeet_coreml_smoke` exercises the supplied real model when
 `TRANSCRIBE_PARAKEET_COREML_GGUF` and `TRANSCRIBE_PARAKEET_COREML_MODEL` are set.

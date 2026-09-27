@@ -149,10 +149,12 @@ other compatible model families can reuse.
 
 On Apple Silicon with macOS 13 or later, the optional Core ML backend covers
 the offline full-context FastConformer encoders: every Parakeet variant except
-the streaming and multitalker checkpoints, which the converter and the runtime
-reject. Build with `-DTRANSCRIBE_COREML=ON`; use `-DTRANSCRIBE_METAL=OFF` and
-`--backend cpu` to keep the decoder on CPU. Core ML uses `CPUAndNeuralEngine`,
-which excludes the GPU but permits CPU operations where needed.
+the streaming-only and multitalker checkpoints, which the converter and the
+runtime reject. Unified's offline path is full-context and supported; its
+streaming path keeps the ggml encoder. Build with `-DTRANSCRIBE_COREML=ON`;
+use `-DTRANSCRIBE_METAL=OFF` and `--backend cpu` to keep the decoder on CPU.
+Core ML uses `CPUAndNeuralEngine`, which excludes the GPU but permits CPU
+operations where needed.
 
 Create the companion encoder directly from the same Handy GGUF used for
 inference. The converter reads and dequantizes its encoder tensors; it does not
