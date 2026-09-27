@@ -95,7 +95,11 @@ GGUF using `scripts/convert-parakeet-gguf-to-coreml.py`. The default capacity is
 inputs use the existing ggml encoder. Streaming variants are rejected.
 
 The encoder uses CPU + Neural Engine, with GPU excluded. Its output feeds the
-existing host decoder. A missing or mismatched companion returns an error.
+existing host decoder. The layers are split into chained programs (four for
+the 0.6B models) because the ANE compiler rejects one 1.2 GB program and runs
+it on the CPU. On an Apple M2 Pro, TDT 0.6B V3 encodes a 15 second window in
+37 ms on the Neural Engine versus 104 ms for the single-program CPU build;
+first load compiles for about 12 s, cached loads take 0.1 s. A missing or mismatched companion returns an error.
 `transcribe_parakeet_coreml_smoke` exercises the supplied real model when
 `TRANSCRIBE_PARAKEET_COREML_GGUF` and `TRANSCRIBE_PARAKEET_COREML_MODEL` are set.
 See `docs/models/parakeet.md` for the adapter contract and supported variants.
