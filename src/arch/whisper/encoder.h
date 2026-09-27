@@ -58,12 +58,16 @@ struct EncoderBuild {
 // n_mel_frames must be positive and even (upstream pads/trims to 3000; smaller
 // even values are accepted for test fixtures). use_flash selects
 // ggml_flash_attn_ext vs. manual mul_mat + soft_max; the caller gates it
-// against backend support. backend_name is informational only.
+// against backend support. attn_k / attn_v, when set, are zeroed F16 buffers
+// of d_model * T_pad elements that flash attention reads K/V from (see
+// k_enc_attn_pad). backend_name is informational only.
 EncoderBuild build_encoder_graph(ggml_context *         compute_ctx,
                                  const WhisperWeights & weights,
                                  const WhisperHParams & hp,
                                  int                    n_mel_frames,
                                  bool                   use_flash    = true,
+                                 ggml_tensor *          attn_k       = nullptr,
+                                 ggml_tensor *          attn_v       = nullptr,
                                  const char *           backend_name = "");
 
 }  // namespace transcribe::whisper

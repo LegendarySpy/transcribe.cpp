@@ -24,6 +24,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-repetition-guard.h"
 #include "weights.h"
 
 #include <algorithm>
@@ -318,7 +319,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     if (weights_buffer == nullptr) {
         gguf_free(gguf_data);
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moss: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
     m->backend_buffer = weights_buffer;
     ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -337,10 +338,12 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         for (auto & b : m->weights.dec_blocks) {
             entries.push_back({ b.ffn_gate_w, b.ffn_up_w, &b.ffn_gate_up_w });
         }
-        if (!transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
-                                                 entries, m->packed_gate_up, "moss")) {
+        if (const transcribe_status st =
+                transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
+                                                    entries, m->packed_gate_up, "moss");
+            st != TRANSCRIBE_OK) {
             m->packed_gate_up.free();
-            return TRANSCRIBE_ERR_GGUF;
+            return st;
         }
     }
 
@@ -389,7 +392,7 @@ transcribe_status ensure_sched(MossSession * cc, MossModel * cm) {
         cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     return TRANSCRIBE_OK;
@@ -405,7 +408,7 @@ transcribe_status reset_compute_ctx(MossSession * cc, int mb) {
     ip.mem_buffer   = nullptr;
     ip.no_alloc     = true;
     cc->compute_ctx = ggml_init(ip);
-    return cc->compute_ctx != nullptr ? TRANSCRIBE_OK : TRANSCRIBE_ERR_GGUF;
+    return cc->compute_ctx != nullptr ? TRANSCRIBE_OK : TRANSCRIBE_ERR_OOM;
 }
 
 // Fills enc_out [dec_hidden, T_enc]; returns T_enc via out_T_enc. `dumps` marks
@@ -477,7 +480,7 @@ transcribe_status encode_one(MossSession *        cc,
         const int64_t t_enc0 = ggml_time_us();
         if (ggml_backend_sched_graph_compute(cc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moss encode: encoder graph compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         enc_us += ggml_time_us() - t_enc0;
 
@@ -536,7 +539,7 @@ transcribe_status encode_one(MossSession *        cc,
     const int64_t t_enc1 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(cc->sched, ab.graph) != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moss encode: adaptor graph compute failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     enc_us += ggml_time_us() - t_enc1;
 
@@ -626,7 +629,7 @@ transcribe_status prefill_chunked(MossSession *                cc,
 
         if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moss prefill: chunk %d/%d compute failed", c + 1, n_chunks);
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
 
         cc->kv_cache.n    = max_n_kv;
@@ -847,7 +850,7 @@ transcribe_status run(transcribe_session *          session,
         const int64_t t_pf0 = perf_debug ? ggml_time_us() : 0;
         if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moss run: prefill compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         t_prefill_us      = perf_debug ? (ggml_time_us() - t_pf0) : 0;
         cc->kv_cache.n    = T_prompt;
@@ -920,6 +923,7 @@ transcribe_status run(transcribe_session *          session,
         per_step_us.reserve(512);
     }
 
+    bool repeating = false;
     while (next_tok != eos_id && static_cast<int32_t>(generated_ids.size()) < gen_budget && cur_past + 1 <= max_n_kv) {
         const int64_t t_i0 = perf_debug ? ggml_time_us() : 0;
         ggml_backend_tensor_set(sb.input_id_in, &next_tok, 0, sizeof(int32_t));
@@ -940,7 +944,7 @@ transcribe_status run(transcribe_session *          session,
 
         if (ggml_backend_sched_graph_compute(cc->sched, sb.graph) != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "moss step: graph compute failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         if (perf_debug) {
             const int64_t dt = ggml_time_us() - t_c0;
@@ -968,15 +972,21 @@ transcribe_status run(transcribe_session *          session,
         cur_past += 1;
         cc->kv_cache.n    = cur_past + 1;
         cc->kv_cache.head = cur_past + 1;
+        if (next_tok != eos_id && transcribe::stop_on_repetition(generated_ids, "moss run")) {
+            cc->mark_repetition_stop();
+            repeating = true;
+            break;
+        }
         if (cc->poll_abort()) {
             return TRANSCRIBE_ERR_ABORTED;
         }
     }
 
-    if (next_tok != eos_id) {
+    if (!repeating && next_tok != eos_id) {
         cc->was_truncated = true;
         log_msg(TRANSCRIBE_LOG_LEVEL_WARN, "moss run: output truncated at %d tokens",
                 static_cast<int>(generated_ids.size()));
+        transcribe::trim_repetition_at_budget_stop(generated_ids, "moss run");
     }
     if (!generated_ids.empty() && generated_ids.back() == eos_id) {
         generated_ids.pop_back();
@@ -1022,7 +1032,7 @@ transcribe_status run(transcribe_session *          session,
     install_transcript(*cc, params, raw_text, audio_ms);
     cc->has_result = true;
 
-    return cc->was_truncated ? TRANSCRIBE_ERR_OUTPUT_TRUNCATED : TRANSCRIBE_OK;
+    return cc->truncation_status();
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,30 +1062,8 @@ transcribe_status run_batch_serial(MossSession *                 cc,
                                    const int *                   n_samples,
                                    int                           n,
                                    const transcribe_run_params * params) {
-    bool any_truncated = false;
-    for (int i = 0; i < n; ++i) {
-        if (cc->poll_abort()) {
-            return TRANSCRIBE_ERR_ABORTED;
-        }
-        cc->clear_result();
-        cc->t_mel_us      = 0;
-        cc->t_encode_us   = 0;
-        cc->t_decode_us   = 0;
-        cc->was_truncated = false;
-
-        const transcribe_status st = (pcm[i] == nullptr || n_samples[i] <= 0) ? TRANSCRIBE_ERR_INVALID_ARG :
-                                                                                run(cc, pcm[i], n_samples[i], params);
-        any_truncated              = any_truncated || st == TRANSCRIBE_ERR_OUTPUT_TRUNCATED;
-        if (st == TRANSCRIBE_OK || cc->has_result) {
-            cc->batch_results.push_back(cc->capture_result(st));
-        } else {
-            transcribe_session::ResultSet rs;
-            rs.status = st;
-            cc->batch_results.push_back(std::move(rs));
-        }
-    }
-    cc->was_truncated = any_truncated;
-    return TRANSCRIBE_OK;
+    return transcribe::run_batch_serial(cc, pcm, n_samples, n,
+                                        [&](const float * p, int ns) { return run(cc, p, ns, params); });
 }
 
 transcribe_status run_batch(transcribe_session *          session,
@@ -1281,7 +1269,7 @@ transcribe_status run_batch(transcribe_session *          session,
 
         transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
         if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         std::vector<int32_t> amax(n, 0);
         ggml_backend_tensor_get(pb.out, amax.data(), 0, amax.size() * sizeof(int32_t));
@@ -1339,7 +1327,7 @@ transcribe_status run_batch(transcribe_session *          session,
         transcribe_session::ResultSet rs = finalize_utterance(cm, params, generated[b], n_samples[b]);
         if (b < static_cast<int>(truncated.size()) && truncated[b]) {
             cc->was_truncated = true;
-            rs.status         = TRANSCRIBE_ERR_OUTPUT_TRUNCATED;
+            rs.status         = transcribe::decode_stop_status(truncated[b]);
         }
         cc->batch_results.push_back(std::move(rs));
     }

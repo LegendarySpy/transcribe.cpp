@@ -579,6 +579,7 @@ transcribe_status load_from_bin(const char *                                path
 
     // ---- Capabilities + language list ----
     apply_caps_and_languages(*m, bm);
+    resolve_alignment_heads(*m);
 
     // ---- ctx_meta + tensor catalog ----
     // Sized like the GGUF path: roughly n_tensors * tensor_overhead,
@@ -591,7 +592,7 @@ transcribe_status load_from_bin(const char *                                path
     init_params.no_alloc   = true;
     m->ctx_meta            = ggml_init(init_params);
     if (m->ctx_meta == nullptr) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     std::vector<transcribe::bin_loader::BinStreamSlot> stream_slots;
@@ -620,7 +621,7 @@ transcribe_status load_from_bin(const char *                                path
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(m->ctx_meta, m->plan.primary);
     if (buf == nullptr) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: ggml_backend_alloc_ctx_tensors failed", kTag);
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
     m->backend_buffer = buf;
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);

@@ -125,6 +125,15 @@ five hypotheses changed on rare proper nouns and invented words, and seven
 more differed only in punctuation. `qwen3-asr-1.7b` converts through the same path but has
 not been exercised here.
 
+With the companion, the ggml encoder weights are never used.
+`scripts/extract-coreml-decoder.py` writes a decoder-only GGUF without them
+(see [Core ML](../coreml.md#decoder-only-packages-parakeet-tdt-v3-qwen3-asr)):
+the 0.6B Q8_0 file goes from 850 MB to 640 MB and peak memory drops by about
+220 MB. Such a model requires the companion and returns an error for input
+over its capacity instead of falling back. On 70 LibriSpeech, synthetic and
+de/es/fr/ja clips up to 15 s, transcripts matched the full GGUF with the same
+companion exactly.
+
 ## Vocabulary context
 
 The RUN-slot `transcribe_qwen3_asr_run_ext` accepts UTF-8 vocabulary/background

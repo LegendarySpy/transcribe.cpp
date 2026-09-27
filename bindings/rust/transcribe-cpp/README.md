@@ -62,6 +62,10 @@ let transcript = stream.snapshot(); // language, segments, words, tokens, timing
 # Ok::<(), transcribe_cpp::Error>(())
 ```
 
+`Stream` borrows its session. To keep a stream across calls (for example in a
+struct field), `session.into_stream(..)` returns an `OwnedStream` with the same
+methods; `into_session()` hands the idle session back.
+
 Runnable examples:
 
 ```sh

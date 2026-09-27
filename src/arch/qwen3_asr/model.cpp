@@ -18,6 +18,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-repetition-guard.h"
 #include "transcribe/qwen3_asr.h"
 #include "weights.h"
 
@@ -168,6 +169,14 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         return st;
     }
 
+    const int64_t decoder_only_key = gguf_find_key(loader.gguf(), "stt.qwen3_asr.decoder_only");
+    if (decoder_only_key >= 0) {
+        if (gguf_get_kv_type(loader.gguf(), decoder_only_key) != GGUF_TYPE_BOOL) {
+            return TRANSCRIBE_ERR_GGUF;
+        }
+        m->decoder_only = gguf_get_val_bool(loader.gguf(), decoder_only_key);
+    }
+
     // Publish the input-length ceiling now that the decoder context window
     // and frontend rate are known.
     m->caps.max_audio_ms = qwen3_max_audio_ms(m->hparams);
@@ -245,7 +254,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         return TRANSCRIBE_ERR_GGUF;
     }
 
-    if (const transcribe_status st = build_qwen3_asr_weights(m->ctx_meta, m->hparams, m->weights);
+    if (const transcribe_status st = build_qwen3_asr_weights(m->ctx_meta, m->hparams, m->weights, !m->decoder_only);
         st != TRANSCRIBE_OK) {
         gguf_free(gguf_data);
         return st;
@@ -266,7 +275,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     if (weights_buffer == nullptr) {
         gguf_free(gguf_data);
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
     m->backend_buffer = weights_buffer;
     ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -289,10 +298,12 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         for (auto & b : m->weights.dec_blocks) {
             entries.push_back({ b.ffn_gate_w, b.ffn_up_w, &b.ffn_gate_up_w });
         }
-        if (!transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
-                                                 entries, m->packed_gate_up, "qwen3_asr")) {
+        if (const transcribe_status st =
+                transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
+                                                    entries, m->packed_gate_up, "qwen3_asr");
+            st != TRANSCRIBE_OK) {
             m->packed_gate_up.free();
-            return TRANSCRIBE_ERR_GGUF;
+            return st;
         }
     }
 
@@ -365,6 +376,11 @@ transcribe_status init_context(transcribe_model *                model,
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr: rebuild with TRANSCRIBE_COREML=ON to use a Core ML encoder");
         return TRANSCRIBE_ERR_INVALID_ARG;
 #endif
+    }
+
+    if (cm->decoder_only && cc->coreml_encoder == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr: decoder-only GGUF requires a matching Core ML encoder");
+        return TRANSCRIBE_ERR_INVALID_ARG;
     }
 
     *out_ctx = cc.release();
@@ -697,7 +713,7 @@ transcribe_status run(transcribe_session *          session,
         cc->compute_ctx = ggml_init(ip);
         if (cc->compute_ctx == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: ggml_init for compute_ctx failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_OOM;
         }
     }
 
@@ -707,7 +723,7 @@ transcribe_status run(transcribe_session *          session,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: ggml_backend_sched_new failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
 
@@ -729,6 +745,10 @@ transcribe_status run(transcribe_session *          session,
             const long long shape[2] = { T_enc, d_enc };
             transcribe::debug::dump_host_f32("enc.proj.out", cc->enc_host.data(),
                                              static_cast<long long>(cc->enc_host.size()), shape, 2, "enc.proj");
+        } else if (cm->decoder_only) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                    "qwen3_asr: input exceeds Core ML encoder capacity; split audio into chunks of at most 15 seconds");
+            return TRANSCRIBE_ERR_INVALID_ARG;
         } else {
             log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
                     "qwen3_asr Core ML: %d mel frames exceed encoder capacity %d; using ggml for this utterance",
@@ -783,7 +803,7 @@ transcribe_status run(transcribe_session *          session,
         if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: encoder graph compute failed (%d)",
                     static_cast<int>(gs));
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         cc->t_encode_us = ggml_time_us() - t_enc_start;
 
@@ -932,7 +952,7 @@ transcribe_status run(transcribe_session *          session,
     t_prefill_build_us                    = t_prefill_compute_start - t_prefill_build_start;
     if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, pb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr run: prefill graph compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     t_prefill_compute_us = ggml_time_us() - t_prefill_compute_start;
 
@@ -1032,6 +1052,7 @@ transcribe_status run(transcribe_session *          session,
     int64_t       t_step_comp_us    = 0;
     int64_t       t_step_get_us     = 0;
     const int64_t t_step_loop_start = ggml_time_us();
+    bool          repeating         = false;
     while (next_tok != eos_id && static_cast<int32_t>(generated_ids.size()) < max_new && cur_past + 1 <= max_n_kv) {
         const int64_t t_set0 = ggml_time_us();
 
@@ -1056,7 +1077,7 @@ transcribe_status run(transcribe_session *          session,
 
         if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, sb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "qwen3_asr step: graph compute failed (%d)", static_cast<int>(gs));
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         const int64_t t_comp1 = ggml_time_us();
         t_step_comp_us += t_comp1 - t_set1;
@@ -1069,19 +1090,26 @@ transcribe_status run(transcribe_session *          session,
         cc->kv_cache.n    = cur_past + 1;
         cc->kv_cache.head = cur_past + 1;
         t_step_get_us += ggml_time_us() - t_comp1;
+        if (next_tok != eos_id && transcribe::stop_on_repetition(generated_ids, "qwen3_asr run")) {
+            cc->mark_repetition_stop();
+            repeating = true;
+            break;
+        }
     }
     t_step_loop_us = ggml_time_us() - t_step_loop_start;
     n_steps        = static_cast<int>(generated_ids.size()) - 1;
 
     // Decode stopped at EOS (complete) or the generation budget / context width
-    // (truncated). Surface the latter via transcribe_was_truncated() + WARN.
-    if (next_tok != eos_id) {
+    // (truncated). Surface the latter via transcribe_was_truncated() + WARN; a
+    // repetition stop has already done both.
+    if (!repeating && next_tok != eos_id) {
         cc->was_truncated = true;
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
                             "qwen3_asr run: output truncated at %d tokens — decode reached the "
                             "generation budget before end-of-stream; the transcript may be "
                             "incomplete.",
                             static_cast<int>(generated_ids.size()));
+        transcribe::trim_repetition_at_budget_stop(generated_ids, "qwen3_asr run");
     }
 
     // Map granular counters to the debug-print shape. With graph reuse all
@@ -1181,7 +1209,7 @@ transcribe_status run(transcribe_session *          session,
 
     // A truncated decode returns OUTPUT_TRUNCATED; the partial transcript above
     // stays readable (like an aborted run).
-    return cc->was_truncated ? TRANSCRIBE_ERR_OUTPUT_TRUNCATED : TRANSCRIBE_OK;
+    return cc->truncation_status();
 }
 
 // ===========================================================================
@@ -1213,7 +1241,7 @@ transcribe_status reset_compute_ctx(QwenAsrSession * cc, int mb) {
     ip.mem_buffer   = nullptr;
     ip.no_alloc     = true;
     cc->compute_ctx = ggml_init(ip);
-    return cc->compute_ctx != nullptr ? TRANSCRIBE_OK : TRANSCRIBE_ERR_GGUF;
+    return cc->compute_ctx != nullptr ? TRANSCRIBE_OK : TRANSCRIBE_ERR_OOM;
 }
 
 // Batched encoder: mel (parallel) + one encoder graph over all B utterances
@@ -1289,12 +1317,12 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
         cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(cc->sched);
     if (!ggml_backend_sched_alloc_graph(cc->sched, eb.graph)) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     const int    mel_per_chunk   = cm->hparams.enc_n_window * 2;
@@ -1366,7 +1394,7 @@ transcribe_status encode_all_batched(QwenAsrSession *                  cc,
 
     const int64_t t_enc0 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(cc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     enc_us += ggml_time_us() - t_enc0;
 
@@ -1425,7 +1453,7 @@ transcribe_status prefill_all_batched(QwenAsrSession *                          
 
     ggml_backend_sched_reset(cc->sched);
     if (!ggml_backend_sched_alloc_graph(cc->sched, pb.graph)) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     const int d_enc = cm->hparams.enc_output_dim;
@@ -1502,7 +1530,7 @@ transcribe_status prefill_all_batched(QwenAsrSession *                          
 
     apply_sched_threads(cc);
     if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
 
     std::vector<int32_t> amax(n, 0);
@@ -1571,21 +1599,8 @@ transcribe_status run_batch_serial(QwenAsrSession *              cc,
                                    const int *                   n_samples,
                                    int                           n,
                                    const transcribe_run_params * params) {
-    for (int i = 0; i < n; ++i) {
-        if (cc->poll_abort()) {
-            return TRANSCRIBE_ERR_ABORTED;
-        }
-        const transcribe_status st = (pcm[i] == nullptr || n_samples[i] <= 0) ? TRANSCRIBE_ERR_INVALID_ARG :
-                                                                                run(cc, pcm[i], n_samples[i], params);
-        if (st == TRANSCRIBE_OK) {
-            cc->batch_results.push_back(cc->capture_result(st));
-        } else {
-            transcribe_session::ResultSet rs;
-            rs.status = st;
-            cc->batch_results.push_back(std::move(rs));
-        }
-    }
-    return TRANSCRIBE_OK;
+    return transcribe::run_batch_serial(cc, pcm, n_samples, n,
+                                        [&](const float * p, int ns) { return run(cc, p, ns, params); });
 }
 
 }  // namespace
@@ -1756,7 +1771,7 @@ transcribe_status run_batch(transcribe_session *          session,
     }
     ggml_backend_sched_reset(cc->sched);
     if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     transcribe::causal_lm::StepBatchedIO io{};
@@ -1795,7 +1810,7 @@ transcribe_status run_batch(transcribe_session *          session,
         // Per-utterance truncation parity with the single-shot path.
         if (b < static_cast<int>(truncated.size()) && truncated[b]) {
             cc->was_truncated = true;
-            rs.status         = TRANSCRIBE_ERR_OUTPUT_TRUNCATED;
+            rs.status         = transcribe::decode_stop_status(truncated[b]);
         }
         rs.t_mel_us    = mel_us / valid_count;
         rs.t_encode_us = enc_us / valid_count;

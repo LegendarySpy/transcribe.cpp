@@ -39,6 +39,7 @@ from .errors import (
     ModelLoadError,
     NotImplementedByModel,
     OutOfMemory,
+    OutputRepetition,
     OutputTruncated,
     TranscribeError,
     UnsupportedRequest,
@@ -46,7 +47,7 @@ from .errors import (
     raise_for_status,
 )
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 # String-enum types, exported so callers (and type checkers) can name them.
 Backend = Literal["auto", "cpu", "metal", "vulkan", "cpu_accel", "cuda", "rocm"]
@@ -110,6 +111,7 @@ __all__ = [
     "Aborted",
     "InputTooLong",
     "OutputTruncated",
+    "OutputRepetition",
     "native_version",
     "native_commit",
     "library_path",
@@ -726,7 +728,11 @@ class WhisperRunOptions(FamilyExtension):
                  no_speech_thold: float | None = None,
                  max_prev_context_tokens: int | None = None,
                  seed: int | None = None,
-                 max_initial_timestamp: float | None = None):
+                 max_initial_timestamp: float | None = None,
+                 suppress_non_speech: bool | None = None,
+                 best_of: int | None = None,
+                 entropy_thold: float | None = None,
+                 greedy_prompt_tokens: bool | None = None):
         self.initial_prompt = initial_prompt
         self.condition_on_prev_tokens = condition_on_prev_tokens
         self.temperature = temperature
@@ -737,6 +743,10 @@ class WhisperRunOptions(FamilyExtension):
         self.max_prev_context_tokens = max_prev_context_tokens
         self.seed = seed
         self.max_initial_timestamp = max_initial_timestamp
+        self.suppress_non_speech = suppress_non_speech
+        self.best_of = best_of
+        self.entropy_thold = entropy_thold
+        self.greedy_prompt_tokens = greedy_prompt_tokens
 
     def _apply(self, ext) -> None:
         if self.initial_prompt is not None:
@@ -759,6 +769,14 @@ class WhisperRunOptions(FamilyExtension):
             ext.seed = self.seed
         if self.max_initial_timestamp is not None:
             ext.max_initial_timestamp = self.max_initial_timestamp
+        if self.suppress_non_speech is not None:
+            ext.suppress_non_speech = self.suppress_non_speech
+        if self.best_of is not None:
+            ext.best_of = self.best_of
+        if self.entropy_thold is not None:
+            ext.entropy_thold = self.entropy_thold
+        if self.greedy_prompt_tokens is not None:
+            ext.greedy_prompt_tokens = self.greedy_prompt_tokens
 
 
 class MoonshineStreamingOptions(FamilyExtension):
@@ -1116,9 +1134,9 @@ class Session:
         capabilities advertise ``supports_spec_decode`` (-1 = family default,
         0 = disabled, >0 = draft length; silently ignored elsewhere).
 
-        On ``Aborted`` (via :meth:`cancel`) and ``OutputTruncated`` the
-        partial transcript is preserved and attached to the exception as
-        ``partial_result``."""
+        On ``Aborted`` (via :meth:`cancel`) and ``OutputTruncated`` (including
+        its ``OutputRepetition`` subclass) the partial transcript is preserved
+        and attached to the exception as ``partial_result``."""
         self._cancel.clear()
         array, n_samples = _pcm_to_carray(pcm)
         params = _build_run_params(task, language, target_language, timestamps,
@@ -1132,7 +1150,8 @@ class Session:
                    "transcribe_run")
         except (Aborted, OutputTruncated) as exc:
             # The C API preserves the partial transcript on the session for
-            # exactly these two statuses; surface it rather than discard it.
+            # these statuses (OutputRepetition included, as an OutputTruncated
+            # subclass); surface it rather than discard it.
             exc.partial_result = self._materialize()
             raise
         return self._materialize()

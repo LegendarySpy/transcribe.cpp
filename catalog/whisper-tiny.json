@@ -28,7 +28,7 @@
     "transcribe": {"supported":true,"verified":false},
     "translate": {"supported":true,"verified":false,"targets":["en"],"pairs":null},
     "lang_detect": {"supported":true,"verified":false},
-    "timestamps": {"supported":true,"verified":false,"granularities":["segment"]},
+    "timestamps": {"supported":true,"verified":false,"granularities":["word"]},
     "streaming": {"supported":false},
     "diarize": {"supported":false},
     "batching": {"supported":true,"verified":false}

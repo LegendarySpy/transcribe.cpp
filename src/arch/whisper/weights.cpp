@@ -204,6 +204,12 @@ transcribe_status read_whisper_hparams(const gguf_context * gguf, WhisperHParams
         st != TRANSCRIBE_OK) {
         return st;
     }
+    // Optional; a malformed value only costs the built-in head table.
+    if (transcribe::read_int32_array_kv(gguf, "stt.whisper.alignment_heads", hp.alignment_heads) ==
+        transcribe::KvResult::BadType) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_WARN, "%s: ignoring stt.whisper.alignment_heads (wrong type)", kFamilyTag);
+        hp.alignment_heads.clear();
+    }
 
     // Frontend.
     if (auto st = read_required_string_kv(gguf, "stt.frontend.type", kFamilyTag, hp.fe_type); st != TRANSCRIBE_OK) {

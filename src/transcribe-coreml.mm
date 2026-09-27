@@ -54,8 +54,10 @@ CoreMLEncoder * coreml_encoder_load(const char * path,
                     return nullptr;
                 }
                 MLModelDescription * desc           = encoder->model.modelDescription;
+                // One variant, or a comma-separated list for encoders shared across checkpoints.
                 NSString *           source_variant = desc.metadata[MLModelCreatorDefinedKey][@"transcribe.variant"];
-                if (![source_variant isEqualToString:[NSString stringWithUTF8String:variant]]) {
+                NSArray *            variants       = [source_variant componentsSeparatedByString:@","];
+                if (![variants containsObject:[NSString stringWithUTF8String:variant]]) {
                     log_error("encoder checkpoint does not match GGUF variant", nil);
                     return nullptr;
                 }
@@ -149,11 +151,12 @@ bool coreml_encoder_run(CoreMLEncoder *      encoder,
     }
     @autoreleasepool {
         @try {
-            float *    input   = static_cast<float *>(encoder->input.dataPointer);
-            const auto strides = encoder->input.strides;
+            float *         input    = static_cast<float *>(encoder->input.dataPointer);
+            const NSInteger in_mel   = encoder->input.strides[1].integerValue;
+            const NSInteger in_frame = encoder->input.strides[2].integerValue;
             for (int m = 0; m < encoder->n_mels; ++m) {
                 for (int t = 0; t < encoder->capacity; ++t) {
-                    input[m * strides[1].integerValue + t * strides[2].integerValue] =
+                    input[m * in_mel + t * in_frame] =
                         t < n_frames ? mel[time_major ? t * encoder->n_mels + m : m * n_frames + t] : 0.0f;
                 }
             }
@@ -178,12 +181,12 @@ bool coreml_encoder_run(CoreMLEncoder *      encoder,
                 return false;
             }
             output.resize(static_cast<size_t>(frames_out) * encoder->d_model);
-            const float * data        = static_cast<const float *>(result.dataPointer);
-            const auto    out_strides = result.strides;
+            const float *   data      = static_cast<const float *>(result.dataPointer);
+            const NSInteger out_frame = result.strides[1].integerValue;
+            const NSInteger out_dim   = result.strides[2].integerValue;
             for (int t = 0; t < frames_out; ++t) {
                 for (int d = 0; d < encoder->d_model; ++d) {
-                    output[t * encoder->d_model + d] =
-                        data[t * out_strides[1].integerValue + d * out_strides[2].integerValue];
+                    output[t * encoder->d_model + d] = data[t * out_frame + d * out_dim];
                 }
             }
             return true;

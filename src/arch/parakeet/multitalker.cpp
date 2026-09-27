@@ -319,6 +319,7 @@ static transcribe_status run_streaming_passes(ParakeetSession *             pc,
     const int64_t t_dec_start = ggml_time_us();
     for (size_t i = 0; i < active.size(); ++i) {
         Inst & I = inst[i];
+        resolve_boost_fork(I.dec.boost, I.dec.lstm_state, I.dec.prev_token_id, I.raw);
         if (st == TRANSCRIBE_OK && !I.raw.empty()) {
             for (auto & rt : I.raw) {
                 const size_t f  = std::min(static_cast<size_t>(std::max(rt.step_at_emit, 0)), I.fed.size() - 1);
@@ -388,7 +389,7 @@ transcribe_status run_multitalker(ParakeetSession *             pc,
                                            /*graph_size=*/8192, /*parallel=*/false, /*op_offload=*/true);
         if (pc->sched == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet multitalker: ggml_backend_sched_new failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
 

@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "alignment.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "transcribe-backend.h"
@@ -15,8 +16,10 @@
 #include "weights.h"
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_context;
@@ -27,6 +30,10 @@ struct ggml_backend_sched;
 typedef struct ggml_backend *        ggml_backend_t;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 typedef struct ggml_backend_sched *  ggml_backend_sched_t;
+
+namespace transcribe {
+struct CoreMLEncoder;
+}
 
 namespace transcribe::whisper {
 
@@ -113,11 +120,16 @@ struct WhisperKvCache {
 // Allocated on first use, reallocated only on shape change (T_enc is fixed at
 // max_source_positions=1500 for stock variants, so effectively never).
 struct WhisperEncOut {
-    ggml_tensor *         tensor  = nullptr;
-    ggml_context *        ctx     = nullptr;
-    ggml_backend_buffer_t buffer  = nullptr;
-    int                   d_model = 0;
-    int                   T_enc   = 0;
+    ggml_tensor *         tensor   = nullptr;
+    ggml_context *        ctx      = nullptr;
+    ggml_backend_buffer_t buffer   = nullptr;
+    int                   d_model  = 0;
+    int                   T_enc    = 0;
+    // Zeroed F16 K/V rows, T_enc padded to attn_pad, that the encoder's
+    // flash attention reads (see k_enc_attn_pad); null when attn_pad is 0.
+    ggml_tensor *         attn_k   = nullptr;
+    ggml_tensor *         attn_v   = nullptr;
+    int                   attn_pad = 0;
 
     void free() {
         if (buffer != nullptr) {
@@ -128,13 +140,16 @@ struct WhisperEncOut {
             ggml_free(ctx);
             ctx = nullptr;
         }
-        tensor  = nullptr;
-        d_model = 0;
-        T_enc   = 0;
+        tensor   = nullptr;
+        d_model  = 0;
+        T_enc    = 0;
+        attn_k   = nullptr;
+        attn_v   = nullptr;
+        attn_pad = 0;
     }
 };
 
-bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, int T_enc);
+bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, int T_enc, int attn_pad);
 
 // Active-KV padding for the self-attention step graph (whisper.cpp's
 // whisper_kv_cache_get_padding): 32 on Metal+FA, 1 otherwise. Aligns the FA
@@ -146,6 +161,11 @@ int kv_pad_self_attn(transcribe::BackendKind kind, bool use_flash);
 // on backend); cost is a few unused rows per layer plus small cross-attn
 // dilution.
 constexpr int k_cross_kv_pad = 256;
+
+// Encoder self-attention K/V padding multiple under flash attention on Metal.
+// whisper.cpp attends over zeroed rows up to this multiple, unmasked, which
+// skips the Metal kernel's slower partial-block path.
+constexpr int k_enc_attn_pad = 256;
 
 // Allocate cache tensors. n_ctx caps self-attention length; T_enc is
 // fixed at 1500 for whisper (max_source_positions after the stride-2
@@ -229,6 +249,11 @@ struct WhisperPerf {
     WhisperPerfStage step_cpu_sample;
     WhisperPerfStage step_cpu_logprob;
 
+    // Word-timestamp alignment pass (per window, only on TIMESTAMPS_WORD).
+    WhisperPerfStage align_graph;  // build + alloc + inputs
+    WhisperPerfStage align_compute;
+    WhisperPerfStage align_host;   // readback + host math
+
     int chunks = 0;
 
     void reset() {
@@ -257,6 +282,9 @@ struct WhisperPerf {
         step_cpu_timestamp.reset();
         step_cpu_sample.reset();
         step_cpu_logprob.reset();
+        align_graph.reset();
+        align_compute.reset();
+        align_host.reset();
         chunks = 0;
     }
 };
@@ -277,10 +305,18 @@ struct WhisperModel final : public transcribe_model {
     std::vector<std::string> lang_codes;  // owned copy; lifetime matches the model
     std::vector<int32_t>     lang_token_ids;
 
+    // Cross-attention heads used for word timestamps, sorted by (layer, head).
+    std::vector<AlignHead> align_heads;
+
     // C++ mel frontend (per_utterance / hann_periodic / reflect / Slaney).
     // Built from the filterbank + window baked into the GGUF. Optional so a
     // load failure still surfaces a model object for inspection.
     std::optional<transcribe::MelFrontend> mel;
+
+    // Raw bytes -> text token id, for whisper.cpp-style prompt tokenization.
+    // Built on first use.
+    mutable std::once_flag                           raw_piece_ids_once;
+    mutable std::unordered_map<std::string, int32_t> raw_piece_ids;
 
     WhisperModel() = default;
     ~WhisperModel() override;
@@ -288,11 +324,15 @@ struct WhisperModel final : public transcribe_model {
     const transcribe::Tokenizer * tokenizer() const override { return &tok; }
 };
 
+// Picks WhisperModel::align_heads from hparams + variant (see alignment.h).
+void resolve_alignment_heads(WhisperModel & m);
+
 struct WhisperSession final : public transcribe_session {
     // Currently-allocated capacity of compute_ctx (mem_size). Used by
     // ensure_compute_ctx to decide between ggml_reset (cheap reuse)
     // and ggml_free + ggml_init (only when more space is needed).
-    size_t compute_ctx_size = 0;
+    size_t          compute_ctx_size = 0;
+    CoreMLEncoder * coreml_encoder   = nullptr;
 
     // Persistent backend-resident encoder output (see WhisperEncOut).
     WhisperEncOut enc_out;
@@ -325,6 +365,11 @@ struct WhisperSession final : public transcribe_session {
     // Reusable scratch for the multinomial T>0 sampler, sized to vocab_size on
     // first use to avoid a per-call double[vocab] allocation in the hot path.
     std::vector<double> sample_scratch;
+
+    // Word-timestamp scratch: alignment-pass readback [head][row][frame] and
+    // the host pipeline buffers.
+    std::vector<float> align_qk;
+    align::Scratch     align_scratch;
 
     WhisperSession() = default;
     ~WhisperSession() override;

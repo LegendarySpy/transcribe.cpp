@@ -64,14 +64,15 @@ pub use backend::{
 pub use cancel::CancelToken;
 pub use error::{Error, Result};
 pub use family::{
-    MoonshineStreamingOptions, ParakeetBufferedStreamOptions, ParakeetStreamOptions,
-    Qwen3AsrRunOptions, RunExtension, SortformerLiveOptions, SortformerPreset,
-    SortformerStreamOptions, StreamExtension, VoxtralRealtimeStreamOptions, WhisperRunOptions,
+    MoonshineStreamingOptions, ParakeetBufferedStreamOptions, ParakeetRunOptions,
+    ParakeetStreamOptions, Qwen3AsrRunOptions, RunExtension, SortformerLiveOptions,
+    SortformerPreset, SortformerStreamOptions, StreamExtension, VoxtralRealtimeStreamOptions,
+    WhisperRunOptions,
 };
 pub use logging::{disable_logging, init_logging};
 pub use model::{Capabilities, Model, ModelOptions, SessionLimits, SessionOptions};
 pub use result::{Segment, SpeakerSegment, Timings, Token, Transcript, Word};
-pub use session::{RunOptions, Session, Stream};
+pub use session::{OwnedStream, RunOptions, Session, Stream};
 pub use streaming::{StreamOptions, StreamText, StreamUpdate};
 pub use types::{
     AbiStruct, Backend, CommitPolicy, Diarize, ExtSlot, Feature, Itn, KvType, Pnc, StreamState,

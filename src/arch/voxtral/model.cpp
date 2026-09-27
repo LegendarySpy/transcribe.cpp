@@ -26,6 +26,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-repetition-guard.h"
 #include "voxtral.h"
 #include "weights.h"
 
@@ -166,7 +167,7 @@ transcribe_status prefill_chunked(VoxtralSession *             cc,
         if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, pb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral prefill: chunk %d/%d compute failed (%d)", c + 1, n_chunks,
                     static_cast<int>(gs));
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
 
         cc->kv_cache.n    = max_n_kv;
@@ -485,7 +486,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     if (weights_buffer == nullptr) {
         gguf_free(gguf_data);
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
     m->backend_buffer = weights_buffer;
     ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -505,10 +506,12 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         for (auto & b : m->weights.dec_blocks) {
             entries.push_back({ b.ffn_gate_w, b.ffn_up_w, &b.ffn_gate_up_w });
         }
-        if (!transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
-                                                 entries, m->packed_gate_up, "voxtral")) {
+        if (const transcribe_status st =
+                transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
+                                                    entries, m->packed_gate_up, "voxtral");
+            st != TRANSCRIBE_OK) {
             m->packed_gate_up.free();
-            return TRANSCRIBE_ERR_GGUF;
+            return st;
         }
     }
 
@@ -651,7 +654,7 @@ transcribe_status run(transcribe_session *          session,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral run: ggml_backend_sched_new failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
 
@@ -702,7 +705,7 @@ transcribe_status run(transcribe_session *          session,
 
         if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral run: encoder compute failed (%d)", static_cast<int>(gs));
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
 
         // Dump enc.* for the first chunk (matches the single-chunk reference).
@@ -856,7 +859,7 @@ transcribe_status run(transcribe_session *          session,
 
         if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, pb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral run: prefill compute failed (%d)", static_cast<int>(gs));
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         cc->kv_cache.n    = T_prompt;
         cc->kv_cache.head = T_prompt;
@@ -945,6 +948,7 @@ transcribe_status run(transcribe_session *          session,
     const ggml_fp16_t        mz = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t        mn = ggml_fp32_to_fp16(-INFINITY);
     std::vector<ggml_fp16_t> step_mask(max_n_kv, mn);
+    bool                     repeating = false;
     while (next_tok != eos_id && static_cast<int32_t>(generated_ids.size()) < max_new && cur_past + 1 <= max_n_kv) {
         if (cc->poll_abort()) {
             return TRANSCRIBE_ERR_ABORTED;
@@ -963,7 +967,7 @@ transcribe_status run(transcribe_session *          session,
 
         if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, sb.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "voxtral run: step compute failed (%d)", static_cast<int>(gs));
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         // Mid-generation logits dump: the step at cur_past == T_prompt + 7 is
         // the reference's scores[8] (logits for the 9th generated token).
@@ -978,18 +982,25 @@ transcribe_status run(transcribe_session *          session,
         cur_past += 1;
         cc->kv_cache.n    = cur_past + 1;
         cc->kv_cache.head = cur_past + 1;
+        if (next_tok != eos_id && transcribe::stop_on_repetition(generated_ids, "voxtral run")) {
+            cc->mark_repetition_stop();
+            repeating = true;
+            break;
+        }
     }
     cc->t_decode_us = ggml_time_us() - t_dec_start;
 
     // Decode stopped at EOS (complete) or at the generation budget / context
-    // width (truncated). Surface the latter via transcribe_was_truncated() + WARN.
-    if (next_tok != eos_id) {
+    // width (truncated). Surface the latter via transcribe_was_truncated() + WARN;
+    // a repetition stop has already done both.
+    if (!repeating && next_tok != eos_id) {
         cc->was_truncated = true;
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
                             "voxtral run: output truncated at %d tokens — decode reached the "
                             "generation budget before end-of-stream; the transcript may be "
                             "incomplete.",
                             static_cast<int>(generated_ids.size()));
+        transcribe::trim_repetition_at_budget_stop(generated_ids, "voxtral run");
     }
 
     if (!generated_ids.empty() && generated_ids.back() == eos_id) {
@@ -1020,7 +1031,7 @@ transcribe_status run(transcribe_session *          session,
 
     // Output truncation is a hard status: the partial transcript stays readable
     // (like an aborted run) but the caller is told, not given a clean OK.
-    return cc->was_truncated ? TRANSCRIBE_ERR_OUTPUT_TRUNCATED : TRANSCRIBE_OK;
+    return cc->truncation_status();
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,21 +1048,8 @@ transcribe_status run_batch_serial(VoxtralSession *              cc,
                                    const int *                   n_samples,
                                    int                           n,
                                    const transcribe_run_params * params) {
-    for (int i = 0; i < n; ++i) {
-        if (cc->poll_abort()) {
-            return TRANSCRIBE_ERR_ABORTED;
-        }
-        const transcribe_status st = (pcm[i] == nullptr || n_samples[i] <= 0) ? TRANSCRIBE_ERR_INVALID_ARG :
-                                                                                run(cc, pcm[i], n_samples[i], params);
-        if (st == TRANSCRIBE_OK) {
-            cc->batch_results.push_back(cc->capture_result(st));
-        } else {
-            transcribe_session::ResultSet rs;
-            rs.status = st;
-            cc->batch_results.push_back(std::move(rs));
-        }
-    }
-    return TRANSCRIBE_OK;
+    return transcribe::run_batch_serial(cc, pcm, n_samples, n,
+                                        [&](const float * p, int ns) { return run(cc, p, ns, params); });
 }
 
 transcribe_status run_batch(transcribe_session *          session,
@@ -1186,7 +1184,7 @@ transcribe_status run_batch(transcribe_session *          session,
         cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
 
@@ -1248,7 +1246,7 @@ transcribe_status run_batch(transcribe_session *          session,
 
         const int64_t t_enc0 = ggml_time_us();
         if (ggml_backend_sched_graph_compute(cc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         enc_us = ggml_time_us() - t_enc0;
 
@@ -1440,7 +1438,7 @@ transcribe_status run_batch(transcribe_session *          session,
 
         const int64_t t_dec0 = ggml_time_us();
         if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         dec_us += ggml_time_us() - t_dec0;
 
@@ -1548,11 +1546,12 @@ transcribe_status run_batch(transcribe_session *          session,
         rs.segments.push_back(std::move(seg));
         // Per-utterance truncation parity with single-shot run(): a row cut at
         // the generation budget / KV window before eos reports
-        // TRANSCRIBE_ERR_OUTPUT_TRUNCATED (partial transcript retained). Only
-        // override a TRANSCRIBE_OK status, never a worse one.
+        // TRANSCRIBE_ERR_OUTPUT_TRUNCATED, and one the repetition guard stopped
+        // reports TRANSCRIBE_ERR_OUTPUT_REPETITION (partial transcript retained
+        // either way). Only override a TRANSCRIBE_OK status, never a worse one.
         if (b < static_cast<int>(truncated.size()) && truncated[b] && rs.status == TRANSCRIBE_OK) {
             cc->was_truncated = true;
-            rs.status         = TRANSCRIBE_ERR_OUTPUT_TRUNCATED;
+            rs.status         = transcribe::decode_stop_status(truncated[b]);
         }
         rs.t_mel_us    = mel_us / valid_count;
         rs.t_encode_us = enc_us / valid_count;

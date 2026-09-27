@@ -392,7 +392,8 @@ constexpr const char * kTag = kFamilyTag;
 
 transcribe_status build_qwen3_asr_weights(ggml_context *         ctx_meta,
                                           const QwenAsrHParams & hp,
-                                          QwenAsrWeights &       weights) {
+                                          QwenAsrWeights &       weights,
+                                          bool                   include_encoder) {
     if (ctx_meta == nullptr) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -409,50 +410,52 @@ transcribe_status build_qwen3_asr_weights(ggml_context *         ctx_meta,
     const int64_t mel_ds3     = (mel_ds2 + 1) / 2;
     const int64_t conv_out_in = ds_h * mel_ds3;
 
-    // ----- audio encoder: subsample -----
-    //
-    // Conv2d(in=1, out=480, k=3, stride=2, pad=1). ggml conv_2d expects
-    // the kernel in (kW, kH, in_ch, out_ch) order — same as PyTorch
-    // (out, in, kH, kW) after permute/view. find_tensor validates the
-    // four dims explicitly.
-    GET_CONV(weights.enc_subsample.conv0_w, "enc.conv.0.weight", 3, 3, 1, ds_h);
-    GET_F32(weights.enc_subsample.conv0_b, "enc.conv.0.bias", ds_h);
-    GET_CONV(weights.enc_subsample.conv1_w, "enc.conv.1.weight", 3, 3, ds_h, ds_h);
-    GET_F32(weights.enc_subsample.conv1_b, "enc.conv.1.bias", ds_h);
-    GET_CONV(weights.enc_subsample.conv2_w, "enc.conv.2.weight", 3, 3, ds_h, ds_h);
-    GET_F32(weights.enc_subsample.conv2_b, "enc.conv.2.bias", ds_h);
-    // conv_out is a Linear (bias=False) mapping (ds_h * mel_ds3) -> d_model.
-    GET_LIN(weights.enc_subsample.conv_out, "enc.conv_out.weight", conv_out_in, d_model);
+    if (include_encoder) {
+        // ----- audio encoder: subsample -----
+        //
+        // Conv2d(in=1, out=480, k=3, stride=2, pad=1). ggml conv_2d expects
+        // the kernel in (kW, kH, in_ch, out_ch) order — same as PyTorch
+        // (out, in, kH, kW) after permute/view. find_tensor validates the
+        // four dims explicitly.
+        GET_CONV(weights.enc_subsample.conv0_w, "enc.conv.0.weight", 3, 3, 1, ds_h);
+        GET_F32(weights.enc_subsample.conv0_b, "enc.conv.0.bias", ds_h);
+        GET_CONV(weights.enc_subsample.conv1_w, "enc.conv.1.weight", 3, 3, ds_h, ds_h);
+        GET_F32(weights.enc_subsample.conv1_b, "enc.conv.1.bias", ds_h);
+        GET_CONV(weights.enc_subsample.conv2_w, "enc.conv.2.weight", 3, 3, ds_h, ds_h);
+        GET_F32(weights.enc_subsample.conv2_b, "enc.conv.2.bias", ds_h);
+        // conv_out is a Linear (bias=False) mapping (ds_h * mel_ds3) -> d_model.
+        GET_LIN(weights.enc_subsample.conv_out, "enc.conv_out.weight", conv_out_in, d_model);
 
-    // ----- audio encoder: blocks -----
-    weights.enc_blocks.assign(hp.enc_n_layers, QwenAsrEncBlock{});
-    for (int i = 0; i < hp.enc_n_layers; ++i) {
-        auto & b = weights.enc_blocks[i];
-        GET_F32(b.norm_attn_w, lname("enc.blocks.%d.norm_attn.weight", i), d_model);
-        GET_F32(b.norm_attn_b, lname("enc.blocks.%d.norm_attn.bias", i), d_model);
-        GET_LIN(b.attn_q_w, lname("enc.blocks.%d.attn.q.weight", i), d_model, d_model);
-        GET_F32(b.attn_q_b, lname("enc.blocks.%d.attn.q.bias", i), d_model);
-        GET_LIN(b.attn_k_w, lname("enc.blocks.%d.attn.k.weight", i), d_model, d_model);
-        GET_F32(b.attn_k_b, lname("enc.blocks.%d.attn.k.bias", i), d_model);
-        GET_LIN(b.attn_v_w, lname("enc.blocks.%d.attn.v.weight", i), d_model, d_model);
-        GET_F32(b.attn_v_b, lname("enc.blocks.%d.attn.v.bias", i), d_model);
-        GET_LIN(b.attn_out_w, lname("enc.blocks.%d.attn.out.weight", i), d_model, d_model);
-        GET_F32(b.attn_out_b, lname("enc.blocks.%d.attn.out.bias", i), d_model);
-        GET_F32(b.norm_ffn_w, lname("enc.blocks.%d.norm_ffn.weight", i), d_model);
-        GET_F32(b.norm_ffn_b, lname("enc.blocks.%d.norm_ffn.bias", i), d_model);
-        GET_LIN(b.fc1_w, lname("enc.blocks.%d.ffn.fc1.weight", i), d_model, ffn_dim);
-        GET_F32(b.fc1_b, lname("enc.blocks.%d.ffn.fc1.bias", i), ffn_dim);
-        GET_LIN(b.fc2_w, lname("enc.blocks.%d.ffn.fc2.weight", i), ffn_dim, d_model);
-        GET_F32(b.fc2_b, lname("enc.blocks.%d.ffn.fc2.bias", i), d_model);
+        // ----- audio encoder: blocks -----
+        weights.enc_blocks.assign(hp.enc_n_layers, QwenAsrEncBlock{});
+        for (int i = 0; i < hp.enc_n_layers; ++i) {
+            auto & b = weights.enc_blocks[i];
+            GET_F32(b.norm_attn_w, lname("enc.blocks.%d.norm_attn.weight", i), d_model);
+            GET_F32(b.norm_attn_b, lname("enc.blocks.%d.norm_attn.bias", i), d_model);
+            GET_LIN(b.attn_q_w, lname("enc.blocks.%d.attn.q.weight", i), d_model, d_model);
+            GET_F32(b.attn_q_b, lname("enc.blocks.%d.attn.q.bias", i), d_model);
+            GET_LIN(b.attn_k_w, lname("enc.blocks.%d.attn.k.weight", i), d_model, d_model);
+            GET_F32(b.attn_k_b, lname("enc.blocks.%d.attn.k.bias", i), d_model);
+            GET_LIN(b.attn_v_w, lname("enc.blocks.%d.attn.v.weight", i), d_model, d_model);
+            GET_F32(b.attn_v_b, lname("enc.blocks.%d.attn.v.bias", i), d_model);
+            GET_LIN(b.attn_out_w, lname("enc.blocks.%d.attn.out.weight", i), d_model, d_model);
+            GET_F32(b.attn_out_b, lname("enc.blocks.%d.attn.out.bias", i), d_model);
+            GET_F32(b.norm_ffn_w, lname("enc.blocks.%d.norm_ffn.weight", i), d_model);
+            GET_F32(b.norm_ffn_b, lname("enc.blocks.%d.norm_ffn.bias", i), d_model);
+            GET_LIN(b.fc1_w, lname("enc.blocks.%d.ffn.fc1.weight", i), d_model, ffn_dim);
+            GET_F32(b.fc1_b, lname("enc.blocks.%d.ffn.fc1.bias", i), ffn_dim);
+            GET_LIN(b.fc2_w, lname("enc.blocks.%d.ffn.fc2.weight", i), ffn_dim, d_model);
+            GET_F32(b.fc2_b, lname("enc.blocks.%d.ffn.fc2.bias", i), d_model);
+        }
+
+        // ----- audio encoder: head (LN + proj1 + GELU + proj2) -----
+        GET_F32(weights.enc_head.ln_post_w, "enc.ln_post.weight", d_model);
+        GET_F32(weights.enc_head.ln_post_b, "enc.ln_post.bias", d_model);
+        GET_LIN(weights.enc_head.proj1_w, "enc.proj1.weight", d_model, d_model);
+        GET_F32(weights.enc_head.proj1_b, "enc.proj1.bias", d_model);
+        GET_LIN(weights.enc_head.proj2_w, "enc.proj2.weight", d_model, out_dim);
+        GET_F32(weights.enc_head.proj2_b, "enc.proj2.bias", out_dim);
     }
-
-    // ----- audio encoder: head (LN + proj1 + GELU + proj2) -----
-    GET_F32(weights.enc_head.ln_post_w, "enc.ln_post.weight", d_model);
-    GET_F32(weights.enc_head.ln_post_b, "enc.ln_post.bias", d_model);
-    GET_LIN(weights.enc_head.proj1_w, "enc.proj1.weight", d_model, d_model);
-    GET_F32(weights.enc_head.proj1_b, "enc.proj1.bias", d_model);
-    GET_LIN(weights.enc_head.proj2_w, "enc.proj2.weight", d_model, out_dim);
-    GET_F32(weights.enc_head.proj2_b, "enc.proj2.bias", out_dim);
 
     // ----- text LM: embedding (tied output) -----
     {

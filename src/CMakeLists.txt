@@ -38,6 +38,7 @@ add_library(transcribe
     arch/parakeet/capabilities.cpp
     arch/parakeet/weights.cpp
     arch/parakeet/encoder.cpp
+    arch/parakeet/boost.cpp
     arch/parakeet/decoder.cpp
     arch/cohere/model.cpp
     arch/cohere/capabilities.cpp
@@ -87,6 +88,7 @@ add_library(transcribe
     arch/whisper/weights.cpp
     arch/whisper/encoder.cpp
     arch/whisper/decoder.cpp
+    arch/whisper/alignment.cpp
     arch/whisper/bin_load.cpp
     arch/whisper/public.cpp
     arch/moonshine/model.cpp

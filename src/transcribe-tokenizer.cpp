@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <queue>
 #include <string>
 #include <vector>
@@ -128,7 +129,7 @@ bool Tokenizer::has_encoder() const {
     if (decode_mode_ == DecodeMode::RawBytes && !tokens_.empty()) {
         return true;
     }
-    return false;
+    return (model_ == "unigram" || model_ == "bpe") && !scores_.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -464,7 +465,218 @@ transcribe_status encode_tiktoken_raw_bytes(const std::string &                 
     return TRANSCRIBE_OK;
 }
 
+// llama.cpp / scripts/lib/gguf_common.py token types.
+constexpr int32_t k_token_type_normal       = 1;
+constexpr int32_t k_token_type_user_defined = 4;
+
+// SentencePiece normalization as NeMo configures it: one U+2581 prefix
+// (add_dummy_prefix), each whitespace byte becomes U+2581, runs are kept
+// (remove_extra_whitespaces = false).
+std::string sp_normalize(const std::string & text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    out.append(k_sp_space, k_sp_space_len);
+    for (const char ch : text) {
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+            out.append(k_sp_space, k_sp_space_len);
+        } else {
+            out.push_back(ch);
+        }
+    }
+    return out;
+}
+
+// One SentencePiece BPE merge candidate. Stale entries are detected at pop
+// time: merges only grow the left symbol, so an unchanged combined size
+// with right still adjacent means both sides are unchanged.
+struct SpBigram {
+    float  score = 0.0f;
+    int    left  = -1;
+    int    right = -1;
+    size_t size  = 0;
+};
+
+struct SpBigramLess {
+    bool operator()(const SpBigram & a, const SpBigram & b) const {
+        // Highest score first; on ties the leftmost pair (sentencepiece's
+        // bpe_model.cc agenda order).
+        if (a.score != b.score) {
+            return a.score < b.score;
+        }
+        return a.left > b.left;
+    }
+};
+
 }  // namespace
+
+// Id of a piece the SentencePiece encoders may produce from text, or -1.
+// CONTROL / UNKNOWN / BYTE / UNUSED pieces never match raw text.
+int Tokenizer::sp_piece_id(const char * data, size_t n) const {
+    const auto it = piece_to_id_.find(std::string(data, n));
+    if (it == piece_to_id_.end()) {
+        return -1;
+    }
+    const int id = it->second;
+    if (!token_type_.empty()) {
+        const int32_t type = token_type_[static_cast<size_t>(id)];
+        if (type != k_token_type_normal && type != k_token_type_user_defined) {
+            return -1;
+        }
+    }
+    return id;
+}
+
+// Ids for a run of characters with no piece: one byte-fallback piece per
+// byte when the vocab has them, else a single unk. False when neither is
+// available.
+bool Tokenizer::sp_append_unknown(const char * data, size_t n, std::vector<int32_t> & out_ids) const {
+    if (sp_byte_fallback_) {
+        for (size_t i = 0; i < n; ++i) {
+            char name[8];
+            std::snprintf(name, sizeof(name), "<0x%02X>", static_cast<unsigned>(static_cast<unsigned char>(data[i])));
+            const int id = find(name);
+            if (id < 0) {
+                return false;
+            }
+            out_ids.push_back(id);
+        }
+        return true;
+    }
+    if (unk_id_ < 0) {
+        return false;
+    }
+    if (out_ids.empty() || out_ids.back() != unk_id_) {
+        out_ids.push_back(unk_id_);
+    }
+    return true;
+}
+
+// Unigram: Viterbi over the piece lattice, maximizing the summed scores.
+// A position no piece starts from takes one character as unknown with
+// sentencepiece's penalty (min score - 10), so it is only chosen when
+// nothing else covers that character.
+transcribe_status Tokenizer::sp_encode_unigram(const std::string & s, std::vector<int32_t> & out_ids) const {
+    constexpr float k_unk_penalty = 10.0f;
+    const float     unk_score     = sp_min_score_ - k_unk_penalty;
+
+    const size_t       n = s.size();
+    std::vector<float> best(n + 1, -std::numeric_limits<float>::infinity());
+    std::vector<int>   from(n + 1, -1);   // start byte of the piece ending here
+    std::vector<int>   piece(n + 1, -1);  // its id, -1 = unknown character
+    best[0] = 0.0f;
+    for (size_t b = 0; b < n; b += 1) {
+        if (best[b] == -std::numeric_limits<float>::infinity()) {
+            continue;
+        }
+        const size_t clen   = std::min(n - b, unicode::len_utf8(s[b]));
+        bool         has_ch = false;
+        for (size_t e = b + clen; e <= n && e - b <= sp_max_piece_len_;) {
+            const int id = sp_piece_id(s.data() + b, e - b);
+            if (id >= 0) {
+                has_ch           = has_ch || e == b + clen;
+                const float cand = best[b] + scores_[static_cast<size_t>(id)];
+                if (cand > best[e]) {
+                    best[e]  = cand;
+                    from[e]  = static_cast<int>(b);
+                    piece[e] = id;
+                }
+            }
+            if (e == n) {
+                break;
+            }
+            e += std::min(n - e, unicode::len_utf8(s[e]));
+        }
+        if (!has_ch) {
+            const float cand = best[b] + unk_score;
+            if (cand > best[b + clen]) {
+                best[b + clen]  = cand;
+                from[b + clen]  = static_cast<int>(b);
+                piece[b + clen] = -1;
+            }
+        }
+    }
+
+    std::vector<size_t> ends;
+    for (size_t e = n; e > 0; e = static_cast<size_t>(from[e])) {
+        ends.push_back(e);
+    }
+    for (size_t k = ends.size(); k-- > 0;) {
+        const size_t e = ends[k];
+        const size_t b = static_cast<size_t>(from[e]);
+        if (piece[e] >= 0) {
+            out_ids.push_back(piece[e]);
+        } else if (!sp_append_unknown(s.data() + b, e - b, out_ids)) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+    }
+    return TRANSCRIBE_OK;
+}
+
+// BPE: start from characters and repeatedly merge the adjacent pair whose
+// concatenation is the highest-scoring piece.
+transcribe_status Tokenizer::sp_encode_bpe(const std::string & s, std::vector<int32_t> & out_ids) const {
+    std::vector<Symbol> symbols;
+    for (size_t off = 0; off < s.size();) {
+        const size_t clen = std::min(s.size() - off, unicode::len_utf8(s[off]));
+        Symbol       sym;
+        sym.text = s.data() + off;
+        sym.n    = clen;
+        sym.prev = static_cast<int>(symbols.size()) - 1;
+        off += clen;
+        sym.next = off < s.size() ? static_cast<int>(symbols.size()) + 1 : -1;
+        symbols.push_back(sym);
+    }
+
+    std::priority_queue<SpBigram, std::vector<SpBigram>, SpBigramLess> queue;
+
+    auto push_bigram = [&](int l, int r) {
+        if (l < 0 || r < 0) {
+            return;
+        }
+        const size_t size = symbols[l].n + symbols[r].n;
+        const int    id   = sp_piece_id(symbols[l].text, size);
+        if (id < 0) {
+            return;
+        }
+        SpBigram bg;
+        bg.score = scores_[static_cast<size_t>(id)];
+        bg.left  = l;
+        bg.right = r;
+        bg.size  = size;
+        queue.push(bg);
+    };
+    for (int i = 1; i < static_cast<int>(symbols.size()); ++i) {
+        push_bigram(i - 1, i);
+    }
+    while (!queue.empty()) {
+        const SpBigram bg = queue.top();
+        queue.pop();
+        Symbol & left  = symbols[bg.left];
+        Symbol & right = symbols[bg.right];
+        if (left.n == 0 || right.n == 0 || left.next != bg.right || left.n + right.n != bg.size) {
+            continue;
+        }
+        left.n += right.n;
+        right.n   = 0;
+        left.next = right.next;
+        if (right.next >= 0) {
+            symbols[right.next].prev = bg.left;
+        }
+        push_bigram(left.prev, bg.left);
+        push_bigram(bg.left, left.next);
+    }
+
+    for (int i = 0; i != -1 && !symbols.empty(); i = symbols[i].next) {
+        const Symbol & sym = symbols[i];
+        const int      id  = sp_piece_id(sym.text, sym.n);
+        if (id >= 0) {
+            out_ids.push_back(id);
+        } else if (!sp_append_unknown(sym.text, sym.n, out_ids)) {
+            return TRANSCRIBE_ERR_INVALID_ARG;
+        }
+    }
+    return TRANSCRIBE_OK;
+}
 
 transcribe_status Tokenizer::encode(const std::string & text, std::vector<int32_t> & out_ids) const {
     out_ids.clear();
@@ -476,6 +688,17 @@ transcribe_status Tokenizer::encode(const std::string & text, std::vector<int32_
             return TRANSCRIBE_ERR_GGUF;
         }
         return encode_tiktoken_raw_bytes(text, pre_, piece_to_id_, out_ids);
+    }
+
+    if (model_ == "unigram" || model_ == "bpe") {
+        if (scores_.empty()) {
+            return TRANSCRIBE_ERR_NOT_IMPLEMENTED;
+        }
+        if (text.empty()) {
+            return TRANSCRIBE_OK;
+        }
+        const std::string s = sp_normalize(text);
+        return sp_unigram_ ? sp_encode_unigram(s, out_ids) : sp_encode_bpe(s, out_ids);
     }
 
     if (model_ != "gpt2") {
@@ -762,11 +985,35 @@ transcribe_status Tokenizer::load(const gguf_context * gguf) {
             break;
     }
 
+    // SentencePiece encode setup. Older converters labelled every
+    // SentencePiece model "bpe"; a BPE model's piece scores are its merge
+    // ranks (non-increasing with id), a unigram model's are log-probs.
+    sp_unigram_       = model_ == "unigram";
+    sp_max_piece_len_ = 0;
+    sp_min_score_     = 0.0f;
+    sp_byte_fallback_ = find("<0x00>") >= 0 && find("<0xFF>") >= 0;
+    if (model_ == "unigram" || model_ == "bpe") {
+        float prev = std::numeric_limits<float>::infinity();
+        for (size_t i = 0; i < tokens_.size(); ++i) {
+            sp_max_piece_len_ = std::max(sp_max_piece_len_, tokens_[i].size());
+            if (scores_.empty()) {
+                continue;
+            }
+            sp_min_score_ = std::min(sp_min_score_, scores_[i]);
+            if (!token_type_.empty() && token_type_[i] != k_token_type_normal) {
+                continue;
+            }
+            if (scores_[i] > prev) {
+                sp_unigram_ = true;
+            }
+            prev = scores_[i];
+        }
+    }
+
     // Optional: merges. Only "gpt2" uses them; SentencePiece tokenizers
-    // ("unigram"/"bpe") encode via a score-based lattice (not
-    // implemented) and their decode path needs no merges. Missing merges
-    // on a "gpt2" file means encode() fails at call time -- the right
-    // surface, since the decode path still works.
+    // ("unigram"/"bpe") encode from the piece scores and decode needs no
+    // merges. Missing merges on a "gpt2" file means encode() fails at call
+    // time -- the right surface, since the decode path still works.
     merge_rank_.clear();
     std::vector<std::string> merges;
     switch (read_string_array_kv(gguf, "tokenizer.ggml.merges", merges)) {

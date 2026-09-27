@@ -25,6 +25,10 @@
 //     status
 //   - translate task rejected (no <|translate|> token)
 //
+// Both paths: WORD timestamps return words with SEGMENT-identical text.
+// TRANSCRIBE_WHISPER_WORD_CLIPS=<dir> additionally runs WORD on the short
+// repro clips that aborted whisper.cpp DTW (p_after_110.wav, yes_110.wav, ...).
+//
 // Each subsection skips (RC 77) when its env var is unset; both
 // subsections may be exercised independently.
 
@@ -77,6 +81,60 @@ bool load_wav(const char * fname, std::vector<float> & out) {
 const char * env_or_null(const char * key) {
     const char * v = std::getenv(key);
     return (v != nullptr && v[0] != '\0') ? v : nullptr;
+}
+
+// WORD run: OK, text equals the SEGMENT run, words inside the clip with
+// non-decreasing starts, segments cover the words.
+void check_words(transcribe_session * ctx, const std::vector<float> & pcm, bool expect_words) {
+    transcribe_run_params rp;
+    transcribe_run_params_init(&rp);
+    rp.language   = "en";
+    rp.timestamps = TRANSCRIBE_TIMESTAMPS_SEGMENT;
+    CHECK(transcribe_run(ctx, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_OK);
+    const std::string segment_text = transcribe_full_text(ctx);
+
+    rp.timestamps = TRANSCRIBE_TIMESTAMPS_WORD;
+    CHECK(transcribe_run(ctx, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_OK);
+    CHECK(transcribe_returned_timestamp_kind(ctx) == TRANSCRIBE_TIMESTAMPS_WORD);
+    CHECK(segment_text == transcribe_full_text(ctx));
+    const int n_words = transcribe_n_words(ctx);
+    CHECK(!expect_words || n_words > 0);
+    const int64_t clip_ms = static_cast<int64_t>(pcm.size()) / 16;
+    int64_t       prev_t0 = 0;
+    for (int i = 0; i < n_words; ++i) {
+        transcribe_word w;
+        transcribe_word_init(&w);
+        CHECK(transcribe_get_word(ctx, i, &w) == TRANSCRIBE_OK);
+        CHECK(w.text != nullptr && w.text[0] != '\0');
+        CHECK(w.t0_ms >= prev_t0 && w.t0_ms <= w.t1_ms && w.t1_ms <= clip_ms);
+        prev_t0 = w.t0_ms;
+    }
+    int covered = 0;
+    for (int k = 0; k < transcribe_n_segments(ctx); ++k) {
+        transcribe_segment seg;
+        transcribe_segment_init(&seg);
+        CHECK(transcribe_get_segment(ctx, k, &seg) == TRANSCRIBE_OK);
+        CHECK(seg.first_word == covered);
+        covered += seg.n_words;
+    }
+    CHECK(covered == n_words);
+}
+
+void check_word_repro_clips(transcribe_session * ctx) {
+    const char * dir = env_or_null("TRANSCRIBE_WHISPER_WORD_CLIPS");
+    if (dir == nullptr) {
+        return;
+    }
+    const char * names[] = { "p_after_110.wav", "p_after_130.wav", "p_before_110.wav", "p_both_110.wav",
+                             "yes_110.wav",     "yes_130.wav",     "yes_150.wav" };
+    for (const char * name : names) {
+        const std::string  path = std::string(dir) + "/" + name;
+        std::vector<float> pcm;
+        std::string        err;
+        if (file_exists(path.c_str()) && transcribe_cli::load_wav_mono_16k(path, pcm, err) && !pcm.empty()) {
+            check_words(ctx, pcm, false);
+        }
+    }
 }
 
 void test_multilingual(const char * model_path) {
@@ -172,26 +230,13 @@ void test_multilingual(const char * model_path) {
         }
     }
 
-    // Special-token literals embedded in initial_prompt must be
-    // rejected with INVALID_ARG, matching the GGUF path. The .bin
-    // vocab does not store "<|en|>" / "<|notimestamps|>" / "<|0.00|>"
-    // strings directly; the bin adapter synthesizes them into the
-    // tokenizer's special-piece map so find() can resolve them. A
-    // gap here would let users smuggle special bytes into the
-    // decoder context.
+    // Special-token literals embedded in initial_prompt encode as plain
+    // text (whisper.cpp behavior, matching the GGUF path): the run
+    // succeeds, and no special id reaches the decoder context.
     {
         const char * literals[] = {
-            "transcribe <|en|> address",
-            "use <|notimestamps|> please",
-            "<|0.00|> beginning",
-            "<|30.00|> end",
-            "<|translate|> task",
-            // EOS — locks the eos_id == 50257 case explicitly. The
-            // first-line check at model.cpp:1442 catches this via
-            // find(); the second-line id-vs-eos_id check would also
-            // catch it, but a literal in user text should never reach
-            // the encoder in the first place.
-            "ending <|endoftext|> here",
+            "transcribe <|en|> address", "use <|notimestamps|> please", "<|0.00|> beginning", "<|30.00|> end",
+            "<|translate|> task",        "ending <|endoftext|> here",
         };
         for (const char * t : literals) {
             transcribe_run_params rp;
@@ -202,7 +247,8 @@ void test_multilingual(const char * model_path) {
             wp.initial_prompt = t;
             rp.family         = &wp.ext;
             st                = transcribe_run(ctx, jfk.data(), static_cast<int>(jfk.size()), &rp);
-            CHECK(st == TRANSCRIBE_ERR_INVALID_ARG);
+            CHECK(st == TRANSCRIBE_OK);
+            CHECK(contains(transcribe_full_text(ctx), "country"));
         }
     }
 
@@ -292,6 +338,9 @@ void test_multilingual(const char * model_path) {
             CHECK(contains(transcribe_full_text(ctx), "country"));
         }
     }
+
+    check_words(ctx, jfk, true);
+    check_word_repro_clips(ctx);
 
     transcribe_session_free(ctx);
     transcribe_model_free(model);
@@ -395,6 +444,8 @@ void test_english_only(const char * model_path) {
         st          = transcribe_run(ctx, jfk.data(), static_cast<int>(jfk.size()), &rp);
         CHECK(st != TRANSCRIBE_OK);
     }
+
+    check_words(ctx, jfk, true);
 
     transcribe_session_free(ctx);
     transcribe_model_free(model);

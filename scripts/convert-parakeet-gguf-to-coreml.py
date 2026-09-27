@@ -7,6 +7,9 @@
 Full-context, batch-norm FastConformer encoders with 8x depthwise-striding
 subsampling: the offline Parakeet variants and every Canary variant. Streaming
 (chunked-attention) and speaker-kernel checkpoints are rejected.
+
+The layers are split into chained programs (a Core ML pipeline) because the
+ANE compiler rejects one 1.2 GB program and silently runs it on the CPU.
 """
 
 import argparse
@@ -20,8 +23,11 @@ import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 
+# Stored FP16 weight bytes per pipeline stage; 0.6B encoders get four stages.
+STAGE_BYTES = 320_000_000
 
-def convert(source: Path, output: Path, max_frames: int):
+
+def convert(source: Path, output: Path, max_frames: int, stages: int):
     r = gguf.GGUFReader(str(source))
     arch = r.fields["general.architecture"].contents()
     if arch not in ("parakeet", "canary"):
@@ -106,15 +112,12 @@ def convert(source: Path, output: Path, max_frames: int):
     pe[:, 0::2] = np.sin(pos * div)
     pe[:, 1::2] = np.cos(pos * div)
 
-    @mb.program(
-        input_specs=[
-            mb.TensorSpec(shape=(1, mels, max_frames)),
-            mb.TensorSpec(shape=(1,), dtype=types.int32),
-        ],
-        opset_version=ct.target.macOS13,
-    )
-    def program(logmel_data, mel_length):
-        length = mel_length
+    def halve(length):
+        return mb.floor_div(
+            x=mb.add(x=length, y=np.array([1], np.int32)), y=np.array([2], np.int32)
+        )
+
+    def subsample(logmel_data, length):
         x = mb.expand_dims(x=mb.transpose(x=logmel_data, perm=[0, 2, 1]), axes=[1])
         for a, b in [(0, None), (2, 3), (5, 6)]:
             x = conv(
@@ -127,9 +130,7 @@ def convert(source: Path, output: Path, max_frames: int):
             if b is not None:
                 x = conv(x, f"enc.pre_encode.conv.{b}", [1, 1], [0, 0, 0, 0])
             x = mb.relu(x=x)
-            length = mb.floor_div(
-                x=mb.add(x=length, y=np.array([1], np.int32)), y=np.array([2], np.int32)
-            )
+            length = halve(length)
             mask = mb.less(x=np.arange(x.shape[2], dtype=np.int32), y=length)
             x = mb.mul(
                 x=x,
@@ -141,7 +142,32 @@ def convert(source: Path, output: Path, max_frames: int):
             x=mb.transpose(x=x, perm=[0, 2, 1, 3]),
             shape=[1, T, channels * ((mels + 7) // 8)],
         )
-        x = lin(x, "enc.pre_encode.out")
+        return lin(x, "enc.pre_encode.out"), length
+
+    def build_stage(first, last, layer_range):
+        if first:
+            spec = mb.TensorSpec(shape=(1, mels, max_frames))
+        else:
+            spec = mb.TensorSpec(shape=(1, T, d), dtype=types.fp16)
+        length_spec = mb.TensorSpec(shape=(1,), dtype=types.int32)
+
+        @mb.program(input_specs=[spec, length_spec], opset_version=ct.target.macOS13)
+        def program(x, mel_length):
+            if first:
+                x, length = subsample(x, mel_length)
+            else:
+                x = mb.cast(x=x, dtype="fp32")
+                length = halve(halve(halve(mel_length)))
+            x = blocks(x, length, layer_range)
+            if last:
+                if meta.get("stt.canary.decoder.encoder_decoder_proj", False):
+                    x = lin(x, "enc.proj")
+                return mb.identity(x=mb.cast(x=x, dtype="fp32"), name="output")
+            return mb.identity(x=mb.cast(x=x, dtype="fp16"), name="hidden")
+
+        return program
+
+    def blocks(x, length, layer_range):
         # xscaling multiplies this stream by sqrt(d_model). Inside block 0 it is
         # consumed only through LayerNorms and the block ends in norm_out, so
         # scaling the block-0 sublayer outputs by 1/sqrt(d_model) instead is
@@ -156,7 +182,7 @@ def convert(source: Path, output: Path, max_frames: int):
             shape=[1, 1, 1, T],
         )
         conv_mask = mb.reshape(x=mb.cast(x=valid, dtype="fp32"), shape=[1, 1, T])
-        for i in range(layers):
+        for i in layer_range:
             name = f"enc.blocks.{i}"
 
             def residual(y, weight=1.0):
@@ -219,17 +245,42 @@ def convert(source: Path, output: Path, max_frames: int):
                 name + ".ff2.linear2",
             )
             x = norm(mb.add(x=x, y=residual(y, 0.5)), name + ".norm_out")
-        if meta.get("stt.canary.decoder.encoder_decoder_proj", False):
-            x = lin(x, "enc.proj")
-        return mb.identity(x=x, name="output")
+        return x
 
-    model = ct.convert(
-        program,
-        convert_to="mlprogram",
-        minimum_deployment_target=ct.target.macOS13,
-        compute_precision=ct.precision.FLOAT16,
-        skip_model_load=True,
-    )
+    if stages <= 0:
+        # About 25 d^2 FP16 weights per block.
+        stages = max(1, -(-50 * d * d * layers // STAGE_BYTES))
+    bounds = [round(layers * s / stages) for s in range(stages + 1)]
+    models = []
+    for s in range(stages):
+        first, last = s == 0, s == stages - 1
+        program = build_stage(first, last, range(bounds[s], bounds[s + 1]))
+        model = ct.convert(
+            program,
+            convert_to="mlprogram",
+            minimum_deployment_target=ct.target.macOS13,
+            compute_precision=ct.precision.FLOAT16,
+            inputs=[
+                ct.TensorType(name="x", dtype=np.float32 if first else np.float16),
+                ct.TensorType(name="mel_length", dtype=np.int32),
+            ],
+            outputs=[
+                ct.TensorType(
+                    name="output" if last else "hidden",
+                    dtype=np.float32 if last else np.float16,
+                )
+            ],
+            skip_model_load=True,
+        )
+        spec = model.get_spec()
+        ct.utils.rename_feature(spec, "x", f"hidden_{s - 1}" if s else "logmel_data")
+        if not last:
+            ct.utils.rename_feature(spec, "hidden", f"hidden_{s}")
+        models.append(
+            ct.models.MLModel(spec, weights_dir=model.weights_dir, skip_model_load=True)
+        )
+        print(f"Built stage {s + 1}/{stages}", flush=True)
+    model = models[0] if stages == 1 else ct.utils.make_pipeline(*models)
     model.user_defined_metadata["transcribe.variant"] = str(meta["stt.variant"])
     with source.open("rb") as f:
         model.user_defined_metadata["transcribe.gguf.sha256"] = hashlib.file_digest(
@@ -252,6 +303,12 @@ def main():
         help="Encoder mel-frame capacity; 1501 covers about 15 seconds",
     )
     parser.add_argument(
+        "--stages",
+        type=int,
+        default=0,
+        help="Chained Core ML programs (default: by encoder size)",
+    )
+    parser.add_argument(
         "--compile",
         action="store_true",
         help="Compile the package with Xcode's coremlcompiler",
@@ -261,7 +318,7 @@ def main():
         parser.error("--output must end in .mlpackage")
     if args.max_frames < 9:
         parser.error("--max-frames must be at least 9")
-    convert(args.gguf, args.output, args.max_frames)
+    convert(args.gguf, args.output, args.max_frames, args.stages)
     if args.compile:
         subprocess.run(
             [

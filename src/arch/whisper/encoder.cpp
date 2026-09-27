@@ -56,6 +56,7 @@ ggml_tensor * add_conv1d_bias(ggml_context * ctx, ggml_tensor * conv_out, ggml_t
 // x: [d_model, T] -> returns [d_model, T]. Encoder is bidirectional
 // (no causal mask).
 ggml_tensor * mha_encoder(ggml_context * ctx,
+                          ggml_cgraph *  gf,
                           ggml_tensor *  x,
                           ggml_tensor *  q_w,
                           ggml_tensor *  q_b,
@@ -66,7 +67,9 @@ ggml_tensor * mha_encoder(ggml_context * ctx,
                           ggml_tensor *  out_b,
                           int            n_heads,
                           int            d_model,
-                          bool           use_flash) {
+                          bool           use_flash,
+                          ggml_tensor *  attn_k,
+                          ggml_tensor *  attn_v) {
     const int     head_dim = d_model / n_heads;
     const float   scale    = 1.0f / std::sqrt(static_cast<float>(head_dim));
     const int64_t T        = x->ne[1];
@@ -90,20 +93,35 @@ ggml_tensor * mha_encoder(ggml_context * ctx,
     q = ggml_reshape_3d(ctx, q, head_dim, n_heads, T);
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
 
-    k = ggml_reshape_3d(ctx, k, head_dim, n_heads, T);
-    k = ggml_permute(ctx, k, 0, 2, 1, 3);
+    if (use_flash && attn_k != nullptr) {
+        // Like whisper.cpp: copy F16 K/V into the zeroed padded buffers and
+        // attend over every row, unmasked (the zero keys dilute slightly).
+        // The copies go into the graph first so they run before the reads.
+        const int64_t T_pad = attn_k->ne[0] / d_model;
+        const size_t  es    = ggml_element_size(attn_k);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, k, ggml_view_1d(ctx, attn_k, d_model * T, 0)));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, v, ggml_view_1d(ctx, attn_v, d_model * T, 0)));
+        k = ggml_view_3d(ctx, attn_k, head_dim, T_pad, n_heads, es * d_model, es * head_dim, 0);
+        v = ggml_view_3d(ctx, attn_v, head_dim, T_pad, n_heads, es * d_model, es * head_dim, 0);
+    } else {
+        // Like whisper.cpp, flash attention takes F16 K/V and reads the
+        // permuted views in place.
+        if (use_flash) {
+            k = ggml_cast(ctx, k, GGML_TYPE_F16);
+            v = ggml_cast(ctx, v, GGML_TYPE_F16);
+        }
 
-    v = ggml_reshape_3d(ctx, v, head_dim, n_heads, T);
-    v = ggml_permute(ctx, v, 0, 2, 1, 3);
+        k = ggml_reshape_3d(ctx, k, head_dim, n_heads, T);
+        k = ggml_permute(ctx, k, 0, 2, 1, 3);
+
+        v = ggml_reshape_3d(ctx, v, head_dim, n_heads, T);
+        v = ggml_permute(ctx, v, 0, 2, 1, 3);
+    }
 
     ggml_tensor * o;
     if (use_flash) {
-        // flash_attn_ext wants q/k/v contiguous.
-        ggml_tensor * q_c = ggml_cont(ctx, q);
-        ggml_tensor * k_c = ggml_cont(ctx, k);
-        ggml_tensor * v_c = ggml_cont(ctx, v);
-        o                 = ggml_flash_attn_ext(ctx, q_c, k_c, v_c, nullptr, scale, 0.0f, 0.0f);
-        o                 = ggml_reshape_2d(ctx, o, d_model, T);
+        o = ggml_flash_attn_ext(ctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+        o = ggml_reshape_2d(ctx, o, d_model, T);
     } else {
         // Manual attention path: mul_mat(K, Q) gives [T_k, T_q, n_heads]
         // per the standard cohere pattern.
@@ -152,16 +170,19 @@ ggml_tensor * ffn(ggml_context * ctx,
 //   y = x + MHSA(LN_attn(x))
 //   y = y + FFN(LN_ffn(y))
 ggml_tensor * build_block(ggml_context *          ctx,
+                          ggml_cgraph *           gf,
                           ggml_tensor *           x,
                           const WhisperEncBlock & b,
                           int                     n_heads,
                           int                     d_model,
-                          bool                    use_flash) {
+                          bool                    use_flash,
+                          ggml_tensor *           attn_k,
+                          ggml_tensor *           attn_v) {
     // Self-attention sublayer.
     {
         ggml_tensor * y = layer_norm(ctx, x, b.norm_attn_w, b.norm_attn_b);
-        y = mha_encoder(ctx, y, b.attn_q_w, b.attn_q_b, b.attn_k_w, b.attn_v_w, b.attn_v_b, b.attn_out_w, b.attn_out_b,
-                        n_heads, d_model, use_flash);
+        y = mha_encoder(ctx, gf, y, b.attn_q_w, b.attn_q_b, b.attn_k_w, b.attn_v_w, b.attn_v_b, b.attn_out_w,
+                        b.attn_out_b, n_heads, d_model, use_flash, attn_k, attn_v);
         x = ggml_add(ctx, x, y);
     }
     // FFN sublayer.
@@ -180,6 +201,8 @@ EncoderBuild build_encoder_graph(ggml_context *         ctx,
                                  const WhisperHParams & hp,
                                  int                    n_mel_frames,
                                  bool                   use_flash,
+                                 ggml_tensor *          attn_k,
+                                 ggml_tensor *          attn_v,
                                  const char *           backend_name) {
     (void) backend_name;
 
@@ -206,6 +229,13 @@ EncoderBuild build_encoder_graph(ggml_context *         ctx,
     if (T_enc > hp.enc_max_source_positions) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper encoder: T_enc=%d exceeds max_source_positions=%d", T_enc,
                 hp.enc_max_source_positions);
+        return eb;
+    }
+
+    // The forward cgraph. 8192 leaves headroom up to large (32 blocks).
+    eb.graph = ggml_new_graph_custom(ctx, 8192, false);
+    if (eb.graph == nullptr) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper encoder: ggml_new_graph_custom failed");
         return eb;
     }
 
@@ -265,7 +295,7 @@ EncoderBuild build_encoder_graph(ggml_context *         ctx,
     const int n_blocks = static_cast<int>(w.enc_blocks.size());
     eb.dumps.block_outs.reserve(static_cast<size_t>(n_blocks));
     for (int i = 0; i < n_blocks; ++i) {
-        x = build_block(ctx, x, w.enc_blocks[i], n_heads, d_model, use_flash);
+        x = build_block(ctx, eb.graph, x, w.enc_blocks[i], n_heads, d_model, use_flash, attn_k, attn_v);
 
         // Name every block for layer-by-layer comparison. block0 / block_last
         // are stashed separately for callers that only want the spot-check pair.
@@ -291,12 +321,6 @@ EncoderBuild build_encoder_graph(ggml_context *         ctx,
     eb.out = x;
     ggml_set_output(eb.out);
 
-    // Build the forward cgraph. 8192 leaves headroom up to large (32 blocks).
-    eb.graph = ggml_new_graph_custom(ctx, 8192, false);
-    if (eb.graph == nullptr) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper encoder: ggml_new_graph_custom failed");
-        return eb;
-    }
     ggml_build_forward_expand(eb.graph, eb.out);
 
     return eb;

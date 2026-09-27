@@ -8,7 +8,7 @@
  *   - the disabled-threshold sentinel macros (+/-INF) and the prompt
  *     composition enum used by the run ext.
  *
- * Whisper exposes substantial real model-specific knobs (13 fields).
+ * Whisper exposes substantial real model-specific knobs (17 fields).
  * The PNC/ITN toggles that other families share via transcribe_run_params
  * do not apply: transcribe_model_supports(model, TRANSCRIBE_FEATURE_PNC)
  * and (..., TRANSCRIBE_FEATURE_ITN) both return false for whisper, and a
@@ -97,10 +97,9 @@ struct transcribe_whisper_run_ext {
      *       Tokenize as HF's get_prompt_ids does:
      *           "<|startofprev|>" + " " + initial_prompt.strip()
      *       The leading space is mandatory (matches
-     *       transformers tokenization_whisper.py:710-722). Any special
-     *       token (<|...|>) found in the tokenized prompt text is
-     *       rejected with TRANSCRIBE_ERR_INVALID_ARG, mirroring HF's
-     *       own check.
+     *       transformers tokenization_whisper.py:710-722). Text that
+     *       looks like a special token (e.g. "<|en|>") is encoded as
+     *       plain text, like whisper.cpp does.
      *
      *   Else: no initial prompt.
      */
@@ -117,7 +116,9 @@ struct transcribe_whisper_run_ext {
      * prior chunk's tokens is prepended (under <|startofprev|>) to the
      * next chunk's prefix, capped at max_prev_context_tokens. Auto-
      * disables for the next chunk when the prior chunk was accepted at
-     * temperature >= 0.5 (matches HF ":1090-1093").
+     * temperature >= 0.5 (matches HF ":1090-1093"). Like whisper.cpp,
+     * the carried tokens keep each chunk's closing timestamp pair, and
+     * no prior context is used once less than 5 s of audio remains.
      */
     bool condition_on_prev_tokens;
 
@@ -128,6 +129,9 @@ struct transcribe_whisper_run_ext {
      * Sampling + temperature fallback. Default behavior matches
      * Whisper's own recipe, not HF generate()'s library-default.
      * Use the _DISABLED sentinels to turn off individual thresholds.
+     * A tier at temperature T > 0 divides the logits by T before the
+     * suppression and timestamp rules (whisper.cpp's order) and takes
+     * avg_logprob from those scaled logits.
      */
     float temperature;             /* first-tier; default 0.0 */
     float temperature_inc;         /* default 0.2             */
@@ -146,6 +150,46 @@ struct transcribe_whisper_run_ext {
 
     /* Seconds. Caps the first emitted timestamp; default 1.0. */
     float max_initial_timestamp;
+
+    /*
+     * Fields below were appended after the first release. A caller built
+     * against the older, shorter struct gets their defaults (ext.size
+     * tells the library which fields the caller has).
+     */
+
+    /*
+     * Suppress OpenAI's non-speech token list (symbols and bracket
+     * tokens) at every step. Default true (HF / OpenAI). false keeps only
+     * the control tokens suppressed, like whisper.cpp's suppress_nst=false:
+     * silence then tends to decode as a bracketed tag such as
+     * "[BLANK_AUDIO]" instead of an invented phrase.
+     */
+    bool suppress_non_speech;
+
+    /*
+     * Candidates sampled per temperature > 0 tier (at most 8); the one
+     * with the best average log-probability is kept, preferring one that
+     * passes the entropy check. Default 1. whisper.cpp and OpenAI use 5.
+     * Values > 1 run transcribe_run_batch serially when the temperature
+     * ladder has a tier above 0.
+     */
+    int32_t best_of;
+
+    /*
+     * whisper.cpp's repetition check: when a tier generated more than 32
+     * tokens and the token-frequency entropy of the last 32 is below this,
+     * the tier falls back to the next temperature. Default
+     * TRANSCRIBE_WHISPER_LOGPROB_DISABLED (off); whisper.cpp uses 2.4.
+     */
+    float entropy_thold;
+
+    /*
+     * Tokenize initial_prompt like whisper.cpp: no leading space, and each
+     * word split greedily into the longest vocabulary pieces instead of BPE
+     * merges. Default false (HF get_prompt_ids). Small models are sensitive
+     * to the exact prompt ids, so callers replacing whisper.cpp set it.
+     */
+    bool greedy_prompt_tokens;
 };
 
 /* Fills ext.size/kind and the Whisper decoding recipe defaults. */

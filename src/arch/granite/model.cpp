@@ -19,6 +19,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-repetition-guard.h"
 #include "weights.h"
 
 #include <algorithm>
@@ -401,7 +402,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     if (weights_buffer == nullptr) {
         gguf_free(gguf_data);
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "granite: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
     m->backend_buffer = weights_buffer;
     ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -430,10 +431,12 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         for (auto & b : m->weights.dec_blocks) {
             entries.push_back({ b.ffn_gate_w, b.ffn_up_w, &b.ffn_gate_up_w });
         }
-        if (!transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
-                                                 entries, m->packed_gate_up, "granite")) {
+        if (const transcribe_status st =
+                transcribe::causal_lm::pack_gate_up(m->plan.primary, m->hparams.dec_hidden, m->hparams.dec_intermediate,
+                                                    entries, m->packed_gate_up, "granite");
+            st != TRANSCRIBE_OK) {
             m->packed_gate_up.free();
-            return TRANSCRIBE_ERR_GGUF;
+            return st;
         }
     }
 
@@ -841,7 +844,7 @@ transcribe_status run(transcribe_session *          ctx_base,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 32768, false, true);
         if (cc->sched == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "granite run: ggml_backend_sched_new failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(cc->sched);
@@ -891,7 +894,7 @@ transcribe_status run(transcribe_session *          ctx_base,
     const int64_t t_enc_start = ggml_time_us();
     if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "granite run: encoder graph compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     cc->t_encode_us = ggml_time_us() - t_enc_start;
 
@@ -969,7 +972,7 @@ transcribe_status run(transcribe_session *          ctx_base,
     if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, pb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "granite run: projector graph compute failed (%d)", static_cast<int>(gs));
         ggml_free(proj_ctx);
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
 
     try_dump("proj.qformer.out", pb.dumps.qformer_out, "projector");
@@ -1153,7 +1156,7 @@ transcribe_status run(transcribe_session *          ctx_base,
     if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, dec.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "granite run: decoder prefill compute failed (%d)", static_cast<int>(gs));
         ggml_free(dec_ctx);
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     cc->t_decode_us = ggml_time_us() - t_dec_start;
 
@@ -1211,6 +1214,9 @@ transcribe_status run(transcribe_session *          ctx_base,
         ip.mem_buffer = nullptr;
         ip.no_alloc   = true;
         step_ctx      = ggml_init(ip);
+        if (step_ctx == nullptr) {
+            return TRANSCRIBE_ERR_OOM;
+        }
     }
     StepBuild step = build_step_graph(step_ctx, cm->weights, cm->hparams, cc->kv, max_n_kv, cc->decoder_use_flash);
     if (step.graph == nullptr) {
@@ -1234,11 +1240,17 @@ transcribe_status run(transcribe_session *          ctx_base,
     // valid positions get zeroed per step.
     std::vector<uint16_t> step_mask(max_n_kv, 0xFC00);
 
+    bool repeating = false;
     for (int step_i = 0; step_i < max_steps; ++step_i) {
         if (next_id == eos_id) {
             break;
         }
         gen_ids.push_back(next_id);
+        if (transcribe::stop_on_repetition(gen_ids, "granite run")) {
+            cc->mark_repetition_stop();
+            repeating = true;
+            break;
+        }
 
         const int32_t pos      = T_prompt + step_i;  // RoPE position
         const int64_t kv_idx   = pos;                // KV write row
@@ -1259,7 +1271,7 @@ transcribe_status run(transcribe_session *          ctx_base,
         if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, step.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "granite run: step compute failed (%d)", static_cast<int>(gs));
             ggml_free(step_ctx);
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
 
         int32_t amax = 0;
@@ -1274,14 +1286,15 @@ transcribe_status run(transcribe_session *          ctx_base,
     // The decode stopped either at EOS (complete) or at the generation
     // budget / context ceiling (truncated). Surface the latter via
     // transcribe_was_truncated() and a WARN rather than handing back a
-    // silently shortened transcript.
-    if (next_id != eos_id) {
+    // silently shortened transcript; a repetition stop has already done both.
+    if (!repeating && next_id != eos_id) {
         cc->was_truncated = true;
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
                             "granite run: output truncated at %d tokens — decode reached the "
                             "generation budget before end-of-stream; the transcript may be "
                             "incomplete.",
                             static_cast<int>(gen_ids.size()));
+        transcribe::trim_repetition_at_budget_stop(gen_ids, "granite run");
     }
 
     // Detokenize.
@@ -1297,7 +1310,7 @@ transcribe_status run(transcribe_session *          ctx_base,
     // before EOS) is a hard status, not a silent success: surface it so the
     // caller can distinguish a complete transcript from one cut short. The
     // partial transcript is still attached above for inspection.
-    return cc->was_truncated ? TRANSCRIBE_ERR_OUTPUT_TRUNCATED : TRANSCRIBE_OK;
+    return cc->truncation_status();
 }
 
 // Offline batched decode (transcribe_run_batch). Serial mel + Conformer
@@ -1316,7 +1329,7 @@ transcribe_status reset_ctx_g(GraniteSession * cc, int mb) {
     ip.mem_buffer   = nullptr;
     ip.no_alloc     = true;
     cc->compute_ctx = ggml_init(ip);
-    return cc->compute_ctx != nullptr ? TRANSCRIBE_OK : TRANSCRIBE_ERR_GGUF;
+    return cc->compute_ctx != nullptr ? TRANSCRIBE_OK : TRANSCRIBE_ERR_OOM;
 }
 
 void apply_threads_g(GraniteSession * cc) {
@@ -1355,7 +1368,7 @@ transcribe_status encode_one(GraniteSession *           cc,
         cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 32768, false, true);
         if (cc->sched == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(cc->sched);
@@ -1389,7 +1402,7 @@ transcribe_status encode_one(GraniteSession *           cc,
 
     const int64_t t_enc0 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(cc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     enc_us += ggml_time_us() - t_enc0;
 
@@ -1433,7 +1446,7 @@ transcribe_status encode_one(GraniteSession *           cc,
     const int64_t t_enc1 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
         ggml_free(proj_ctx);
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     enc_us += ggml_time_us() - t_enc1;
     n_audio_out = pb.n_audio_tokens;
@@ -1450,21 +1463,8 @@ transcribe_status run_batch_serial(GraniteSession *              cc,
                                    const int *                   n_samples,
                                    int                           n,
                                    const transcribe_run_params * params) {
-    for (int i = 0; i < n; ++i) {
-        if (cc->poll_abort()) {
-            return TRANSCRIBE_ERR_ABORTED;
-        }
-        const transcribe_status st = (pcm[i] == nullptr || n_samples[i] <= 0) ? TRANSCRIBE_ERR_INVALID_ARG :
-                                                                                run(cc, pcm[i], n_samples[i], params);
-        if (st == TRANSCRIBE_OK) {
-            cc->batch_results.push_back(cc->capture_result(st));
-        } else {
-            transcribe_session::ResultSet rs;
-            rs.status = st;
-            cc->batch_results.push_back(std::move(rs));
-        }
-    }
-    return TRANSCRIBE_OK;
+    return transcribe::run_batch_serial(cc, pcm, n_samples, n,
+                                        [&](const float * p, int ns) { return run(cc, p, ns, params); });
 }
 
 }  // namespace
@@ -1714,7 +1714,7 @@ transcribe_status run_batch(transcribe_session *          session,
         ggml_backend_tensor_set(pb.last_idx_in, lidx.data(), 0, lidx.size() * sizeof(int32_t));
         apply_threads_g(cc);
         if (ggml_backend_sched_graph_compute(cc->sched, pb.graph) != GGML_STATUS_SUCCESS) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         std::vector<int32_t> amax(n, 0);
         ggml_backend_tensor_get(pb.out, amax.data(), 0, amax.size() * sizeof(int32_t));
@@ -1809,11 +1809,12 @@ transcribe_status run_batch(transcribe_session *          session,
         finalize_granite_result(cm, params, transcript, audio_ms, rs);
         // Per-utterance truncation parity with single-shot run(): a row cut at
         // the generation budget / KV window before eos reports
-        // TRANSCRIBE_ERR_OUTPUT_TRUNCATED (partial transcript retained). Only
-        // override a TRANSCRIBE_OK status, never a worse one.
+        // TRANSCRIBE_ERR_OUTPUT_TRUNCATED, and one the repetition guard stopped
+        // reports TRANSCRIBE_ERR_OUTPUT_REPETITION (partial transcript retained
+        // either way). Only override a TRANSCRIBE_OK status, never a worse one.
         if (b < static_cast<int>(truncated.size()) && truncated[b] && rs.status == TRANSCRIBE_OK) {
             cc->was_truncated = true;
-            rs.status         = TRANSCRIBE_ERR_OUTPUT_TRUNCATED;
+            rs.status         = transcribe::decode_stop_status(truncated[b]);
         }
         rs.t_mel_us    = mel_us / valid_count;
         rs.t_encode_us = enc_us / valid_count;

@@ -28,7 +28,7 @@ C/C++ speech-to-text inference library. Runs diverse STT model families via [GGU
 | SenseVoice Small | `sensevoice-small` | - | [docs/models/sensevoice-small.md](docs/models/sensevoice-small.md) |
 | Voxtral (2507) | `voxtral-mini-3b-2507`, `voxtral-small-24b-2507` | translate | [docs/models/voxtral.md](docs/models/voxtral.md) |
 | Voxtral Realtime (2602) | `voxtral-mini-4b-realtime-2602` | streaming | [docs/models/voxtral-realtime.md](docs/models/voxtral-realtime.md) |
-| Whisper | `breeze-asr-25`, `whisper-base`, `whisper-base.en`, `whisper-large`, `whisper-large-v2`, `whisper-large-v3`, `whisper-large-v3-turbo`, `whisper-medium`, `whisper-medium.en`, `whisper-small`, `whisper-small.en`, `whisper-tiny`, `whisper-tiny.en` | segment timestamps, translate | [docs/models/whisper.md](docs/models/whisper.md) |
+| Whisper | `breeze-asr-25`, `whisper-base`, `whisper-base.en`, `whisper-large`, `whisper-large-v2`, `whisper-large-v3`, `whisper-large-v3-turbo`, `whisper-medium`, `whisper-medium.en`, `whisper-small`, `whisper-small.en`, `whisper-tiny`, `whisper-tiny.en` | translate, word timestamps | [docs/models/whisper.md](docs/models/whisper.md) |
 <!-- /catalog -->
 
 **Speaker diarization models** (no transcription; verified by DER/JER rather than WER):

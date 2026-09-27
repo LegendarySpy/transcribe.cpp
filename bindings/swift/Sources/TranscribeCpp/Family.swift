@@ -20,6 +20,10 @@ public struct WhisperRunOptions: Sendable {
     public var noSpeechThold: Float?
     public var seed: UInt32?
     public var maxInitialTimestamp: Float?
+    public var suppressNonSpeech: Bool?
+    public var bestOf: Int32?
+    public var entropyThold: Float?
+    public var greedyPromptTokens: Bool?
 
     public init(
         initialPrompt: String? = nil,
@@ -31,7 +35,11 @@ public struct WhisperRunOptions: Sendable {
         logprobThold: Float? = nil,
         noSpeechThold: Float? = nil,
         seed: UInt32? = nil,
-        maxInitialTimestamp: Float? = nil
+        maxInitialTimestamp: Float? = nil,
+        suppressNonSpeech: Bool? = nil,
+        bestOf: Int32? = nil,
+        entropyThold: Float? = nil,
+        greedyPromptTokens: Bool? = nil
     ) {
         self.initialPrompt = initialPrompt
         self.conditionOnPrevTokens = conditionOnPrevTokens
@@ -43,6 +51,10 @@ public struct WhisperRunOptions: Sendable {
         self.noSpeechThold = noSpeechThold
         self.seed = seed
         self.maxInitialTimestamp = maxInitialTimestamp
+        self.suppressNonSpeech = suppressNonSpeech
+        self.bestOf = bestOf
+        self.entropyThold = entropyThold
+        self.greedyPromptTokens = greedyPromptTokens
     }
 }
 
@@ -111,6 +123,10 @@ func withRunExtension<R>(
         if let v = o.noSpeechThold { c.no_speech_thold = v }
         if let v = o.seed { c.seed = v }
         if let v = o.maxInitialTimestamp { c.max_initial_timestamp = v }
+        if let v = o.suppressNonSpeech { c.suppress_non_speech = v }
+        if let v = o.bestOf { c.best_of = v }
+        if let v = o.entropyThold { c.entropy_thold = v }
+        if let v = o.greedyPromptTokens { c.greedy_prompt_tokens = v }
         return try withOptionalCString(o.initialPrompt) { prompt in
             c.initial_prompt = prompt
             return try withUnsafePointer(to: &c.ext) { try body($0) }

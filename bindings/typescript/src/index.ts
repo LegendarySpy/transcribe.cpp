@@ -21,6 +21,7 @@ import {
   InvalidArgument,
   ModelLoadError,
   NotImplementedByModel,
+  OutputRepetition,
   OutputTruncated,
   TranscribeError,
   UnsupportedRequest,
@@ -572,6 +573,10 @@ const FAMILY: Record<string, FamilyReg> = {
       max_prev_context_tokens: o.maxPrevContextTokens,
       seed: o.seed,
       max_initial_timestamp: o.maxInitialTimestamp,
+      suppress_non_speech: o.suppressNonSpeech,
+      best_of: o.bestOf,
+      entropy_thold: o.entropyThold,
+      greedy_prompt_tokens: o.greedyPromptTokens,
     }),
   },
   moonshine: {
@@ -809,7 +814,8 @@ export class Session {
 
       if (
         status === g.TRANSCRIBE_ERR_ABORTED ||
-        status === g.TRANSCRIBE_ERR_OUTPUT_TRUNCATED
+        status === g.TRANSCRIBE_ERR_OUTPUT_TRUNCATED ||
+        status === g.TRANSCRIBE_ERR_OUTPUT_REPETITION
       ) {
         const partial: TranscriptionResult = {
           ...materialize(n, singleAccessors(n, h)),
@@ -819,7 +825,9 @@ export class Session {
         const exc =
           status === g.TRANSCRIBE_ERR_ABORTED
             ? new Aborted(`run aborted`, status)
-            : new OutputTruncated(`run output truncated`, status);
+            : status === g.TRANSCRIBE_ERR_OUTPUT_REPETITION
+              ? new OutputRepetition(`run stopped: output began repeating`, status)
+              : new OutputTruncated(`run output truncated`, status);
         exc.partialResult = partial;
         throw exc;
       }
@@ -920,12 +928,15 @@ export class Session {
           error.utteranceIndex = i;
           if (
             st === g.TRANSCRIBE_ERR_ABORTED ||
-            st === g.TRANSCRIBE_ERR_OUTPUT_TRUNCATED
+            st === g.TRANSCRIBE_ERR_OUTPUT_TRUNCATED ||
+            st === g.TRANSCRIBE_ERR_OUTPUT_REPETITION
           ) {
             error.partialResult = {
               ...materialize(n, batchAccessors(n, h, i)),
               aborted: st === g.TRANSCRIBE_ERR_ABORTED,
-              truncated: st === g.TRANSCRIBE_ERR_OUTPUT_TRUNCATED,
+              truncated:
+                st === g.TRANSCRIBE_ERR_OUTPUT_TRUNCATED ||
+                st === g.TRANSCRIBE_ERR_OUTPUT_REPETITION,
             };
           }
           out.push({ ok: false, error });

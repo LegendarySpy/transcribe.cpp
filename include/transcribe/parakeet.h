@@ -3,7 +3,8 @@
  *
  * Includes transcribe.h; safe to include in C or C++ TUs. Holds the
  * streaming extension structs (cache-aware and chunked-attention
- * variants) and their kind constants and init functions.
+ * variants), the run extension (phrase boosting), and their kind
+ * constants and init functions.
  *
  * Acceptance is per-loaded-model-variant: nemotron-speech-streaming-en-0.6b
  * (cache-aware) accepts TRANSCRIBE_EXT_KIND_PARAKEET_STREAM and rejects
@@ -28,6 +29,8 @@ extern "C" {
 #define TRANSCRIBE_EXT_KIND_PARAKEET_STREAM          0x54534B50u
 /* 'PKBS' little-endian = 0x53424B50 */
 #define TRANSCRIBE_EXT_KIND_PARAKEET_BUFFERED_STREAM 0x53424B50u
+/* 'PKRN' little-endian = 0x4E524B50 */
+#define TRANSCRIBE_EXT_KIND_PARAKEET_RUN             0x4E524B50u
 
 /*
  * Cache-aware streaming knob (nemotron-speech-streaming-en-0.6b).
@@ -104,6 +107,42 @@ struct transcribe_parakeet_buffered_stream_ext {
 
 /* Fills ext.size/kind and left/chunk/right_ms = -1 (model default). */
 TRANSCRIBE_API void transcribe_parakeet_buffered_stream_ext_init(struct transcribe_parakeet_buffered_stream_ext * ext);
+
+/*
+ * Phrase boosting (RUN slot; also honored by transcribe_stream_begin
+ * through its run_params). Accepted by TDT and RNN-T variants, not CTC.
+ *
+ *   boost_phrases / n_boost_phrases
+ *
+ *     UTF-8 phrases to favor, as typed (casing matters: the model emits
+ *     cased text, so "Groq" boosts "Groq"). Borrowed for the call; the
+ *     library copies what it needs. NULL / 0 disables boosting and the
+ *     output is identical to passing no extension. At most 1024
+ *     phrases; more, or a NULL entry, is TRANSCRIBE_ERR_INVALID_ARG.
+ *     Whitespace is trimmed and collapsed. Phrases of fewer than 3
+ *     characters or more than 256 bytes, longer than 24 tokens, or that
+ *     do not tokenize to plain vocabulary pieces, are ignored.
+ *
+ *   boost_score
+ *
+ *     Boost weight in logits per phrase-trie arc score. Default 3.0;
+ *     0 disables. Must be finite and in [0, 10].
+ *
+ * Greedy decoding keeps the model's blank decisions. A boosted token must
+ * have at least 1e-5 unboosted probability, and a swap is kept only when
+ * it completes a phrase as whole words and the decode keeps emitting
+ * speech for half a second after it; otherwise the model's own tokens
+ * stand for that span.
+ */
+struct transcribe_parakeet_run_ext {
+    struct transcribe_ext ext;
+    const char * const *  boost_phrases;
+    int32_t               n_boost_phrases;
+    float                 boost_score;
+};
+
+/* Fills ext.size/kind, no phrases, boost_score = 3.0. */
+TRANSCRIBE_API void transcribe_parakeet_run_ext_init(struct transcribe_parakeet_run_ext * ext);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -55,14 +55,17 @@ target_link_libraries(transcribe_api_smoke PRIVATE transcribe)
 add_test(NAME transcribe_api_smoke COMMAND transcribe_api_smoke)
 
 if(TRANSCRIBE_COREML AND TRANSCRIBE_BUILD_EXAMPLES)
-    add_test(NAME transcribe_parakeet_coreml_smoke
-        COMMAND ${CMAKE_COMMAND}
-            -DCLI=$<TARGET_FILE:transcribe-cli>
-            -DAUDIO=${PROJECT_SOURCE_DIR}/samples/jfk.wav
-            -DFAMILY=PARAKEET
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/coreml_smoke.cmake)
-    set_tests_properties(transcribe_parakeet_coreml_smoke PROPERTIES
-        SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
+    foreach(family parakeet whisper)
+        string(TOUPPER ${family} family_upper)
+        add_test(NAME transcribe_${family}_coreml_smoke
+            COMMAND ${CMAKE_COMMAND}
+                -DCLI=$<TARGET_FILE:transcribe-cli>
+                -DAUDIO=${PROJECT_SOURCE_DIR}/samples/jfk.wav
+                -DFAMILY=${family_upper}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/coreml_smoke.cmake)
+        set_tests_properties(transcribe_${family}_coreml_smoke PROPERTIES
+            SKIP_REGULAR_EXPRESSION "SKIP:" TIMEOUT 600)
+    endforeach()
 endif()
 
 
@@ -225,6 +228,21 @@ target_include_directories(transcribe_decode_budget_unit PRIVATE
 transcribe_apply_warnings(transcribe_decode_budget_unit)
 
 add_test(NAME transcribe_decode_budget_unit COMMAND transcribe_decode_budget_unit)
+
+# -----------------------------------------------------------------------------
+# Greedy-decode repetition guard (pure host, no model)
+
+add_executable(transcribe_repetition_guard_unit
+    repetition_guard_unit.cpp)
+
+target_link_libraries(transcribe_repetition_guard_unit PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_repetition_guard_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_repetition_guard_unit)
+
+add_test(NAME transcribe_repetition_guard_unit COMMAND transcribe_repetition_guard_unit)
 
 # -----------------------------------------------------------------------------
 # MOSS diarized-transcript parser unit test (pure host, no model)
@@ -1087,7 +1105,7 @@ endif()
 # Loads a real Whisper GGUF and verifies the public capabilities match the
 # runtime behavior: language detection runs when no language hint is supplied,
 # default params use no-timestamp decode, explicit SEGMENT returns segment
-# timestamps, and WORD timestamps are rejected until the DTW alignment path lands.
+# timestamps, and WORD returns aligned word timestamps with identical text.
 
 if(TRANSCRIBE_BUILD_REAL_MODEL_TESTS)
     add_executable(transcribe_whisper_e2e_smoke
@@ -1386,6 +1404,70 @@ add_test(NAME transcribe_tokenizer_decode_only_unit
     COMMAND transcribe_tokenizer_decode_only_unit)
 
 # -----------------------------------------------------------------------------
+# SentencePiece encode() on toy vocabs
+# -----------------------------------------------------------------------------
+#
+# Builds tokenizer KVs in an in-memory gguf_context: BPE merge order,
+# unigram Viterbi, label-independent unigram detection, whitespace and
+# unknown-character handling. No fixtures.
+
+add_executable(transcribe_tokenizer_sentencepiece_unit
+    tokenizer_sentencepiece_unit.cpp)
+
+target_link_libraries(transcribe_tokenizer_sentencepiece_unit PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_tokenizer_sentencepiece_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_tokenizer_sentencepiece_unit)
+
+add_test(NAME transcribe_tokenizer_sentencepiece_unit
+    COMMAND transcribe_tokenizer_sentencepiece_unit)
+
+# -----------------------------------------------------------------------------
+# SentencePiece encode() parity on real Parakeet / Nemotron vocabularies
+# -----------------------------------------------------------------------------
+#
+# Reads only the tokenizer KVs of the GGUFs named by
+# TRANSCRIBE_PARAKEET_GGUF (v3), TRANSCRIBE_PARAKEET_UNIFIED_GGUF and
+# TRANSCRIBE_NEMOTRON35_GGUF and compares ids with
+# tests/fixtures/parakeet_sp_parity.inc (scripts/sp-tokenizer-parity-fixture.py).
+# All unset -> skip (77).
+
+add_executable(transcribe_parakeet_sp_parity
+    parakeet_sp_parity.cpp)
+
+target_link_libraries(transcribe_parakeet_sp_parity PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_parakeet_sp_parity PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR})
+
+transcribe_apply_warnings(transcribe_parakeet_sp_parity)
+
+add_test(NAME transcribe_parakeet_sp_parity
+    COMMAND transcribe_parakeet_sp_parity)
+set_tests_properties(transcribe_parakeet_sp_parity PROPERTIES
+    SKIP_RETURN_CODE 77)
+
+# -----------------------------------------------------------------------------
+# Parakeet phrase-boosting trie and decisions
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_parakeet_boost_unit
+    parakeet_boost_unit.cpp)
+
+target_link_libraries(transcribe_parakeet_boost_unit PRIVATE transcribe)
+
+target_include_directories(transcribe_parakeet_boost_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_parakeet_boost_unit)
+
+add_test(NAME transcribe_parakeet_boost_unit
+    COMMAND transcribe_parakeet_boost_unit)
+
+# -----------------------------------------------------------------------------
 # Whisper .bin synthesized suppression metadata
 # -----------------------------------------------------------------------------
 
@@ -1401,6 +1483,24 @@ transcribe_apply_warnings(transcribe_whisper_bin_suppress_unit)
 
 add_test(NAME transcribe_whisper_bin_suppress_unit
     COMMAND transcribe_whisper_bin_suppress_unit)
+
+# -----------------------------------------------------------------------------
+# Whisper word-timestamp host math (alignment.cpp) vs numpy timing.py ports
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_whisper_alignment_unit
+    whisper_alignment_unit.cpp)
+
+target_link_libraries(transcribe_whisper_alignment_unit PRIVATE transcribe)
+
+target_include_directories(transcribe_whisper_alignment_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR})
+
+transcribe_apply_warnings(transcribe_whisper_alignment_unit)
+
+add_test(NAME transcribe_whisper_alignment_unit
+    COMMAND transcribe_whisper_alignment_unit)
 
 # -----------------------------------------------------------------------------
 # Whisper .bin parser unit test

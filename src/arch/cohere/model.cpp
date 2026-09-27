@@ -23,6 +23,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-repetition-guard.h"
 #include "weights.h"
 
 #include <algorithm>
@@ -297,7 +298,7 @@ transcribe_status fuse_batch_norm(CohereModel & m) {
     ggml_init_params params   = { ctx_size, nullptr, true };
     m.bn_fused_ctx            = ggml_init(params);
     if (m.bn_fused_ctx == nullptr) {
-        return TRANSCRIBE_ERR_BACKEND;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     for (size_t i = 0; i < n_blocks; ++i) {
@@ -308,7 +309,7 @@ transcribe_status fuse_batch_norm(CohereModel & m) {
 
     m.bn_fused_buffer = ggml_backend_alloc_ctx_tensors(m.bn_fused_ctx, m.plan.scheduler_list.back());
     if (m.bn_fused_buffer == nullptr) {
-        return TRANSCRIBE_ERR_BACKEND;
+        return TRANSCRIBE_ERR_OOM;
     }
 
     std::vector<float> bn_w(d), bn_b(d), rm(d), rv(d);
@@ -574,7 +575,7 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     if (weights_buffer == nullptr) {
         gguf_free(gguf_data);
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere: ggml_backend_alloc_ctx_tensors failed");
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_OOM;
     }
     m->backend_buffer = weights_buffer;
     ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -736,7 +737,7 @@ transcribe_status run(transcribe_session *          session,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: ggml_backend_sched_new failed");
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(cc->sched);
@@ -787,7 +788,7 @@ transcribe_status run(transcribe_session *          session,
     const int64_t t_enc_start = ggml_time_us();
     if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, eb.graph); gs != GGML_STATUS_SUCCESS) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: encoder graph compute failed (%d)", static_cast<int>(gs));
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     cc->t_encode_us = ggml_time_us() - t_enc_start;
 
@@ -959,7 +960,7 @@ transcribe_status run(transcribe_session *          session,
         if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, cross_db.graph);
             gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: cross_kv compute failed (%d)", static_cast<int>(gs));
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         cc->kv_cache.cross_populated = true;
     }
@@ -1015,7 +1016,7 @@ transcribe_status run(transcribe_session *          session,
 
         if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, db.graph); gs != GGML_STATUS_SUCCESS) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: decoder prompt compute failed (%d)", static_cast<int>(gs));
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
 
         // Dump decoder intermediates (prompt pass only).
@@ -1204,7 +1205,7 @@ transcribe_status run(transcribe_session *          session,
                     log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: step compute failed (%d, n_past=%d)",
                             static_cast<int>(gs), n_past);
                     commit_result();
-                    return TRANSCRIBE_ERR_GGUF;
+                    return TRANSCRIBE_ERR_BACKEND;
                 }
 
                 n_past += 1;
@@ -1217,6 +1218,10 @@ transcribe_status run(transcribe_session *          session,
 
                 if (next_token != eos_id) {
                     generated_ids.push_back(next_token);
+                    if (transcribe::stop_on_repetition(generated_ids, "cohere run")) {
+                        cc->mark_repetition_stop();
+                        break;
+                    }
                 }
             }
         } else {
@@ -1253,19 +1258,26 @@ transcribe_status run(transcribe_session *          session,
                 }
 
                 if (!new_compute_ctx(4 * 1024 * 1024)) {
-                    break;
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: decoder step ggml_init failed");
+                    commit_result();
+                    return TRANSCRIBE_ERR_OOM;
                 }
 
                 DecoderBuild db_step = build_decoder_graph_kv(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache,
                                                               /*n_tokens=*/1, n_past, T_enc,
                                                               /*skip_log_softmax=*/true, cc->decoder_use_flash);
                 if (db_step.out == nullptr || db_step.graph == nullptr) {
-                    break;
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: decoder step graph build failed");
+                    commit_result();
+                    return TRANSCRIBE_ERR_GGUF;
                 }
 
                 ggml_backend_sched_reset(cc->sched);
                 if (!ggml_backend_sched_alloc_graph(cc->sched, db_step.graph)) {
-                    break;
+                    transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                                        "cohere run: step graph allocation failed — out of memory.");
+                    commit_result();
+                    return TRANSCRIBE_ERR_OOM;
                 }
 
                 int32_t token_id = next_token;
@@ -1275,7 +1287,10 @@ transcribe_status run(transcribe_session *          session,
 
                 if (const ggml_status gs = ggml_backend_sched_graph_compute(cc->sched, db_step.graph);
                     gs != GGML_STATUS_SUCCESS) {
-                    break;
+                    log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: decoder step compute failed (%d)",
+                            static_cast<int>(gs));
+                    commit_result();
+                    return TRANSCRIBE_ERR_BACKEND;
                 }
 
                 n_past += 1;
@@ -1288,6 +1303,10 @@ transcribe_status run(transcribe_session *          session,
 
                 if (next_token != eos_id) {
                     generated_ids.push_back(next_token);
+                    if (transcribe::stop_on_repetition(generated_ids, "cohere run")) {
+                        cc->mark_repetition_stop();
+                        break;
+                    }
                 }
             }
         }
@@ -1304,6 +1323,9 @@ transcribe_status run(transcribe_session *          session,
                                 "incomplete.",
                                 static_cast<int>(generated_ids.size()));
         }
+        if (cc->was_truncated && !cc->stopped_on_repetition) {
+            transcribe::trim_repetition_at_budget_stop(generated_ids, "cohere run");
+        }
 
         // Build the result. max_timestamp_kind == NONE means text but no
         // alignment data: full_text plus one segment (text == full_text,
@@ -1314,7 +1336,7 @@ transcribe_status run(transcribe_session *          session,
     // Output truncation is a hard status: the partial transcript is committed
     // and stays readable (like an aborted run), but we surface the truncation
     // rather than reporting a clean OK.
-    return cc->was_truncated ? TRANSCRIBE_ERR_OUTPUT_TRUNCATED : TRANSCRIBE_OK;
+    return cc->truncation_status();
 }
 
 // ===========================================================================
@@ -1379,7 +1401,7 @@ transcribe_status encode_one_to_host(CohereSession *            cc,
         cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
                                            static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
         if (cc->sched == nullptr) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
     }
     ggml_backend_sched_reset(cc->sched);
@@ -1416,7 +1438,7 @@ transcribe_status encode_one_to_host(CohereSession *            cc,
 
     const int64_t t0 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(cc->sched, eb.graph) != GGML_STATUS_SUCCESS) {
-        return TRANSCRIBE_ERR_GGUF;
+        return TRANSCRIBE_ERR_BACKEND;
     }
     enc_us += ggml_time_us() - t0;
 
@@ -1436,21 +1458,8 @@ transcribe_status run_batch_serial(CohereSession *               cc,
                                    const int *                   n_samples,
                                    int                           n,
                                    const transcribe_run_params * params) {
-    for (int i = 0; i < n; ++i) {
-        if (cc->poll_abort()) {
-            return TRANSCRIBE_ERR_ABORTED;
-        }
-        const transcribe_status st = (pcm[i] == nullptr || n_samples[i] <= 0) ? TRANSCRIBE_ERR_INVALID_ARG :
-                                                                                run(cc, pcm[i], n_samples[i], params);
-        if (st == TRANSCRIBE_OK) {
-            cc->batch_results.push_back(cc->capture_result(st));
-        } else {
-            transcribe_session::ResultSet rs;
-            rs.status = st;
-            cc->batch_results.push_back(std::move(rs));
-        }
-    }
-    return TRANSCRIBE_OK;
+    return transcribe::run_batch_serial(cc, pcm, n_samples, n,
+                                        [&](const float * p, int ns) { return run(cc, p, ns, params); });
 }
 
 transcribe_status run_batch(transcribe_session *          session,
@@ -1645,7 +1654,7 @@ transcribe_status run_batch(transcribe_session *          session,
         }
         ggml_backend_tensor_set(cross.encoder_out_in, packed.data(), 0, packed.size() * sizeof(float));
         if (ggml_backend_sched_graph_compute(cc->sched, cross.graph) != GGML_STATUS_SUCCESS) {
-            return TRANSCRIBE_ERR_GGUF;
+            return TRANSCRIBE_ERR_BACKEND;
         }
         cc->kv_cache.cross_populated = true;
     }
@@ -1676,18 +1685,18 @@ transcribe_status run_batch(transcribe_session *          session,
     }
 
     StepBuildBatched sb{};
-    auto             rebuild = [&](int win, transcribe::EncDecStepIO & io) -> bool {
+    auto             rebuild = [&](int win, transcribe::EncDecStepIO & io) -> transcribe_status {
         if (!new_compute_ctx(16 * 1024 * 1024)) {
-            return false;
+            return TRANSCRIBE_ERR_OOM;
         }
         sb = build_step_graph_batched(cc->compute_ctx, cm->weights, hp, cc->kv_cache, win, T_enc_max, n,
                                       cc->decoder_use_flash);
         if (sb.graph == nullptr || sb.argmax_out == nullptr) {
-            return false;
+            return TRANSCRIBE_ERR_GGUF;
         }
         ggml_backend_sched_reset(cc->sched);
         if (!ggml_backend_sched_alloc_graph(cc->sched, sb.graph)) {
-            return false;
+            return TRANSCRIBE_ERR_OOM;
         }
         ggml_backend_tensor_set(sb.cross_mask_in, cmask.data(), 0, cmask.size() * sizeof(ggml_fp16_t));
         io.token_ids = sb.token_ids_in;
@@ -1696,7 +1705,7 @@ transcribe_status run_batch(transcribe_session *          session,
         io.self_mask = sb.self_mask_in;
         io.argmax    = sb.argmax_out;
         io.graph     = sb.graph;
-        return true;
+        return TRANSCRIBE_OK;
     };
 
     std::vector<std::vector<int32_t>> generated(n);
@@ -1736,7 +1745,7 @@ transcribe_status run_batch(transcribe_session *          session,
         // otherwise-OK status, never a worse one.
         if (rs.status == TRANSCRIBE_OK && b < static_cast<int>(truncated.size()) && truncated[b]) {
             cc->was_truncated = true;
-            rs.status         = TRANSCRIBE_ERR_OUTPUT_TRUNCATED;
+            rs.status         = transcribe::decode_stop_status(truncated[b]);
         }
         rs.t_mel_us    = mel_us / valid_count;
         rs.t_encode_us = enc_us / valid_count;

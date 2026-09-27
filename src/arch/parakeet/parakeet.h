@@ -235,6 +235,9 @@ struct ParakeetStreamingDecoderState {
     // into stream-wide frame indices.
     int64_t frame_offset = 0;
 
+    // Phrase-boosting trie state and any fork still open at a chunk edge.
+    BoostDecodeState boost;
+
     bool initialized = false;
 };
 
@@ -254,6 +257,10 @@ struct ParakeetSession final : public transcribe_session {
     std::vector<float>    pos_div_term;
     std::vector<float>    enc_host;
     std::vector<TdtToken> raw_tokens;
+
+    // Phrase-boosting trie compiled from the PARAKEET_RUN extension by
+    // run / run_batch / stream_begin; empty = plain greedy.
+    BoostTrie boost;
 
     // Multitalker bundle scratch: streaming-diarizer AOSC/FIFO state for
     // the embedded sortformer forward (diarize=ON runs only).

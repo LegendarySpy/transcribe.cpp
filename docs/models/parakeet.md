@@ -117,6 +117,21 @@ training menu (lookahead latency from 160ms at `(70, 1, 1)` through
 for the per-config WER and the `--stream-buf-{left,chunk,right}-ms`
 CLI surface. Other Parakeet variants run offline only.
 
+**Phrase boosting** (TDT and RNN-T heads, offline and streaming) favors
+caller-listed words and names such as product names or people, as typed:
+`struct transcribe_parakeet_run_ext` in the run slot (`boost_phrases`,
+`boost_score`, default 3.0), or `--boost FILE --boost-score F` on the
+CLI. The phrases are tokenized with the model's SentencePiece vocabulary
+into a trie scored like NeMo's GPU phrase boosting. Greedy decoding keeps
+the model's blank decisions; a listed token may replace the model's choice
+only if its unboosted probability is at least 1e-5, and the swap is kept
+only when it completes a listed phrase as whole words and the decode keeps
+emitting speech for half a second after it (the decode forks and verifies
+both). An empty list or `boost_score = 0` gives output identical to no
+extension. On parakeet-tdt-0.6b-v3 with a 4-name list, recall of the names
+in 76 real dictations went from 44% to 80% (1e-3 floor and weight 2.0
+before), with one false insertion across 797 control dictations.
+
 What's not supported (consistent across the family): translation,
 VAD, speaker diarization. Language coverage is English-only except
 `parakeet-tdt-0.6b-v3` and `parakeet-primeline` (25 European languages,
@@ -134,10 +149,12 @@ other compatible model families can reuse.
 
 On Apple Silicon with macOS 13 or later, the optional Core ML backend covers
 the offline full-context FastConformer encoders: every Parakeet variant except
-the streaming and multitalker checkpoints, which the converter and the runtime
-reject. Build with `-DTRANSCRIBE_COREML=ON`; use `-DTRANSCRIBE_METAL=OFF` and
-`--backend cpu` to keep the decoder on CPU. Core ML uses `CPUAndNeuralEngine`,
-which excludes the GPU but permits CPU operations where needed.
+the streaming-only and multitalker checkpoints, which the converter and the
+runtime reject. Unified's offline path is full-context and supported; its
+streaming path keeps the ggml encoder. Build with `-DTRANSCRIBE_COREML=ON`;
+use `-DTRANSCRIBE_METAL=OFF` and `--backend cpu` to keep the decoder on CPU.
+Core ML uses `CPUAndNeuralEngine`, which excludes the GPU but permits CPU
+operations where needed.
 
 Create the companion encoder directly from the same Handy GGUF used for
 inference. The converter reads and dequantizes its encoder tensors; it does not
@@ -184,7 +201,7 @@ unverified.
 
 ### Decoder-only Parakeet TDT V3 packages
 
-`scripts/extract-parakeet-decoder.py SOURCE.gguf OUTPUT-decoder.gguf` copies the
+`scripts/extract-coreml-decoder.py SOURCE.gguf OUTPUT-decoder.gguf` copies the
 original GGUF metadata and predictor/joint tensors, omitting encoder tensors.
 It sets `stt.parakeet.decoder_only=true` and records
 `stt.parakeet.source_sha256`. Use the Core ML encoder exported from SOURCE;
