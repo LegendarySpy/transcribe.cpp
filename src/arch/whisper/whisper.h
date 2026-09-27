@@ -120,11 +120,16 @@ struct WhisperKvCache {
 // Allocated on first use, reallocated only on shape change (T_enc is fixed at
 // max_source_positions=1500 for stock variants, so effectively never).
 struct WhisperEncOut {
-    ggml_tensor *         tensor  = nullptr;
-    ggml_context *        ctx     = nullptr;
-    ggml_backend_buffer_t buffer  = nullptr;
-    int                   d_model = 0;
-    int                   T_enc   = 0;
+    ggml_tensor *         tensor   = nullptr;
+    ggml_context *        ctx      = nullptr;
+    ggml_backend_buffer_t buffer   = nullptr;
+    int                   d_model  = 0;
+    int                   T_enc    = 0;
+    // Zeroed F16 K/V rows, T_enc padded to attn_pad, that the encoder's
+    // flash attention reads (see k_enc_attn_pad); null when attn_pad is 0.
+    ggml_tensor *         attn_k   = nullptr;
+    ggml_tensor *         attn_v   = nullptr;
+    int                   attn_pad = 0;
 
     void free() {
         if (buffer != nullptr) {
@@ -135,13 +140,16 @@ struct WhisperEncOut {
             ggml_free(ctx);
             ctx = nullptr;
         }
-        tensor  = nullptr;
-        d_model = 0;
-        T_enc   = 0;
+        tensor   = nullptr;
+        d_model  = 0;
+        T_enc    = 0;
+        attn_k   = nullptr;
+        attn_v   = nullptr;
+        attn_pad = 0;
     }
 };
 
-bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, int T_enc);
+bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, int T_enc, int attn_pad);
 
 // Active-KV padding for the self-attention step graph (whisper.cpp's
 // whisper_kv_cache_get_padding): 32 on Metal+FA, 1 otherwise. Aligns the FA
@@ -153,6 +161,11 @@ int kv_pad_self_attn(transcribe::BackendKind kind, bool use_flash);
 // on backend); cost is a few unused rows per layer plus small cross-attn
 // dilution.
 constexpr int k_cross_kv_pad = 256;
+
+// Encoder self-attention K/V padding multiple under flash attention on Metal.
+// whisper.cpp attends over zeroed rows up to this multiple, unmasked, which
+// skips the Metal kernel's slower partial-block path.
+constexpr int k_enc_attn_pad = 256;
 
 // Allocate cache tensors. n_ctx caps self-attention length; T_enc is
 // fixed at 1500 for whisper (max_source_positions after the stride-2

@@ -85,10 +85,10 @@ void WhisperSession::on_scratch_released() noexcept {
     compute_ctx_size = 0;
 }
 
-bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, int T_enc) {
+bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, int T_enc, int attn_pad) {
     enc_out.free();
 
-    const size_t     ctx_size = ggml_tensor_overhead() + 256;
+    const size_t     ctx_size = 3 * ggml_tensor_overhead() + 256;
     ggml_init_params params{};
     params.mem_size   = ctx_size;
     params.mem_buffer = nullptr;
@@ -102,6 +102,13 @@ bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, 
 
     enc_out.tensor = ggml_new_tensor_2d(enc_out.ctx, GGML_TYPE_F32, d_model, T_enc);
     ggml_set_name(enc_out.tensor, "enc_out");
+    if (attn_pad > 0) {
+        const int64_t n = static_cast<int64_t>(d_model) * GGML_PAD(T_enc, attn_pad);
+        enc_out.attn_k  = ggml_new_tensor_1d(enc_out.ctx, GGML_TYPE_F16, n);
+        enc_out.attn_v  = ggml_new_tensor_1d(enc_out.ctx, GGML_TYPE_F16, n);
+        ggml_set_name(enc_out.attn_k, "enc_attn_k");
+        ggml_set_name(enc_out.attn_v, "enc_attn_v");
+    }
 
     enc_out.buffer = ggml_backend_alloc_ctx_tensors(enc_out.ctx, backend);
     if (enc_out.buffer == nullptr) {
@@ -109,11 +116,15 @@ bool enc_out_init(WhisperEncOut & enc_out, ggml_backend_t backend, int d_model, 
         ggml_free(enc_out.ctx);
         enc_out.ctx    = nullptr;
         enc_out.tensor = nullptr;
+        enc_out.attn_k = nullptr;
+        enc_out.attn_v = nullptr;
         return false;
     }
+    ggml_backend_buffer_clear(enc_out.buffer, 0);
 
-    enc_out.d_model = d_model;
-    enc_out.T_enc   = T_enc;
+    enc_out.d_model  = d_model;
+    enc_out.T_enc    = T_enc;
+    enc_out.attn_pad = attn_pad;
     return true;
 }
 
@@ -654,7 +665,7 @@ transcribe_status run_whisper_encoder_on_window(WhisperSession * cc,
         }
         ggml_backend_sched_reset(cc->sched);
         if (cc->enc_out.tensor == nullptr || cc->enc_out.d_model != d_model || cc->enc_out.T_enc != frames) {
-            if (!enc_out_init(cc->enc_out, cm->plan.primary, d_model, frames)) {
+            if (!enc_out_init(cc->enc_out, cm->plan.primary, d_model, frames, 0)) {
                 return TRANSCRIBE_ERR_OOM;
             }
         }
@@ -675,29 +686,31 @@ transcribe_status run_whisper_encoder_on_window(WhisperSession * cc,
     }
 #endif
 
-    EncoderBuild eb = build_encoder_graph(cc->compute_ctx, cm->weights, cm->hparams, n_mel_frames,
-                                          cc->encoder_use_flash, cm->backend.c_str());
+    // Backend-resident encoder output: allocate the persistent F32 tensor once
+    // (re-allocate on T_enc / d_model change), then append a ggml_cpy from
+    // eb.out into a view of it: a single intra-backend memcpy that stays off
+    // the host. Subsequent graphs read cc->enc_out.tensor directly.
+    const int d_enc_g = cm->hparams.enc_d_model;
+    const int T_enc_g = n_mel_frames / 2;
+    const int attn_pad_g =
+        cc->encoder_use_flash && cm->plan.primary_kind == transcribe::BackendKind::Metal ? k_enc_attn_pad : 0;
+    if (cc->enc_out.tensor == nullptr || cc->enc_out.d_model != d_enc_g || cc->enc_out.T_enc != T_enc_g ||
+        cc->enc_out.attn_pad != attn_pad_g) {
+        if (!enc_out_init(cc->enc_out, cm->plan.primary, d_enc_g, T_enc_g, attn_pad_g)) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper run: enc_out_init failed");
+            return TRANSCRIBE_ERR_OOM;
+        }
+    }
+
+    EncoderBuild eb =
+        build_encoder_graph(cc->compute_ctx, cm->weights, cm->hparams, n_mel_frames, cc->encoder_use_flash,
+                            cc->enc_out.attn_k, cc->enc_out.attn_v, cm->backend.c_str());
     if (eb.mel_in == nullptr || eb.out == nullptr || eb.graph == nullptr) {
         return TRANSCRIBE_ERR_GGUF;
     }
-
-    // Backend-resident encoder output: allocate the persistent F32 tensor once
-    // (re-allocate on T_enc / d_model change), then append a ggml_cpy from
-    // eb.out into a view of it — a single intra-backend memcpy that stays off
-    // the host. Subsequent graphs read cc->enc_out.tensor directly.
-    {
-        const int d_enc_g = static_cast<int>(eb.out->ne[0]);
-        const int T_enc_g = static_cast<int>(eb.out->ne[1]);
-        if (cc->enc_out.tensor == nullptr || cc->enc_out.d_model != d_enc_g || cc->enc_out.T_enc != T_enc_g) {
-            if (!enc_out_init(cc->enc_out, cm->plan.primary, d_enc_g, T_enc_g)) {
-                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "whisper run: enc_out_init failed");
-                return TRANSCRIBE_ERR_OOM;
-            }
-        }
-        ggml_tensor * enc_out_view =
-            ggml_view_2d(cc->compute_ctx, cc->enc_out.tensor, d_enc_g, T_enc_g, cc->enc_out.tensor->nb[1], 0);
-        ggml_build_forward_expand(eb.graph, ggml_cpy(cc->compute_ctx, eb.out, enc_out_view));
-    }
+    ggml_tensor * enc_out_view =
+        ggml_view_2d(cc->compute_ctx, cc->enc_out.tensor, d_enc_g, T_enc_g, cc->enc_out.tensor->nb[1], 0);
+    ggml_build_forward_expand(eb.graph, ggml_cpy(cc->compute_ctx, eb.out, enc_out_view));
     cc->perf.enc_build.add(ggml_time_us() - t_enc_build_start);
 
     // Allocate + compute encoder graph.
