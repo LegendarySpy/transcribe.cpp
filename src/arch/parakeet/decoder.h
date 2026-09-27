@@ -202,6 +202,13 @@ struct TdtToken {
     int   duration_frames = 0;
 };
 
+// Predictor position at a TDT frame's first zero-duration emission, kept to
+// rewind a frame that gets stuck looping.
+struct FrameStart {
+    LstmState state;
+    int       last_token = -1;
+};
+
 // One greedy decode position: predictor state, frame cursor, and the
 // tokens a fork branch holds back until it is resolved.
 struct GreedyCursor {
@@ -211,6 +218,7 @@ struct GreedyCursor {
     int                   step        = 0;
     int                   new_symbols = 0;
     bool                  dirty       = true;  // next_state needs a predictor step
+    FrameStart            frame;
     std::vector<TdtToken> held;
 };
 

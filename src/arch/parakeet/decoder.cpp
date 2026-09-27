@@ -1009,12 +1009,13 @@ float token_confidence(const float * token_logits, int n_token_classes, std::vec
     return static_cast<float>(1.0 - entropy / max_entropy);
 }
 
-// A TDT frame that emits max_symbols tokens without advancing is stuck.
-// When the tokens it emitted end in a repeating block, keep one copy
-// (transcribe-repetition-guard.h); the forced advance then moves on.
-void trim_stuck_frame(std::vector<TdtToken> & toks, int step, int max_symbols) {
+// A TDT frame that emits max_symbols tokens without advancing is stuck. When
+// its tokens end in a repeating block the model is looping: drop the loop
+// from its first token (transcribe-repetition-guard.h). Returns true if
+// tokens were dropped.
+bool trim_stuck_frame(std::vector<TdtToken> & toks, int step, int max_symbols) {
     if (!repetition_guard_enabled()) {
-        return;
+        return false;
     }
     size_t start = toks.size();
     while (start > 0 && toks[start - 1].step_at_emit == step) {
@@ -1028,12 +1029,44 @@ void trim_stuck_frame(std::vector<TdtToken> & toks, int step, int max_symbols) {
     const RepeatBar bar   = { max_symbols / 2, 2, 0, max_symbols, 2 };
     const int       block = repeating_tail_block(ids.data(), n, bar);
     if (block == 0) {
-        return;
+        return false;
     }
-    const int kept = trim_repeating_tail(ids.data(), n, block);
-    toks.resize(start + static_cast<size_t>(kept));
-    log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "parakeet decoder: dropped %d tokens of a repeating %d-token block at frame %d",
-            n - kept, block, step);
+    int loop = n - 2 * block;
+    while (loop > 0 && ids[static_cast<size_t>(loop - 1)] == ids[static_cast<size_t>(loop - 1 + block)]) {
+        --loop;
+    }
+    toks.resize(start + static_cast<size_t>(loop));
+    log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "parakeet decoder: dropped a %d-token loop (%d tokens) at frame %d", block,
+            n - loop, step);
+    return true;
+}
+
+// Rewinds the predictor after trim_stuck_frame: replays the frame's kept
+// tokens from where the frame started, so the next frame decodes as if the
+// loop never happened. Returns false if a predictor step fails.
+bool rewind_stuck_frame(const HostPredictor &         predictor,
+                        PredGraph &                   pg,
+                        const std::vector<TdtToken> & toks,
+                        int                           step,
+                        const FrameStart &            frame,
+                        LstmState &                   state,
+                        int &                         last_token,
+                        LstmState &                   scratch_state,
+                        std::vector<float> &          scratch_x) {
+    size_t start = toks.size();
+    while (start > 0 && toks[start - 1].step_at_emit == step) {
+        --start;
+    }
+    state      = frame.state;
+    last_token = frame.last_token;
+    for (size_t i = start; i < toks.size(); ++i) {
+        if (predictor_step_ggml(predictor, pg, last_token, state, scratch_state, scratch_x) == nullptr) {
+            return false;
+        }
+        std::swap(state, scratch_state);
+        last_token = toks[i].id;
+    }
+    return true;
 }
 
 // Greedy TDT / RNN-T decode with phrase boosting (boost.h). The step rules
@@ -1113,8 +1146,9 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
     };
 
     // Emit `tok` (blank = none) for `c` from the last evaluated joint output
-    // and advance its frame cursor with the unboosted loops' rules.
-    auto commit = [&](GreedyCursor & c, int tok, std::vector<TdtToken> & dst) {
+    // and advance its frame cursor with the unboosted loops' rules. Returns
+    // false if a predictor step fails.
+    auto commit = [&](GreedyCursor & c, int tok, std::vector<TdtToken> & dst) -> bool {
         const bool is_blank = tok == blank_id;
         const int  duration =
             tdt ? w.tdt_durations[static_cast<size_t>(argmax_range(logits.data() + n_token_cls, n_dur))] : 1;
@@ -1124,6 +1158,10 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
             t.p               = token_confidence(logits.data(), n_token_cls, scratch_probs);
             t.step_at_emit    = frame_offset + c.step;
             t.duration_frames = duration;
+            if (tdt && duration == 0 && (dst.empty() || dst.back().step_at_emit != t.step_at_emit)) {
+                c.frame.state      = c.state;
+                c.frame.last_token = c.last_token;
+            }
             dst.push_back(t);
             c.last_token = tok;
             std::swap(c.state, c.next_state);
@@ -1137,14 +1175,20 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
                 c.step += 1;
                 c.new_symbols = 0;
             }
-            return;
+            return true;
         }
         c.step += duration;
         c.new_symbols += 1;
         if (duration != 0) {
             c.new_symbols = 0;
         } else if (w.tdt_max_symbols > 0 && c.new_symbols >= w.tdt_max_symbols) {
-            trim_stuck_frame(dst, frame_offset + c.step, w.tdt_max_symbols);
+            if (trim_stuck_frame(dst, frame_offset + c.step, w.tdt_max_symbols)) {
+                if (!rewind_stuck_frame(w.predictor, pg, dst, frame_offset + c.step, c.frame, c.state, c.last_token,
+                                        c.next_state, scratch_x)) {
+                    return false;
+                }
+                c.dirty = true;
+            }
             c.step += 1;
             c.new_symbols = 0;
         } else if (is_blank && w.tdt_max_symbols > 0) {
@@ -1155,6 +1199,7 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
                 c.new_symbols = 0;
             }
         }
+        return true;
     };
 
     // A completed phrase is checked for derailment first: both branches run
@@ -1189,7 +1234,9 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
             const int u = argmax_range(logits.data(), n_token_cls);
             const int b = u == blank_id ? u : trie.pick(bs.node, logits.data(), n_token_cls, u, false);
             if (b == u) {
-                commit(main, u, out);
+                if (!commit(main, u, out)) {
+                    return TRANSCRIBE_ERR_BACKEND;
+                }
                 if (u != blank_id) {
                     bs.node = trie.next(bs.node, u);
                 }
@@ -1198,8 +1245,12 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
             ++n_forks;
             bs.plain   = main;
             bs.boosted = main;
-            commit(bs.plain, u, bs.plain.held);
-            commit(bs.boosted, b, bs.boosted.held);
+            if (!commit(bs.plain, u, bs.plain.held)) {
+                return TRANSCRIBE_ERR_BACKEND;
+            }
+            if (!commit(bs.boosted, b, bs.boosted.held)) {
+                return TRANSCRIBE_ERR_BACKEND;
+            }
             bs.fork_open   = true;
             bs.fork_node   = bs.node;
             bs.fork_tokens = 1;
@@ -1228,7 +1279,9 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
             }
             const int u    = argmax_range(logits.data(), n_token_cls);
             const int from = c.step;
-            commit(c, u, c.held);
+            if (!commit(c, u, c.held)) {
+                return TRANSCRIBE_ERR_BACKEND;
+            }
             if (u != blank_id && from >= bs.guard_from &&
                 (trie.token_flags[static_cast<size_t>(u)] & k_boost_token_word) != 0) {
                 ++(&c == &a ? bs.guard_plain : bs.guard_boosted);
@@ -1254,12 +1307,16 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
         }
         const int u = argmax_range(logits.data(), n_token_cls);
         if (step_plain) {
-            commit(a, u, a.held);
+            if (!commit(a, u, a.held)) {
+                return TRANSCRIBE_ERR_BACKEND;
+            }
             continue;
         }
         const int tok    = u == blank_id ? u : trie.pick(bs.fork_node, logits.data(), n_token_cls, u, true);
         const int b_from = b.step;
-        commit(b, tok, b.held);
+        if (!commit(b, tok, b.held)) {
+            return TRANSCRIBE_ERR_BACKEND;
+        }
         if (tok == blank_id) {
             continue;
         }
@@ -1387,9 +1444,10 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
     std::vector<float> scratch_probs;
     std::vector<float> logits;
 
-    int last_token  = -1;  // sentinel: no previous token (start state)
-    int step        = 0;
-    int new_symbols = 0;
+    int        last_token  = -1;  // sentinel: no previous token (start state)
+    int        step        = 0;
+    int        new_symbols = 0;
+    FrameStart frame;
 
     // Runaway-protection cap; legitimate transcriptions never approach it.
     const int max_iters = 16 * T_enc + 1024;
@@ -1469,6 +1527,10 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
             tok.p               = p;
             tok.step_at_emit    = step;
             tok.duration_frames = duration;
+            if (duration == 0 && (out_tokens.empty() || out_tokens.back().step_at_emit != step)) {
+                frame.state      = state;
+                frame.last_token = last_token;
+            }
             out_tokens.push_back(tok);
 
             last_token = pred_token;
@@ -1487,7 +1549,13 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
         if (duration != 0) {
             new_symbols = 0;
         } else if (w.tdt_max_symbols > 0 && new_symbols >= w.tdt_max_symbols) {
-            trim_stuck_frame(out_tokens, step, w.tdt_max_symbols);
+            if (trim_stuck_frame(out_tokens, step, w.tdt_max_symbols)) {
+                if (!rewind_stuck_frame(w.predictor, pg, out_tokens, step, frame, state, last_token, next_state,
+                                        scratch_x)) {
+                    return TRANSCRIBE_ERR_BACKEND;
+                }
+                predictor_dirty = true;
+            }
             step += 1;
             new_symbols = 0;
         } else if (is_blank && w.tdt_max_symbols > 0) {
