@@ -1078,8 +1078,9 @@ bool rewind_stuck_frame(const HostPredictor &         predictor,
 // branch's next trie transition (see BoostTrie::fork_advance), after
 // k_boost_fork_tokens tokens (reject), or at the end of the frames when
 // `end_of_audio` (reject unless a phrase completed). A completed phrase is
-// kept only if the deletion check below passes. An open fork otherwise
-// stays in `bs` for the next call, frames rebased to 0.
+// kept only if it ends at a word edge and the deletion check below passes.
+// An open fork otherwise stays in `bs` for the next call, frames rebased
+// to 0.
 transcribe_status decode_boosted(const HostDecoderWeights & w,
                                  const float *              enc_out,
                                  int                        T_enc,
@@ -1210,6 +1211,7 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
         bs.guard_until   = bs.boosted.step + k_boost_guard_frames;
         bs.guard_plain   = 0;
         bs.guard_boosted = 0;
+        bs.guard_next    = false;
     };
 
     auto resolve = [&](bool accept) {
@@ -1286,6 +1288,13 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
                 (trie.token_flags[static_cast<size_t>(u)] & k_boost_token_word) != 0) {
                 ++(&c == &a ? bs.guard_plain : bs.guard_boosted);
             }
+            // A phrase glued onto the next word piece is not the phrase.
+            if (&c == &b && u != blank_id && !bs.guard_next) {
+                bs.guard_next = true;
+                if ((trie.token_flags[static_cast<size_t>(u)] & k_boost_token_glue) != 0) {
+                    resolve(false);
+                }
+            }
             continue;
         }
         const bool a_live = a.step < T_enc;
@@ -1326,6 +1335,7 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
         }
         if (verdict == BoostVerdict::Accept) {
             start_guard();
+            bs.guard_next = trie.nodes[static_cast<size_t>(bs.fork_node)].n_children > 0;  // left the match
             // The token that left the match sits at guard_from; the plain
             // branch's copy of it is counted, so count this one too.
             if (b_from >= bs.guard_from && (trie.token_flags[static_cast<size_t>(tok)] & k_boost_token_word) != 0) {

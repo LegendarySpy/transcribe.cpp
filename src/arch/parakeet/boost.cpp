@@ -118,7 +118,8 @@ BoostVerdict BoostTrie::fork_begin(int & node, bool & completed, int tok) const 
 BoostVerdict BoostTrie::fork_advance(int & node, bool & completed, int tok) const {
     const int c = child(node, tok);
     if (c < 0) {
-        return completed ? BoostVerdict::Accept : BoostVerdict::Reject;
+        const bool glued = (token_flags[static_cast<size_t>(tok)] & k_boost_token_glue) != 0;
+        return completed && !glued ? BoostVerdict::Accept : BoostVerdict::Reject;
     }
     node           = c;
     const Node & n = nodes[static_cast<size_t>(c)];

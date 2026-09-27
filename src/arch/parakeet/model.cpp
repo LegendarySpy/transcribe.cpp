@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -782,7 +783,10 @@ static void compile_boost(ParakeetSession * pc, const ParakeetModel * pm, const 
     for (int id = 0; id < n_cls; ++id) {
         const bool special = id == pm->host_decoder.blank_id || id == tok.unk_id() || is_strippable_special(tok, id);
         const bool word    = tok.token(id).compare(0, 3, "\xE2\x96\x81") == 0;
-        flags[static_cast<size_t>(id)] = (special ? k_boost_token_special : 0) | (word ? k_boost_token_word : 0);
+        const unsigned char c0   = tok.token(id).empty() ? 0 : static_cast<unsigned char>(tok.token(id)[0]);
+        const bool          glue = !special && !word && (std::isalnum(c0) != 0 || c0 >= 0x80);
+        flags[static_cast<size_t>(id)] =
+            (special ? k_boost_token_special : 0) | (word ? k_boost_token_word : 0) | (glue ? k_boost_token_glue : 0);
     }
 
     std::vector<std::vector<int32_t>> seqs;
@@ -3577,7 +3581,7 @@ extern "C" void transcribe_parakeet_run_ext_init(struct transcribe_parakeet_run_
     std::memset(p, 0, sizeof(*p));
     p->ext.size    = sizeof(*p);
     p->ext.kind    = TRANSCRIBE_EXT_KIND_PARAKEET_RUN;
-    p->boost_score = 2.0f;
+    p->boost_score = 3.0f;
 }
 
 extern "C" void transcribe_parakeet_buffered_stream_ext_init(struct transcribe_parakeet_buffered_stream_ext * p) {

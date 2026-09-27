@@ -120,17 +120,17 @@ CLI surface. Other Parakeet variants run offline only.
 **Phrase boosting** (TDT and RNN-T heads, offline and streaming) favors
 caller-listed words and names such as product names or people, as typed:
 `struct transcribe_parakeet_run_ext` in the run slot (`boost_phrases`,
-`boost_score`, default 2.0), or `--boost FILE --boost-score F` on the
+`boost_score`, default 3.0), or `--boost FILE --boost-score F` on the
 CLI. The phrases are tokenized with the model's SentencePiece vocabulary
 into a trie scored like NeMo's GPU phrase boosting. Greedy decoding keeps
 the model's blank decisions; a listed token may replace the model's choice
-only if its unboosted probability is at least 1e-3, and the swap is kept
-only when it completes a listed phrase and the decode keeps emitting speech
-for half a second after it (the decode forks and verifies both). An empty list or
-`boost_score = 0` gives output identical to no extension. On
-parakeet-tdt-0.6b-v3 with a 34-name list, recall of the names in 117
-synthetic English sentences went from 37.6% to 62.4%, with no false
-insertions on control sentences.
+only if its unboosted probability is at least 1e-5, and the swap is kept
+only when it completes a listed phrase as whole words and the decode keeps
+emitting speech for half a second after it (the decode forks and verifies
+both). An empty list or `boost_score = 0` gives output identical to no
+extension. On parakeet-tdt-0.6b-v3 with a 4-name list, recall of the names
+in 76 real dictations went from 44% to 80% (1e-3 floor and weight 2.0
+before), with one false insertion across 797 control dictations.
 
 What's not supported (consistent across the family): translation,
 VAD, speaker diarization. Language coverage is English-only except

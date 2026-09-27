@@ -25,13 +25,14 @@ namespace transcribe::parakeet {
 
 constexpr float k_boost_c0           = 1.0f;   // NeMo context_score
 constexpr float k_boost_beta         = 2.0f;   // NeMo depth_scaling for TDT / RNN-T
-constexpr float k_boost_floor        = 1e-3f;  // min unboosted probability of a swapped-in token
+constexpr float k_boost_floor        = 1e-5f;  // min unboosted probability of a swapped-in token
 constexpr int   k_boost_fork_tokens  = 24;     // boosted branch token budget before rejection
 constexpr int   k_boost_guard_frames = 6;      // deletion check after a completed phrase (~0.5 s)
 
 // BoostTrie::token_flags bits.
 constexpr uint8_t k_boost_token_special = 1;  // never swapped from or into (blank, unk, control, tags)
 constexpr uint8_t k_boost_token_word    = 2;  // starts a word (leading U+2581)
+constexpr uint8_t k_boost_token_glue    = 4;  // continues a word (letter or digit, no U+2581)
 
 enum class BoostVerdict { Continue, Accept, Reject };
 
@@ -74,7 +75,7 @@ struct BoostTrie {
 
     // The branch emitted `tok`. Continue while it extends the match; a
     // token that leaves the match accepts a completed branch and rejects
-    // an unfinished one.
+    // an unfinished one or one the token glues onto (a phrase is whole words).
     BoostVerdict fork_advance(int & node, bool & completed, int tok) const;
 };
 

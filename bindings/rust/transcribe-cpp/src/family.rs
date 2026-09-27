@@ -50,7 +50,7 @@ pub struct WhisperRunOptions {
 
 /// Parakeet phrase boosting (run slot; also applied by `stream`). Phrases
 /// are matched as typed (casing matters). `boost_score: None` keeps the
-/// library default (2.0); an empty list disables boosting.
+/// library default (3.0); an empty list disables boosting.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParakeetRunOptions {
     pub boost_phrases: Vec<String>,

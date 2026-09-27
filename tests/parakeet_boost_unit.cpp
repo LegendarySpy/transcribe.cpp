@@ -108,20 +108,28 @@ void test_pick() {
     })
                      .data(),
                  k_n_cls, k_u, false) == k_u);
-    // Floor: z = 2 is far below p = 1e-3 (the floor sits near 10 - 6.9).
+    // Floor: after token 10, z = -3 is below p = 1e-5 (the floor sits near
+    // 10 - 11.5) and z = -1 is above it.
     const BoostTrie strong = make_trie(10.0f);
-    CHECK(strong.pick(0,
+    const int       s10    = strong.child(0, 10);
+    CHECK(strong.pick(s10,
                       logits_with({
-                                      { 10, 2.0f }
+                                      { 10, -20.0f },
+                                      { 11, -3.0f  },
+                                      { 13, -20.0f },
+                                      { 20, -20.0f }
     })
                           .data(),
                       k_n_cls, k_u, false) == k_u);
-    CHECK(strong.pick(0,
+    CHECK(strong.pick(s10,
                       logits_with({
-                                      { 10, 4.0f }
+                                      { 10, -20.0f },
+                                      { 11, -1.0f  },
+                                      { 13, -20.0f },
+                                      { 20, -20.0f }
     })
                           .data(),
-                      k_n_cls, k_u, false) == 10);
+                      k_n_cls, k_u, false) == 11);
     // A special model token is never swapped away from.
     {
         std::vector<float> z = logits_with({

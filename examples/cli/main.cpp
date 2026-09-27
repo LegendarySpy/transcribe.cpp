@@ -258,7 +258,7 @@ struct cli_args {
 
     // Parakeet phrase boosting. Ignored by other families and CTC heads.
     std::vector<std::string> boost_phrases;       // --boost FILE (one phrase per line)
-    float                    boost_score = 2.0f;  // --boost-score F
+    float                    boost_score = 3.0f;  // --boost-score F
     bool                     boost_set   = false;
 
     // Canary family knobs. Ignored by non-Canary families.
@@ -336,7 +336,7 @@ void print_usage(const char * argv0) {
                  "  --condition-on-prev-tokens (whisper) carry prev-chunk tokens across chunks\n"
                  "  --prompt-condition T  (whisper) prompt placement: first|all (default: first)\n"
                  "  --boost FILE          (parakeet) phrases to boost, one per line\n"
-                 "  --boost-score F       (parakeet) boost weight (default 2.0, 0 = off)\n"
+                 "  --boost-score F       (parakeet) boost weight (default 3.0, 0 = off)\n"
                  "  --itn                 (sensevoice/funasr-nano) enable inverse text\n"
                  "                        normalization (sensevoice: on unless --no-itn)\n"
                  "  --no-itn              (sensevoice/funasr-nano) emit the upstream\n"

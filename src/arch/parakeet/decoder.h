@@ -241,6 +241,7 @@ struct BoostDecodeState {
     int          guard_until    = -1;
     int          guard_plain    = 0;
     int          guard_boosted  = 0;
+    bool         guard_next     = false;  // boosted branch emitted a token after the phrase
 };
 
 // Run TDT greedy decode end-to-end against an encoder output buffer.
