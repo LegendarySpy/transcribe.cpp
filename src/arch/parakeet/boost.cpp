@@ -108,6 +108,22 @@ int BoostTrie::pick(int node, const float * logits, int n_classes, int u, bool c
     return best;
 }
 
+float BoostTrie::advance(int & node, int tok) const {
+    const Node & n   = nodes[static_cast<size_t>(node)];
+    float        acc = 0.0f;
+    for (int f = node;; f = nodes[static_cast<size_t>(f)].fail) {
+        const int c = child(f, tok);
+        if (c >= 0 || f == 0) {
+            if (f != node && n.end && (token_flags[static_cast<size_t>(tok)] & k_boost_token_glue) != 0) {
+                acc -= n.score;
+            }
+            node = std::max(c, 0);
+            return acc + (c >= 0 ? nodes[static_cast<size_t>(c)].arc : 0.0f);
+        }
+        acc += nodes[static_cast<size_t>(f)].backoff;
+    }
+}
+
 BoostVerdict BoostTrie::fork_begin(int & node, bool & completed, int tok) const {
     node           = next(node, tok);
     const Node & n = nodes[static_cast<size_t>(node)];
@@ -185,6 +201,7 @@ void build_boost_trie(const std::vector<std::vector<int32_t>> & phrases,
         n.first_child       = static_cast<int32_t>(out.child_tok.size());
         n.n_children        = static_cast<int32_t>(e.size());
         n.arc               = arc[v];
+        n.score             = score[v];
         n.end               = end[v] != 0;
         for (const auto & te : e) {
             out.child_tok.push_back(te.first);
