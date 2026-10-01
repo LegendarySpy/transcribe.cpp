@@ -1008,10 +1008,9 @@ int argmax_range(const float * data, int n) {
 //     confidence  = 1 - entropy / max_entropy
 //
 // In our terms `vocab_size + 1 == pred_vocab == n_token_classes`.
-// The result lives in [0, 1] modulo the +1e-10 epsilon (which
-// matches the reference verbatim, including its slight
-// negative-bias for nearly-uniform distributions).
-float token_confidence(const float * token_logits, int n_token_classes, std::vector<float> & scratch_probs) {
+// Computed in closed form without the +1e-10 epsilon, which moves the
+// result by well under 1e-6.
+float token_confidence(const float * token_logits, int n_token_classes) {
     // Numerically stable softmax: subtract max before exp.
     float max_logit = token_logits[0];
     for (int i = 1; i < n_token_classes; ++i) {
@@ -1019,22 +1018,17 @@ float token_confidence(const float * token_logits, int n_token_classes, std::vec
             max_logit = token_logits[i];
         }
     }
-    if (static_cast<int>(scratch_probs.size()) < n_token_classes) {
-        scratch_probs.resize(static_cast<size_t>(n_token_classes));
-    }
+    // With e_i = exp(x_i - max) and S = sum e_i, log p_i = (x_i - max) - log S,
+    // so entropy = log S - sum e_i (x_i - max) / S: one exp per class, no log.
     double sum_exp = 0.0;
+    double sum_ex  = 0.0;
     for (int i = 0; i < n_token_classes; ++i) {
-        const float e                         = std::exp(token_logits[i] - max_logit);
-        scratch_probs[static_cast<size_t>(i)] = e;
+        const float x = token_logits[i] - max_logit;
+        const float e = std::exp(x);
         sum_exp += static_cast<double>(e);
+        sum_ex += static_cast<double>(e * x);
     }
-    const float inv_sum = static_cast<float>(1.0 / sum_exp);
-    double      entropy = 0.0;
-    for (int i = 0; i < n_token_classes; ++i) {
-        const float p = scratch_probs[static_cast<size_t>(i)] * inv_sum;
-        // +1e-10 matches the reference.
-        entropy -= static_cast<double>(p) * std::log(static_cast<double>(p) + 1e-10);
-    }
+    const double entropy     = std::log(sum_exp) - sum_ex / sum_exp;
     const double max_entropy = std::log(static_cast<double>(n_token_classes));
     if (max_entropy <= 0.0) {
         return 1.0f;
@@ -1148,7 +1142,6 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
     }
 
     std::vector<float> scratch_x;
-    std::vector<float> scratch_probs;
     std::vector<float> logits;
 
     // Two cursors may run over the same frames while a fork is open.
@@ -1189,7 +1182,7 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
         if (!is_blank) {
             TdtToken t;
             t.id              = tok;
-            t.p               = token_confidence(logits.data(), n_token_cls, scratch_probs);
+            t.p               = token_confidence(logits.data(), n_token_cls);
             t.step_at_emit    = frame_offset + c.step;
             t.duration_frames = duration;
             if (tdt && duration == 0 && (dst.empty() || dst.back().step_at_emit != t.step_at_emit)) {
@@ -1803,7 +1796,6 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
 
     // Per-call scratch reused across every decode step.
     std::vector<float> scratch_x;
-    std::vector<float> scratch_probs;
     std::vector<float> logits;
 
     int        last_token  = -1;  // sentinel: no previous token (start state)
@@ -1882,7 +1874,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
         const bool is_blank = (pred_token == blank_id);
         if (!is_blank) {
             const int64_t tc0 = ggml_time_us();
-            const float   p   = token_confidence(token_logits, n_token_cls, scratch_probs);
+            const float   p   = token_confidence(token_logits, n_token_cls);
             t_conf_us += ggml_time_us() - tc0;
             TdtToken tok;
             tok.id              = pred_token;
@@ -2031,7 +2023,6 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
     const int64_t t_enc_proj_us = ggml_time_us() - t_enc_proj_start;
 
     std::vector<float> scratch_x;
-    std::vector<float> scratch_probs;
     std::vector<float> logits;
 
     int last_token  = -1;
@@ -2096,7 +2087,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
             new_symbols = 0;
         } else {
             const int64_t tc0 = ggml_time_us();
-            const float   p   = token_confidence(token_logits, n_token_cls, scratch_probs);
+            const float   p   = token_confidence(token_logits, n_token_cls);
             t_conf_us += ggml_time_us() - tc0;
             TdtToken tok;
             tok.id              = pred_token;
@@ -2235,7 +2226,6 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
     next_state.reset(n_layers, H);
 
     std::vector<float> scratch_x;
-    std::vector<float> scratch_probs;
     std::vector<float> logits;
 
     int last_token  = last_token_io;
@@ -2274,7 +2264,7 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
             step += 1;
             new_symbols = 0;
         } else {
-            const float p = token_confidence(token_logits, n_token_cls, scratch_probs);
+            const float p = token_confidence(token_logits, n_token_cls);
             TdtToken    tok;
             tok.id              = pred_token;
             tok.p               = p;
