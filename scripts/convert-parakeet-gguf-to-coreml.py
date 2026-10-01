@@ -10,11 +10,18 @@ subsampling: the offline Parakeet variants and every Canary variant. Streaming
 
 The layers are split into chained programs (a Core ML pipeline) because the
 ANE compiler rejects one 1.2 GB program and silently runs it on the CPU.
+
+--extra-frames adds smaller fixed-shape functions to one int8 or palettized
+program (a macOS 15 multifunction model sharing the weights). The runtime runs
+short audio on the smallest function that holds it: the ANE handles up to 128
+encoder frames (10.24 s) about twice as fast as the 188 of a 15 s window.
 """
 
 import argparse
 import hashlib
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import coremltools as ct
@@ -32,6 +39,39 @@ from coremltools.optimize.coreml import (
 
 # Stored FP16 weight bytes per pipeline stage; 0.6B encoders get four stages.
 STAGE_BYTES = 320_000_000
+
+
+def convert_functions(
+    source: Path, output: Path, frames: list[int], bits: int, int8: bool
+):
+    """One multifunction model: "main" holds frames[0], frames_<n> the rest."""
+    desc = ct.utils.MultiFunctionDescriptor()
+    names = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for n in frames:
+            path = Path(tmp) / f"{n}.mlpackage"
+            convert(source, path, n, 1, bits, int8)
+            name = f"frames_{n}" if names else "main"
+            desc.add_function(
+                str(path), src_function_name="main", target_function_name=name
+            )
+            names.append(name)
+        metadata = dict(
+            ct.models.MLModel(
+                str(Path(tmp) / f"{frames[0]}.mlpackage"), skip_model_load=True
+            ).user_defined_metadata
+        )
+        desc.default_function_name = "main"
+        combined = Path(tmp) / "combined.mlpackage"
+        ct.utils.save_multifunction(desc, str(combined))
+        model = ct.models.MLModel(str(combined), skip_model_load=True)
+        model.user_defined_metadata.update(metadata)
+        model.user_defined_metadata["transcribe.functions"] = ",".join(names[1:])
+        if output.exists():
+            shutil.rmtree(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        model.save(str(output))
+    print("Saved", output, flush=True)
 
 
 def convert(
@@ -343,6 +383,14 @@ def main():
         help="Store weights as per-channel int8; closer to FP16 than 8-bit palettes",
     )
     parser.add_argument(
+        "--extra-frames",
+        type=int,
+        nargs="*",
+        default=[],
+        help="Smaller capacities as extra functions of one program, e.g. 1024 "
+        "(10.24 seconds); needs --int8 or --palettize-bits",
+    )
+    parser.add_argument(
         "--compile",
         action="store_true",
         help="Compile the package with Xcode's coremlcompiler",
@@ -354,14 +402,24 @@ def main():
         parser.error("--max-frames must be at least 9")
     if args.int8 and args.palettize_bits:
         parser.error("--int8 and --palettize-bits are exclusive")
-    convert(
-        args.gguf,
-        args.output,
-        args.max_frames,
-        args.stages,
-        args.palettize_bits,
-        args.int8,
-    )
+    if args.extra_frames:
+        if not (args.int8 or args.palettize_bits) or args.stages > 1:
+            parser.error("--extra-frames needs one --int8 or --palettize-bits program")
+        if any(n < 9 or n >= args.max_frames for n in args.extra_frames):
+            parser.error("--extra-frames must be at least 9 and below --max-frames")
+        frames = [args.max_frames, *sorted(set(args.extra_frames), reverse=True)]
+        convert_functions(
+            args.gguf, args.output, frames, args.palettize_bits, args.int8
+        )
+    else:
+        convert(
+            args.gguf,
+            args.output,
+            args.max_frames,
+            args.stages,
+            args.palettize_bits,
+            args.int8,
+        )
     if args.compile:
         subprocess.run(
             [
