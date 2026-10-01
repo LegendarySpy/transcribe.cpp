@@ -444,6 +444,40 @@ static void free_cpu_threadpool(ggml_backend_t backend, ggml_threadpool_t tp) {
     }
 }
 
+// One LSTM cell as a single graph node: dst = [h'; c'] from the gate
+// matmuls src[0] = Wx@x and src[1] = Wh@h_prev, bias src[2] and c_prev
+// src[3], gates in PyTorch [i, f, g, o] order. As separate ggml ops the
+// pointwise math took ~15 nodes per layer, each a thread barrier.
+void lstm_cell(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) nth;
+    (void) userdata;
+    if (ith != 0) {
+        return;
+    }
+    const auto * gx    = static_cast<const float *>(dst->src[0]->data);
+    const auto * gh    = static_cast<const float *>(dst->src[1]->data);
+    const auto * b     = static_cast<const float *>(dst->src[2]->data);
+    const auto * c     = static_cast<const float *>(dst->src[3]->data);
+    const int    H     = static_cast<int>(dst->src[3]->ne[0]);
+    auto *       h_out = static_cast<float *>(dst->data);
+    float *      c_out = h_out + H;
+    auto         gate  = [&](int k, int j) {
+        const int r = k * H + j;
+        return (gx[r] + gh[r]) + b[r];
+    };
+    auto sigmoid = [](float v) {
+        return 1.0f / (1.0f + std::exp(-v));
+    };
+    for (int j = 0; j < H; ++j) {
+        const float i_ = sigmoid(gate(0, j));
+        const float f_ = sigmoid(gate(1, j));
+        const float g_ = std::tanh(gate(2, j));
+        const float o_ = sigmoid(gate(3, j));
+        c_out[j]       = f_ * c[j] + i_ * g_;
+        h_out[j]       = o_ * std::tanh(c_out[j]);
+    }
+}
+
 // Per-call predictor LSTM graph (the mutable half of the predictor):
 // a single per-step graph built fresh per decode call around the
 // model-resident HostPredictor::lstm weights, recomputed in place each
@@ -556,8 +590,8 @@ bool build_pred_graph(PredGraph & g, const HostPredictor & p, int n_threads) {
     }
 
     ggml_init_params ip{};
-    // ~17 op nodes/layer + (1 + 2L) input tensors; generous headroom.
-    ip.mem_size   = ggml_tensor_overhead() * static_cast<size_t>(32 * L + 16) + ggml_graph_overhead();
+    // 5 nodes/layer + (1 + 2L) input tensors; generous headroom.
+    ip.mem_size   = ggml_tensor_overhead() * static_cast<size_t>(16 * L + 16) + ggml_graph_overhead();
     ip.mem_buffer = nullptr;
     ip.no_alloc   = true;
     g.ctx         = ggml_init(ip);
@@ -579,26 +613,16 @@ bool build_pred_graph(PredGraph & g, const HostPredictor & p, int n_threads) {
     }
 
     // gates = Wx@x + Wh@h_prev + b; split [i,f,g,o]; c' = f*c + i*g; h' = o*tanh(c').
-    // Gate order [i, f, g, o] (PyTorch standard).
     ggml_tensor * in = g.x;
     for (int l = 0; l < L; ++l) {
-        const auto &  lh = p.lstm[static_cast<size_t>(l)];
-        ggml_tensor * gates =
-            ggml_add(g.ctx, ggml_add(g.ctx, ggml_mul_mat(g.ctx, lh.g_Wx, in), ggml_mul_mat(g.ctx, lh.g_Wh, g.ph[l])),
-                     lh.g_b);  // [4H]
-        auto part = [&](int k) {
-            return ggml_view_1d(g.ctx, gates, H,
-                                static_cast<size_t>(k) * static_cast<size_t>(H) * ggml_element_size(gates));
-        };
-        ggml_tensor * i_ = ggml_sigmoid(g.ctx, part(0));
-        ggml_tensor * f_ = ggml_sigmoid(g.ctx, part(1));
-        ggml_tensor * gg = ggml_tanh(g.ctx, part(2));
-        ggml_tensor * o_ = ggml_sigmoid(g.ctx, part(3));
-        g.nc[l]          = ggml_add(g.ctx, ggml_mul(g.ctx, f_, g.pc[l]), ggml_mul(g.ctx, i_, gg));
-        ggml_set_output(g.nc[l]);
-        g.nh[l] = ggml_mul(g.ctx, o_, ggml_tanh(g.ctx, g.nc[l]));
-        ggml_set_output(g.nh[l]);
-        in = g.nh[l];
+        const auto &  lh     = p.lstm[static_cast<size_t>(l)];
+        ggml_tensor * args[] = { ggml_mul_mat(g.ctx, lh.g_Wx, in), ggml_mul_mat(g.ctx, lh.g_Wh, g.ph[l]), lh.g_b,
+                                 g.pc[l] };
+        ggml_tensor * cell   = ggml_custom_4d(g.ctx, GGML_TYPE_F32, 2 * H, 1, 1, 1, args, 4, lstm_cell, 1, nullptr);
+        ggml_set_output(cell);
+        g.nh[l] = ggml_view_1d(g.ctx, cell, H, 0);
+        g.nc[l] = ggml_view_1d(g.ctx, cell, H, static_cast<size_t>(H) * sizeof(float));
+        in      = g.nh[l];
     }
 
     g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, g.backend);
