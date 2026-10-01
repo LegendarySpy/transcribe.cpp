@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11,<3.14"
-# dependencies = ["coremltools==9.0", "gguf>=0.17", "numpy>=1.26"]
+# dependencies = ["coremltools==9.0", "gguf>=0.17", "numpy>=1.26", "scikit-learn"]
 # ///
 """Export a Parakeet or Canary FastConformer encoder from transcribe.cpp GGUF weights.
 
@@ -22,12 +22,17 @@ import gguf
 import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
+from coremltools.optimize.coreml import (
+    OpPalettizerConfig,
+    OptimizationConfig,
+    palettize_weights,
+)
 
 # Stored FP16 weight bytes per pipeline stage; 0.6B encoders get four stages.
 STAGE_BYTES = 320_000_000
 
 
-def convert(source: Path, output: Path, max_frames: int, stages: int):
+def convert(source: Path, output: Path, max_frames: int, stages: int, bits: int):
     r = gguf.GGUFReader(str(source))
     arch = r.fields["general.architecture"].contents()
     if arch not in ("parakeet", "canary"):
@@ -248,8 +253,9 @@ def convert(source: Path, output: Path, max_frames: int, stages: int):
         return x
 
     if stages <= 0:
-        # About 25 d^2 FP16 weights per block.
-        stages = max(1, -(-50 * d * d * layers // STAGE_BYTES))
+        # About 25 d^2 FP16 weights per block. A palettized 0.6B encoder
+        # (425 MB at 6 bits) compiles for the ANE as one program.
+        stages = 1 if bits else max(1, -(-50 * d * d * layers // STAGE_BYTES))
     bounds = [round(layers * s / stages) for s in range(stages + 1)]
     models = []
     for s in range(stages):
@@ -272,6 +278,9 @@ def convert(source: Path, output: Path, max_frames: int, stages: int):
             ],
             skip_model_load=True,
         )
+        if bits:
+            config = OpPalettizerConfig(mode="kmeans", nbits=bits)
+            model = palettize_weights(model, OptimizationConfig(global_config=config))
         spec = model.get_spec()
         ct.utils.rename_feature(spec, "x", f"hidden_{s - 1}" if s else "logmel_data")
         if not last:
@@ -309,6 +318,13 @@ def main():
         help="Chained Core ML programs (default: by encoder size)",
     )
     parser.add_argument(
+        "--palettize-bits",
+        type=int,
+        default=0,
+        choices=[0, 6, 8],
+        help="Store weights as per-tensor k-means lookup tables (default: FP16)",
+    )
+    parser.add_argument(
         "--compile",
         action="store_true",
         help="Compile the package with Xcode's coremlcompiler",
@@ -318,7 +334,7 @@ def main():
         parser.error("--output must end in .mlpackage")
     if args.max_frames < 9:
         parser.error("--max-frames must be at least 9")
-    convert(args.gguf, args.output, args.max_frames, args.stages)
+    convert(args.gguf, args.output, args.max_frames, args.stages, args.palettize_bits)
     if args.compile:
         subprocess.run(
             [
