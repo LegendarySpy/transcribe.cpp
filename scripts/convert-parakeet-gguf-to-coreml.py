@@ -23,8 +23,10 @@ import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 from coremltools.optimize.coreml import (
+    OpLinearQuantizerConfig,
     OpPalettizerConfig,
     OptimizationConfig,
+    linear_quantize_weights,
     palettize_weights,
 )
 
@@ -32,7 +34,9 @@ from coremltools.optimize.coreml import (
 STAGE_BYTES = 320_000_000
 
 
-def convert(source: Path, output: Path, max_frames: int, stages: int, bits: int):
+def convert(
+    source: Path, output: Path, max_frames: int, stages: int, bits: int, int8: bool
+):
     r = gguf.GGUFReader(str(source))
     arch = r.fields["general.architecture"].contents()
     if arch not in ("parakeet", "canary"):
@@ -134,7 +138,6 @@ def convert(source: Path, output: Path, max_frames: int, stages: int, bits: int)
             )
             if b is not None:
                 x = conv(x, f"enc.pre_encode.conv.{b}", [1, 1], [0, 0, 0, 0])
-            x = mb.relu(x=x)
             length = halve(length)
             mask = mb.less(x=np.arange(x.shape[2], dtype=np.int32), y=length)
             x = mb.mul(
@@ -143,6 +146,9 @@ def convert(source: Path, output: Path, max_frames: int, stages: int, bits: int)
                     x=mb.cast(x=mask, dtype="fp32"), shape=[1, 1, x.shape[2], 1]
                 ),
             )
+            # ReLU after the 0/1 mask (same result): directly after the first
+            # conv the ANE compiler places it on the CPU.
+            x = mb.relu(x=x)
         x = mb.reshape(
             x=mb.transpose(x=x, perm=[0, 2, 1, 3]),
             shape=[1, T, channels * ((mels + 7) // 8)],
@@ -253,9 +259,9 @@ def convert(source: Path, output: Path, max_frames: int, stages: int, bits: int)
         return x
 
     if stages <= 0:
-        # About 25 d^2 FP16 weights per block. A palettized 0.6B encoder
-        # (425 MB at 6 bits) compiles for the ANE as one program.
-        stages = 1 if bits else max(1, -(-50 * d * d * layers // STAGE_BYTES))
+        # About 25 d^2 FP16 weights per block. A palettized or int8 0.6B
+        # encoder (425 to 570 MB) compiles for the ANE as one program.
+        stages = 1 if bits or int8 else max(1, -(-50 * d * d * layers // STAGE_BYTES))
     bounds = [round(layers * s / stages) for s in range(stages + 1)]
     models = []
     for s in range(stages):
@@ -278,7 +284,14 @@ def convert(source: Path, output: Path, max_frames: int, stages: int, bits: int)
             ],
             skip_model_load=True,
         )
-        if bits:
+        if int8:
+            config = OpLinearQuantizerConfig(
+                mode="linear_symmetric", dtype="int8", granularity="per_channel"
+            )
+            model = linear_quantize_weights(
+                model, OptimizationConfig(global_config=config)
+            )
+        elif bits:
             config = OpPalettizerConfig(mode="kmeans", nbits=bits)
             model = palettize_weights(model, OptimizationConfig(global_config=config))
         spec = model.get_spec()
@@ -325,6 +338,11 @@ def main():
         help="Store weights as per-tensor k-means lookup tables (default: FP16)",
     )
     parser.add_argument(
+        "--int8",
+        action="store_true",
+        help="Store weights as per-channel int8; closer to FP16 than 8-bit palettes",
+    )
+    parser.add_argument(
         "--compile",
         action="store_true",
         help="Compile the package with Xcode's coremlcompiler",
@@ -334,7 +352,16 @@ def main():
         parser.error("--output must end in .mlpackage")
     if args.max_frames < 9:
         parser.error("--max-frames must be at least 9")
-    convert(args.gguf, args.output, args.max_frames, args.stages, args.palettize_bits)
+    if args.int8 and args.palettize_bits:
+        parser.error("--int8 and --palettize-bits are exclusive")
+    convert(
+        args.gguf,
+        args.output,
+        args.max_frames,
+        args.stages,
+        args.palettize_bits,
+        args.int8,
+    )
     if args.compile:
         subprocess.run(
             [
