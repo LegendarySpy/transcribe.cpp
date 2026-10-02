@@ -15,7 +15,8 @@
 //
 // The per-step LSTM and joint matmuls are n=1 GEMVs bound by memory
 // bandwidth, so their weights keep the GGUF's quantized type (the exact
-// stored values, a quarter of the fp32 bytes); fp32 otherwise.
+// stored values, a quarter of the fp32 bytes); fp32 otherwise and on
+// cache-aware streaming models (Nemotron).
 //
 // Memory cost: host + resident-ggml mirror of predictor + joint weights
 // (~35 MB v2, ~73 MB v3) vs the ~2.4 GB encoder. Built once in
