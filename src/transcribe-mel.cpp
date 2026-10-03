@@ -666,8 +666,8 @@ transcribe_status MelFrontend::compute(const float *        pcm,
         // only its nonzero span is visited, in the same 4-term groups as a
         // dense loop from bin 0: the skipped terms add exact zeros, so the
         // sums are unchanged.
-        const int        vec_end  = n_freq - 3;
-        const int        tail     = vec_end > 0 ? (vec_end + 3) / 4 * 4 : 0;
+        const int        vec_end = n_freq - 3;
+        const int        tail    = vec_end > 0 ? (vec_end + 3) / 4 * 4 : 0;
         std::vector<int> span_lo(static_cast<size_t>(n_mels), 0);
         std::vector<int> span_hi(static_cast<size_t>(n_mels), 0);
         for (int m = 0; m < n_mels; ++m) {

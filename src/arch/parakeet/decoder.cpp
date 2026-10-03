@@ -136,8 +136,10 @@ void set_step_weight(ggml_tensor * dst, const ggml_tensor * src, const std::vect
 // out projections keep a quantized source type (step_weight_type); the rest
 // are fp32 from the host mirrors, freed here once uploaded. On failure frees
 // partial state and returns false (w_ready stays false → hard decode error).
-bool build_joint_weight(HostJoint & j, const ggml_tensor * src_pred_w, const ggml_tensor * src_out_w,
-                        bool keep_quantized) {
+bool build_joint_weight(HostJoint &         j,
+                        const ggml_tensor * src_pred_w,
+                        const ggml_tensor * src_out_w,
+                        bool                keep_quantized) {
     const int joint_h = j.joint_h;
     const int joint_n = j.joint_n;
 
