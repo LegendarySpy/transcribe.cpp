@@ -38,6 +38,7 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +46,7 @@
 #include <ios>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -1810,6 +1812,108 @@ static transcribe_status run_batch_encode(ParakeetSession *                     
         });
 }
 
+#ifdef TRANSCRIBE_COREML
+// Batch over the Core ML encoder: a worker computes utterance i + 1's mel and
+// runs it on the ANE while this thread decodes utterance i on the CPU. An
+// utterance over the encoder capacity takes the single-shot path.
+static transcribe_status run_batch_coreml(ParakeetSession *             pc,
+                                          ParakeetModel *               pm,
+                                          const float * const *         pcm,
+                                          const int *                   n_samples,
+                                          int                           n,
+                                          const transcribe_run_params * params) {
+    struct Encoded {
+        std::vector<float> enc;
+        transcribe_status  st      = TRANSCRIBE_OK;
+        bool               encoded = false;
+        int64_t            mel_us  = 0;
+        int64_t            enc_us  = 0;
+    };
+
+    constexpr int           k_ahead = 2;  // encoder outputs held at most
+    std::vector<Encoded>    slots(static_cast<size_t>(n));
+    std::mutex              mu;
+    std::condition_variable cv;
+    int                     ready = 0, consumed = 0;
+    bool                    stop = false;
+    const int               d    = pm->hparams.enc_d_model;
+
+    std::thread worker([&] {
+        std::vector<float> mel;
+        for (int i = 0; i < n; ++i) {
+            {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait(lock, [&] { return stop || i - consumed < k_ahead; });
+                if (stop) {
+                    return;
+                }
+            }
+            Encoded & e = slots[static_cast<size_t>(i)];
+            try {
+                int n_mels = 0, frames = 0;
+                if (pcm[i] == nullptr || n_samples[i] <= 0) {
+                    e.st = TRANSCRIBE_ERR_INVALID_ARG;
+                } else {
+                    const int64_t t0 = ggml_time_us();
+                    e.st             = pm->mel->compute(pcm[i], static_cast<size_t>(n_samples[i]), mel, n_mels, frames);
+                    const int64_t t1 = ggml_time_us();
+                    e.mel_us         = t1 - t0;
+                    if (e.st == TRANSCRIBE_OK && frames <= coreml_encoder_capacity(pc->coreml_encoder)) {
+                        e.encoded = coreml_encoder_run(pc->coreml_encoder, mel.data(), frames, false, e.enc);
+                        e.st      = e.encoded ? TRANSCRIBE_OK : TRANSCRIBE_ERR_GGUF;
+                        e.enc_us  = ggml_time_us() - t1;
+                    }
+                }
+            } catch (...) {
+                e.st = TRANSCRIBE_ERR_OOM;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                ready = i + 1;
+            }
+            cv.notify_all();
+        }
+    });
+
+    transcribe_status status = TRANSCRIBE_OK;
+    for (int i = 0; i < n; ++i) {
+        {
+            std::unique_lock<std::mutex> lock(mu);
+            cv.wait(lock, [&] { return ready > i; });
+        }
+        if (pc->poll_abort()) {
+            status = TRANSCRIBE_ERR_ABORTED;
+            break;
+        }
+        Encoded & e = slots[static_cast<size_t>(i)];
+        pc->clear_result();
+        transcribe_status st = e.st;
+        if (e.encoded) {
+            pc->t_mel_us    = e.mel_us;
+            pc->t_encode_us = e.enc_us;
+            pc->encoder_out = nullptr;
+            st = decode_and_populate(pc, pm, params, e.enc.data(), static_cast<int>(e.enc.size() / d), d, -1);
+        } else if (st == TRANSCRIBE_OK) {
+            st = run_one_shot_inner(pc, pm, pcm[i], n_samples[i], params);
+        }
+        pc->batch_results.push_back(pc->capture_result(st));
+        std::vector<float>().swap(e.enc);
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            consumed = i + 1;
+        }
+        cv.notify_all();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        stop = true;
+    }
+    cv.notify_all();
+    worker.join();
+    return status;
+}
+#endif
+
 transcribe_status run_batch(transcribe_session *          session,
                             const float * const *         pcm,
                             const int *                   n_samples,
@@ -1839,6 +1943,12 @@ transcribe_status run_batch(transcribe_session *          session,
     // cross-utterance state). A malformed utterance falls the whole call
     // back to the per-utterance path (keeps the batch tensor rectangular).
     // n_mels collected per-index to avoid a shared write.
+#ifdef TRANSCRIBE_COREML
+    if (pc->coreml_encoder != nullptr) {
+        return run_batch_coreml(pc, pm, pcm, n_samples, n, params);
+    }
+#endif
+
     std::vector<std::vector<float>> mels(static_cast<size_t>(n));
     std::vector<int>                nf(static_cast<size_t>(n), 0);
     std::vector<int>                n_mels_per(static_cast<size_t>(n), 0);

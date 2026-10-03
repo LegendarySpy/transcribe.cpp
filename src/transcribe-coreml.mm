@@ -5,25 +5,78 @@
 #import <CoreML/CoreML.h>
 #import <Foundation/Foundation.h>
 
+#include <algorithm>
 #include <limits>
 #include <memory>
+#include <vector>
 
 namespace transcribe {
 
-struct CoreMLEncoder {
+// One fixed-shape program of the companion: its default function or a
+// smaller extra one.
+struct CoreMLProgram {
     MLModel *      model        = nil;
     MLMultiArray * input        = nil;
-    MLMultiArray * length       = nil;
-    int            n_mels       = 0;
     int            capacity     = 0;
-    int            d_model      = 0;
-    int            subsampling  = 0;
     int            capacity_out = 0;
+};
+
+struct CoreMLEncoder {
+    std::vector<CoreMLProgram> programs;  // ascending capacity, the default function last
+    MLMultiArray *             length       = nil;
+    int                        n_mels       = 0;
+    int                        capacity     = 0;
+    int                        d_model      = 0;
+    int                        subsampling  = 0;
+    int                        capacity_out = 0;
 };
 
 static void log_error(const char * operation, NSError * error) {
     log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "Core ML encoder: %s: %s", operation,
             error ? error.localizedDescription.UTF8String : "invalid model tensor contract");
+}
+
+// Checks a loaded program's tensor contract and allocates its input. capacity
+// > 0 must match; capacity_out 0 derives it from the capacity, < 0 reads it
+// from the output shape.
+static bool make_program(MLModel *       model,
+                         int             n_mels,
+                         int             capacity,
+                         int             d_model,
+                         int             subsampling,
+                         int             capacity_out,
+                         CoreMLProgram & program) {
+    MLModelDescription *     desc   = model.modelDescription;
+    MLMultiArrayConstraint * input  = desc.inputDescriptionsByName[@"logmel_data"].multiArrayConstraint;
+    MLMultiArrayConstraint * output = desc.outputDescriptionsByName[@"output"].multiArrayConstraint;
+    if (!input || input.shape.count != 3 || input.shape[0].intValue != 1 || input.shape[1].intValue != n_mels ||
+        input.shape[2].longLongValue <= 0 ||
+        input.shape[2].longLongValue > std::numeric_limits<int>::max() - subsampling ||
+        (capacity > 0 && input.shape[2].intValue != capacity)) {
+        log_error("input shape mismatch", nil);
+        return false;
+    }
+    capacity = input.shape[2].intValue;
+    if (capacity_out == 0) {
+        capacity_out = (capacity + subsampling - 1) / subsampling;
+    } else if (capacity_out < 0 && output && output.shape.count == 3) {
+        capacity_out = output.shape[1].intValue;
+    }
+    if (!output || capacity_out <= 0 || ![output.shape isEqualToArray:@[ @1, @(capacity_out), @(d_model) ]] ||
+        input.dataType != MLMultiArrayDataTypeFloat32 || output.dataType != MLMultiArrayDataTypeFloat32) {
+        log_error("output shape or dtype mismatch", nil);
+        return false;
+    }
+    NSError * error = nil;
+    program.input = [[MLMultiArray alloc] initWithShape:input.shape dataType:MLMultiArrayDataTypeFloat32 error:&error];
+    if (!program.input) {
+        log_error("input allocation failed", error);
+        return false;
+    }
+    program.model        = model;
+    program.capacity     = capacity;
+    program.capacity_out = capacity_out;
+    return true;
 }
 
 CoreMLEncoder * coreml_encoder_load(const char * path,
@@ -46,14 +99,13 @@ CoreMLEncoder * coreml_encoder_load(const char * path,
                 MLModelConfiguration * config = [[MLModelConfiguration alloc] init];
                 config.computeUnits           = MLComputeUnitsCPUAndNeuralEngine;
                 NSError * error               = nil;
-                encoder->model                = [MLModel modelWithContentsOfURL:[NSURL fileURLWithPath:model_path]
-                                                                  configuration:config
-                                                                          error:&error];
-                if (!encoder->model) {
+                NSURL *   url                 = [NSURL fileURLWithPath:model_path];
+                MLModel * model               = [MLModel modelWithContentsOfURL:url configuration:config error:&error];
+                if (!model) {
                     log_error("load failed", error);
                     return nullptr;
                 }
-                MLModelDescription * desc           = encoder->model.modelDescription;
+                MLModelDescription * desc           = model.modelDescription;
                 // One variant, or a comma-separated list for encoders shared across checkpoints.
                 NSString *           source_variant = desc.metadata[MLModelCreatorDefinedKey][@"transcribe.variant"];
                 NSArray *            variants       = [source_variant componentsSeparatedByString:@","];
@@ -61,25 +113,8 @@ CoreMLEncoder * coreml_encoder_load(const char * path,
                     log_error("encoder checkpoint does not match GGUF variant", nil);
                     return nullptr;
                 }
-                MLMultiArrayConstraint * input  = desc.inputDescriptionsByName[@"logmel_data"].multiArrayConstraint;
-                MLMultiArrayConstraint * output = desc.outputDescriptionsByName[@"output"].multiArrayConstraint;
-                if (!input || input.shape.count != 3 || input.shape[0].intValue != 1 ||
-                    input.shape[1].intValue != n_mels || input.shape[2].longLongValue <= 0 ||
-                    input.shape[2].longLongValue > std::numeric_limits<int>::max() - subsampling ||
-                    (capacity > 0 && input.shape[2].intValue != capacity)) {
-                    log_error("input shape mismatch", nil);
-                    return nullptr;
-                }
-                capacity = input.shape[2].intValue;
-                if (capacity_out == 0) {
-                    capacity_out = (capacity + subsampling - 1) / subsampling;
-                } else if (capacity_out < 0 && output && output.shape.count == 3) {
-                    capacity_out = output.shape[1].intValue;
-                }
-                if (!output || capacity_out <= 0 ||
-                    ![output.shape isEqualToArray:@[ @1, @(capacity_out), @(d_model) ]] ||
-                    input.dataType != MLMultiArrayDataTypeFloat32 || output.dataType != MLMultiArrayDataTypeFloat32) {
-                    log_error("output shape or dtype mismatch", nil);
+                CoreMLProgram main_program;
+                if (!make_program(model, n_mels, capacity, d_model, subsampling, capacity_out, main_program)) {
                     return nullptr;
                 }
                 if (variable_length) {
@@ -97,18 +132,39 @@ CoreMLEncoder * coreml_encoder_load(const char * path,
                         return nullptr;
                     }
                 }
-                encoder->input = [[MLMultiArray alloc] initWithShape:input.shape
-                                                            dataType:MLMultiArrayDataTypeFloat32
-                                                               error:&error];
-                if (!encoder->input) {
-                    log_error("input allocation failed", error);
-                    return nullptr;
+                // A variable-length companion may add smaller fixed-shape functions
+                // (a macOS 15 multifunction model, listed in transcribe.functions);
+                // a short input runs on the smallest one that holds it.
+                NSString * functions = desc.metadata[MLModelCreatorDefinedKey][@"transcribe.functions"];
+                if (variable_length && functions.length > 0) {
+                    if (@available(macOS 15.0, *)) {
+                        for (NSString * name in [functions componentsSeparatedByString:@","]) {
+                            MLModelConfiguration * function_config = [config copy];
+                            function_config.functionName           = name;
+                            MLModel *     function_model           = [MLModel modelWithContentsOfURL:url
+                                                                                       configuration:function_config
+                                                                                               error:&error];
+                            CoreMLProgram program;
+                            if (!function_model ||
+                                !make_program(function_model, n_mels, 0, d_model, subsampling, capacity_out, program) ||
+                                program.capacity >= main_program.capacity) {
+                                log_msg(TRANSCRIBE_LOG_LEVEL_WARN, "Core ML encoder: skipping function %s",
+                                        name.UTF8String);
+                                continue;
+                            }
+                            encoder->programs.push_back(program);
+                        }
+                        std::sort(
+                            encoder->programs.begin(), encoder->programs.end(),
+                            [](const CoreMLProgram & a, const CoreMLProgram & b) { return a.capacity < b.capacity; });
+                    }
                 }
+                encoder->programs.push_back(main_program);
                 encoder->n_mels       = n_mels;
-                encoder->capacity     = capacity;
+                encoder->capacity     = main_program.capacity;
                 encoder->d_model      = d_model;
                 encoder->subsampling  = subsampling;
-                encoder->capacity_out = capacity_out;
+                encoder->capacity_out = main_program.capacity_out;
                 log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "Core ML encoder loaded for %s (CPU + Neural Engine; GPU excluded)",
                         variant);
                 return encoder.release();
@@ -149,20 +205,23 @@ bool coreml_encoder_run(CoreMLEncoder *      encoder,
         log_error("input length mismatch", nil);
         return false;
     }
+    const CoreMLProgram & program =
+        *std::find_if(encoder->programs.begin(), encoder->programs.end(),
+                      [&](const CoreMLProgram & p) { return n_frames <= p.capacity && frames_out <= p.capacity_out; });
     @autoreleasepool {
         @try {
-            float *         input    = static_cast<float *>(encoder->input.dataPointer);
-            const NSInteger in_mel   = encoder->input.strides[1].integerValue;
-            const NSInteger in_frame = encoder->input.strides[2].integerValue;
+            float *         input    = static_cast<float *>(program.input.dataPointer);
+            const NSInteger in_mel   = program.input.strides[1].integerValue;
+            const NSInteger in_frame = program.input.strides[2].integerValue;
             for (int m = 0; m < encoder->n_mels; ++m) {
-                for (int t = 0; t < encoder->capacity; ++t) {
+                for (int t = 0; t < program.capacity; ++t) {
                     input[m * in_mel + t * in_frame] =
                         t < n_frames ? mel[time_major ? t * encoder->n_mels + m : m * n_frames + t] : 0.0f;
                 }
             }
             NSError *             error = nil;
             NSMutableDictionary * inputs =
-                [@{ @"logmel_data" : [MLFeatureValue featureValueWithMultiArray:encoder->input] } mutableCopy];
+                [@{ @"logmel_data" : [MLFeatureValue featureValueWithMultiArray:program.input] } mutableCopy];
             if (encoder->length) {
                 *static_cast<int32_t *>(encoder->length.dataPointer) = n_frames;
                 inputs[@"mel_length"] = [MLFeatureValue featureValueWithMultiArray:encoder->length];
@@ -173,10 +232,10 @@ bool coreml_encoder_run(CoreMLEncoder *      encoder,
                 log_error("input features failed", error);
                 return false;
             }
-            id<MLFeatureProvider> prediction = [encoder->model predictionFromFeatures:features error:&error];
+            id<MLFeatureProvider> prediction = [program.model predictionFromFeatures:features error:&error];
             MLMultiArray *        result     = [prediction featureValueForName:@"output"].multiArrayValue;
             if (!result || result.dataType != MLMultiArrayDataTypeFloat32 ||
-                ![result.shape isEqualToArray:@[ @1, @(encoder->capacity_out), @(encoder->d_model) ]]) {
+                ![result.shape isEqualToArray:@[ @1, @(program.capacity_out), @(encoder->d_model) ]]) {
                 log_error("prediction failed", error);
                 return false;
             }

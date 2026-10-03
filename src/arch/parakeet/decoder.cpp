@@ -110,12 +110,36 @@ bool read_tensor_to_f32(const ggml_tensor * t, std::vector<float> & out) {
     return true;
 }
 
-// Make the joint network's weights resident as fp32 ggml tensors on the
-// model: enc / pred / out projections. Built once at load. out_w is
-// dequantized from the model tensor src_out_w; the rest come from the
-// host mirrors, freed here once uploaded. On failure frees partial state
-// and returns false (w_ready stays false → hard decode error).
-bool build_joint_weight(HostJoint & j, const ggml_tensor * src_out_w) {
+// Per-step GEMV weights keep a quantized GGUF type. The n=1 matmuls are
+// memory-bound, and the quantized dot reads the GGUF's exact values at a
+// fraction of the fp32 bytes; the step input is quantized to match.
+// Cache-aware streaming models (Nemotron) stay fp32: Q8_0 step weights
+// flipped Danish and Estonian words on Nemotron 3.5.
+ggml_type step_weight_type(const ggml_tensor * src, bool keep_quantized) {
+    return keep_quantized && ggml_is_quantized(src->type) ? src->type : GGML_TYPE_F32;
+}
+
+// Upload a step weight: the model tensor's raw bytes when the types match,
+// else the fp32 values in `host`.
+void set_step_weight(ggml_tensor * dst, const ggml_tensor * src, const std::vector<float> & host) {
+    if (dst->type == src->type) {
+        std::vector<uint8_t> raw(ggml_nbytes(src));
+        ggml_backend_tensor_get(src, raw.data(), 0, raw.size());
+        ggml_backend_tensor_set(dst, raw.data(), 0, raw.size());
+    } else {
+        ggml_backend_tensor_set(dst, host.data(), 0, host.size() * sizeof(float));
+    }
+}
+
+// Make the joint network's weights resident as ggml tensors on the model:
+// enc / pred / out projections. Built once at load. The per-step pred and
+// out projections keep a quantized source type (step_weight_type); the rest
+// are fp32 from the host mirrors, freed here once uploaded. On failure frees
+// partial state and returns false (w_ready stays false → hard decode error).
+bool build_joint_weight(HostJoint &         j,
+                        const ggml_tensor * src_pred_w,
+                        const ggml_tensor * src_out_w,
+                        bool                keep_quantized) {
     const int joint_h = j.joint_h;
     const int joint_n = j.joint_n;
 
@@ -161,9 +185,9 @@ bool build_joint_weight(HostJoint & j, const ggml_tensor * src_out_w) {
 
     j.g_enc_w  = ggml_new_tensor_2d(j.w_ctx, GGML_TYPE_F32, j.d_enc, joint_h);
     j.g_enc_b  = ggml_new_tensor_1d(j.w_ctx, GGML_TYPE_F32, joint_h);
-    j.g_pred_w = ggml_new_tensor_2d(j.w_ctx, GGML_TYPE_F32, j.pred_hidden, joint_h);
+    j.g_pred_w = ggml_new_tensor_2d(j.w_ctx, step_weight_type(src_pred_w, keep_quantized), j.pred_hidden, joint_h);
     j.g_pred_b = ggml_new_tensor_1d(j.w_ctx, GGML_TYPE_F32, joint_h);
-    j.gw_w     = ggml_new_tensor_2d(j.w_ctx, GGML_TYPE_F32, joint_h, joint_n);
+    j.gw_w     = ggml_new_tensor_2d(j.w_ctx, step_weight_type(src_out_w, keep_quantized), joint_h, joint_n);
     j.gw_b     = ggml_new_tensor_1d(j.w_ctx, GGML_TYPE_F32, joint_n);
 
     j.w_buf = ggml_backend_alloc_ctx_tensors(j.w_ctx, j.w_backend);
@@ -171,18 +195,18 @@ bool build_joint_weight(HostJoint & j, const ggml_tensor * src_out_w) {
         return fail();
     }
 
-    // out_w: dequantize the model tensor to fp32 once.
+    // out_w has no host mirror; dequantize it only for an fp32 copy.
     {
         std::vector<float> tmp;
-        if (!read_tensor_to_f32(src_out_w, tmp)) {
+        if (j.gw_w->type != src_out_w->type && !read_tensor_to_f32(src_out_w, tmp)) {
             return fail();
         }
-        ggml_backend_tensor_set(j.gw_w, tmp.data(), 0, tmp.size() * sizeof(float));
+        set_step_weight(j.gw_w, src_out_w, tmp);
     }
     // The rest come from the host mirrors.
     ggml_backend_tensor_set(j.g_enc_w, j.enc_w.data(), 0, j.enc_w.size() * sizeof(float));
     ggml_backend_tensor_set(j.g_enc_b, j.enc_b.data(), 0, j.enc_b.size() * sizeof(float));
-    ggml_backend_tensor_set(j.g_pred_w, j.pred_w.data(), 0, j.pred_w.size() * sizeof(float));
+    set_step_weight(j.g_pred_w, src_pred_w, j.pred_w);
     ggml_backend_tensor_set(j.g_pred_b, j.pred_b.data(), 0, j.pred_b.size() * sizeof(float));
     ggml_backend_tensor_set(j.gw_b, j.out_b.data(), 0, j.out_b.size() * sizeof(float));
 
@@ -197,12 +221,13 @@ bool build_joint_weight(HostJoint & j, const ggml_tensor * src_out_w) {
     return true;
 }
 
-// Make the predictor LSTM weights resident as fp32 ggml tensors for the
-// per-call PredGraph. Built once at load. ne is [pred_hidden, 4*pred_hidden]
-// for Wx/Wh (row-major [4*H, H] host bytes as a mul_mat operand) and
-// [4*pred_hidden] for the bias. On failure frees partial state and returns
-// false (lstm_ready stays false → hard decode error).
-bool build_pred_weights(HostPredictor & p) {
+// Make the predictor LSTM weights resident as ggml tensors for the per-call
+// PredGraph. Built once at load. ne is [pred_hidden, 4*pred_hidden] for Wx/Wh
+// (row-major [4*H, H] host bytes as a mul_mat operand; a quantized source
+// type is kept, see step_weight_type) and [4*pred_hidden] for the fp32 bias.
+// On failure frees partial state and returns false (lstm_ready stays false →
+// hard decode error).
+bool build_pred_weights(HostPredictor & p, const std::vector<ParakeetPredictor::LstmLayer> & src, bool keep_quantized) {
     const int H      = p.pred_hidden;
     const int four_H = 4 * H;
     const int L      = static_cast<int>(p.lstm.size());
@@ -250,8 +275,8 @@ bool build_pred_weights(HostPredictor & p) {
 
     for (int l = 0; l < L; ++l) {
         auto & lh = p.lstm[l];
-        lh.g_Wx   = ggml_new_tensor_2d(p.lstm_w_ctx, GGML_TYPE_F32, H, four_H);
-        lh.g_Wh   = ggml_new_tensor_2d(p.lstm_w_ctx, GGML_TYPE_F32, H, four_H);
+        lh.g_Wx   = ggml_new_tensor_2d(p.lstm_w_ctx, step_weight_type(src[l].Wx, keep_quantized), H, four_H);
+        lh.g_Wh   = ggml_new_tensor_2d(p.lstm_w_ctx, step_weight_type(src[l].Wh, keep_quantized), H, four_H);
         lh.g_b    = ggml_new_tensor_1d(p.lstm_w_ctx, GGML_TYPE_F32, four_H);
     }
 
@@ -262,8 +287,8 @@ bool build_pred_weights(HostPredictor & p) {
 
     for (int l = 0; l < L; ++l) {
         auto & lh = p.lstm[l];
-        ggml_backend_tensor_set(lh.g_Wx, lh.Wx.data(), 0, lh.Wx.size() * sizeof(float));
-        ggml_backend_tensor_set(lh.g_Wh, lh.Wh.data(), 0, lh.Wh.size() * sizeof(float));
+        set_step_weight(lh.g_Wx, src[l].Wx, lh.Wx);
+        set_step_weight(lh.g_Wh, src[l].Wh, lh.Wh);
         ggml_backend_tensor_set(lh.g_b, lh.b.data(), 0, lh.b.size() * sizeof(float));
         // Host mirrors now resident in ggml — release them.
         std::vector<float>().swap(lh.Wx);
@@ -424,6 +449,40 @@ static void free_cpu_threadpool(ggml_backend_t backend, ggml_threadpool_t tp) {
     }
 }
 
+// One LSTM cell as a single graph node: dst = [h'; c'] from the gate
+// matmuls src[0] = Wx@x and src[1] = Wh@h_prev, bias src[2] and c_prev
+// src[3], gates in PyTorch [i, f, g, o] order. As separate ggml ops the
+// pointwise math took ~15 nodes per layer, each a thread barrier.
+void lstm_cell(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) nth;
+    (void) userdata;
+    if (ith != 0) {
+        return;
+    }
+    const auto * gx    = static_cast<const float *>(dst->src[0]->data);
+    const auto * gh    = static_cast<const float *>(dst->src[1]->data);
+    const auto * b     = static_cast<const float *>(dst->src[2]->data);
+    const auto * c     = static_cast<const float *>(dst->src[3]->data);
+    const int    H     = static_cast<int>(dst->src[3]->ne[0]);
+    auto *       h_out = static_cast<float *>(dst->data);
+    float *      c_out = h_out + H;
+    auto         gate  = [&](int k, int j) {
+        const int r = k * H + j;
+        return (gx[r] + gh[r]) + b[r];
+    };
+    auto sigmoid = [](float v) {
+        return 1.0f / (1.0f + std::exp(-v));
+    };
+    for (int j = 0; j < H; ++j) {
+        const float i_ = sigmoid(gate(0, j));
+        const float f_ = sigmoid(gate(1, j));
+        const float g_ = std::tanh(gate(2, j));
+        const float o_ = sigmoid(gate(3, j));
+        c_out[j]       = f_ * c[j] + i_ * g_;
+        h_out[j]       = o_ * std::tanh(c_out[j]);
+    }
+}
+
 // Per-call predictor LSTM graph (the mutable half of the predictor):
 // a single per-step graph built fresh per decode call around the
 // model-resident HostPredictor::lstm weights, recomputed in place each
@@ -536,8 +595,8 @@ bool build_pred_graph(PredGraph & g, const HostPredictor & p, int n_threads) {
     }
 
     ggml_init_params ip{};
-    // ~17 op nodes/layer + (1 + 2L) input tensors; generous headroom.
-    ip.mem_size   = ggml_tensor_overhead() * static_cast<size_t>(32 * L + 16) + ggml_graph_overhead();
+    // 5 nodes/layer + (1 + 2L) input tensors; generous headroom.
+    ip.mem_size   = ggml_tensor_overhead() * static_cast<size_t>(16 * L + 16) + ggml_graph_overhead();
     ip.mem_buffer = nullptr;
     ip.no_alloc   = true;
     g.ctx         = ggml_init(ip);
@@ -559,26 +618,16 @@ bool build_pred_graph(PredGraph & g, const HostPredictor & p, int n_threads) {
     }
 
     // gates = Wx@x + Wh@h_prev + b; split [i,f,g,o]; c' = f*c + i*g; h' = o*tanh(c').
-    // Gate order [i, f, g, o] (PyTorch standard).
     ggml_tensor * in = g.x;
     for (int l = 0; l < L; ++l) {
-        const auto &  lh = p.lstm[static_cast<size_t>(l)];
-        ggml_tensor * gates =
-            ggml_add(g.ctx, ggml_add(g.ctx, ggml_mul_mat(g.ctx, lh.g_Wx, in), ggml_mul_mat(g.ctx, lh.g_Wh, g.ph[l])),
-                     lh.g_b);  // [4H]
-        auto part = [&](int k) {
-            return ggml_view_1d(g.ctx, gates, H,
-                                static_cast<size_t>(k) * static_cast<size_t>(H) * ggml_element_size(gates));
-        };
-        ggml_tensor * i_ = ggml_sigmoid(g.ctx, part(0));
-        ggml_tensor * f_ = ggml_sigmoid(g.ctx, part(1));
-        ggml_tensor * gg = ggml_tanh(g.ctx, part(2));
-        ggml_tensor * o_ = ggml_sigmoid(g.ctx, part(3));
-        g.nc[l]          = ggml_add(g.ctx, ggml_mul(g.ctx, f_, g.pc[l]), ggml_mul(g.ctx, i_, gg));
-        ggml_set_output(g.nc[l]);
-        g.nh[l] = ggml_mul(g.ctx, o_, ggml_tanh(g.ctx, g.nc[l]));
-        ggml_set_output(g.nh[l]);
-        in = g.nh[l];
+        const auto &  lh     = p.lstm[static_cast<size_t>(l)];
+        ggml_tensor * args[] = { ggml_mul_mat(g.ctx, lh.g_Wx, in), ggml_mul_mat(g.ctx, lh.g_Wh, g.ph[l]), lh.g_b,
+                                 g.pc[l] };
+        ggml_tensor * cell   = ggml_custom_4d(g.ctx, GGML_TYPE_F32, 2 * H, 1, 1, 1, args, 4, lstm_cell, 1, nullptr);
+        ggml_set_output(cell);
+        g.nh[l] = ggml_view_1d(g.ctx, cell, H, 0);
+        g.nc[l] = ggml_view_1d(g.ctx, cell, H, static_cast<size_t>(H) * sizeof(float));
+        in      = g.nh[l];
     }
 
     g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, g.backend);
@@ -685,6 +734,7 @@ transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDe
     }
 
     // ----- Predictor mirror (TDT, RNNT) -----
+    const bool keep_quantized = hp.enc_att_context_style != ParakeetHParams::AttContextStyle::ChunkedLimited;
     out.predictor.pred_hidden = hp.pred_hidden;
     out.predictor.pred_vocab  = hp.pred_vocab;
 
@@ -731,7 +781,7 @@ transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDe
 
     // Make the predictor LSTM weights resident. Fatal: a failure means
     // the model cannot decode — fail fast at load.
-    if (!build_pred_weights(out.predictor)) {
+    if (!build_pred_weights(out.predictor, w.predictor.lstm, keep_quantized)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: predictor ggml weight build failed");
         return TRANSCRIBE_ERR_BACKEND;
     }
@@ -744,7 +794,7 @@ transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDe
     out.joint.activation  = hp.joint_activation;
 
     // enc/pred/out_b are mirrored to host fp32; out_w is NOT mirrored
-    // here (build_joint_weight dequantizes it from the model tensor).
+    // here (build_joint_weight reads it from the model tensor).
     if (!read_tensor_to_f32(w.joint.enc_w, out.joint.enc_w)) {
         return TRANSCRIBE_ERR_GGUF;
     }
@@ -774,7 +824,7 @@ transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDe
                 out.joint.joint_h, out.joint.joint_n);
         return TRANSCRIBE_ERR_GGUF;
     }
-    if (!build_joint_weight(out.joint, w.joint.out_w)) {
+    if (!build_joint_weight(out.joint, w.joint.pred_w, w.joint.out_w, keep_quantized)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: joint ggml weight build failed");
         return TRANSCRIBE_ERR_BACKEND;
     }
@@ -988,10 +1038,9 @@ int argmax_range(const float * data, int n) {
 //     confidence  = 1 - entropy / max_entropy
 //
 // In our terms `vocab_size + 1 == pred_vocab == n_token_classes`.
-// The result lives in [0, 1] modulo the +1e-10 epsilon (which
-// matches the reference verbatim, including its slight
-// negative-bias for nearly-uniform distributions).
-float token_confidence(const float * token_logits, int n_token_classes, std::vector<float> & scratch_probs) {
+// Computed in closed form without the +1e-10 epsilon, which moves the
+// result by well under 1e-6.
+float token_confidence(const float * token_logits, int n_token_classes) {
     // Numerically stable softmax: subtract max before exp.
     float max_logit = token_logits[0];
     for (int i = 1; i < n_token_classes; ++i) {
@@ -999,22 +1048,17 @@ float token_confidence(const float * token_logits, int n_token_classes, std::vec
             max_logit = token_logits[i];
         }
     }
-    if (static_cast<int>(scratch_probs.size()) < n_token_classes) {
-        scratch_probs.resize(static_cast<size_t>(n_token_classes));
-    }
+    // With e_i = exp(x_i - max) and S = sum e_i, log p_i = (x_i - max) - log S,
+    // so entropy = log S - sum e_i (x_i - max) / S: one exp per class, no log.
     double sum_exp = 0.0;
+    double sum_ex  = 0.0;
     for (int i = 0; i < n_token_classes; ++i) {
-        const float e                         = std::exp(token_logits[i] - max_logit);
-        scratch_probs[static_cast<size_t>(i)] = e;
+        const float x = token_logits[i] - max_logit;
+        const float e = std::exp(x);
         sum_exp += static_cast<double>(e);
+        sum_ex += static_cast<double>(e * x);
     }
-    const float inv_sum = static_cast<float>(1.0 / sum_exp);
-    double      entropy = 0.0;
-    for (int i = 0; i < n_token_classes; ++i) {
-        const float p = scratch_probs[static_cast<size_t>(i)] * inv_sum;
-        // +1e-10 matches the reference.
-        entropy -= static_cast<double>(p) * std::log(static_cast<double>(p) + 1e-10);
-    }
+    const double entropy     = std::log(sum_exp) - sum_ex / sum_exp;
     const double max_entropy = std::log(static_cast<double>(n_token_classes));
     if (max_entropy <= 0.0) {
         return 1.0f;
@@ -1128,7 +1172,6 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
     }
 
     std::vector<float> scratch_x;
-    std::vector<float> scratch_probs;
     std::vector<float> logits;
 
     // Two cursors may run over the same frames while a fork is open.
@@ -1169,7 +1212,7 @@ transcribe_status decode_boosted(const HostDecoderWeights & w,
         if (!is_blank) {
             TdtToken t;
             t.id              = tok;
-            t.p               = token_confidence(logits.data(), n_token_cls, scratch_probs);
+            t.p               = token_confidence(logits.data(), n_token_cls);
             t.step_at_emit    = frame_offset + c.step;
             t.duration_frames = duration;
             if (tdt && duration == 0 && (dst.empty() || dst.back().step_at_emit != t.step_at_emit)) {
@@ -1783,7 +1826,6 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
 
     // Per-call scratch reused across every decode step.
     std::vector<float> scratch_x;
-    std::vector<float> scratch_probs;
     std::vector<float> logits;
 
     int        last_token  = -1;  // sentinel: no previous token (start state)
@@ -1862,7 +1904,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
         const bool is_blank = (pred_token == blank_id);
         if (!is_blank) {
             const int64_t tc0 = ggml_time_us();
-            const float   p   = token_confidence(token_logits, n_token_cls, scratch_probs);
+            const float   p   = token_confidence(token_logits, n_token_cls);
             t_conf_us += ggml_time_us() - tc0;
             TdtToken tok;
             tok.id              = pred_token;
@@ -2011,7 +2053,6 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
     const int64_t t_enc_proj_us = ggml_time_us() - t_enc_proj_start;
 
     std::vector<float> scratch_x;
-    std::vector<float> scratch_probs;
     std::vector<float> logits;
 
     int last_token  = -1;
@@ -2076,7 +2117,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
             new_symbols = 0;
         } else {
             const int64_t tc0 = ggml_time_us();
-            const float   p   = token_confidence(token_logits, n_token_cls, scratch_probs);
+            const float   p   = token_confidence(token_logits, n_token_cls);
             t_conf_us += ggml_time_us() - tc0;
             TdtToken tok;
             tok.id              = pred_token;
@@ -2215,7 +2256,6 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
     next_state.reset(n_layers, H);
 
     std::vector<float> scratch_x;
-    std::vector<float> scratch_probs;
     std::vector<float> logits;
 
     int last_token  = last_token_io;
@@ -2254,7 +2294,7 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
             step += 1;
             new_symbols = 0;
         } else {
-            const float p = token_confidence(token_logits, n_token_cls, scratch_probs);
+            const float p = token_confidence(token_logits, n_token_cls);
             TdtToken    tok;
             tok.id              = pred_token;
             tok.p               = p;

@@ -415,6 +415,9 @@ if(MSVC)
     if(NOT CMAKE_CXX_FLAGS MATCHES "/EHs")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHs")
     endif()
+    # The constexpr std::mutex of VS 17.10+ crashes in _Mtx_lock when an older
+    # MSVCP140.dll (another app's, on PATH) is the one loaded.
+    add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 endif()
 
 # Windows MAX_PATH: relocate ExternalProjects (vulkan-shaders-gen) to a flat
