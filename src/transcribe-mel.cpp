@@ -661,40 +661,65 @@ transcribe_status MelFrontend::compute(const float *        pcm,
             }
         }
 #else
-        // Scalar fused matmul + log fallback (no BLAS available).
-        for (int t = 0; t < n_frames; ++t) {
-            const float * pwr = power.data() + static_cast<size_t>(t) * n_freq;
-            for (int m = 0; m < n_mels; ++m) {
-                const float * fb_row = mel_fb_.data() + static_cast<size_t>(m) * n_freq;
-                double        sum    = 0.0;
-                int           k      = 0;
-                for (; k < n_freq - 3; k += 4) {
-                    sum += static_cast<double>(fb_row[k]) * static_cast<double>(pwr[k]) +
-                           static_cast<double>(fb_row[k + 1]) * static_cast<double>(pwr[k + 1]) +
-                           static_cast<double>(fb_row[k + 2]) * static_cast<double>(pwr[k + 2]) +
-                           static_cast<double>(fb_row[k + 3]) * static_cast<double>(pwr[k + 3]);
-                }
-                for (; k < n_freq; ++k) {
-                    sum += static_cast<double>(fb_row[k]) * static_cast<double>(pwr[k]);
-                }
-                float result;
-                if (whisper_mode) {
-                    if (sum < 1.0e-10) {
-                        sum = 1.0e-10;
-                    }
-                    result = static_cast<float>(std::log10(sum));
-                } else if (cfg_.log_clamp_min > 0.0f) {
-                    const double clamp = static_cast<double>(cfg_.log_clamp_min);
-                    if (sum < clamp) {
-                        sum = clamp;
-                    }
-                    result = static_cast<float>(std::log(sum));
-                } else {
-                    result = static_cast<float>(std::log(sum + static_cast<double>(kLogEps)));
-                }
-                log_mel[static_cast<size_t>(m) * n_frames + t] = result;
+        // Scalar fused matmul + log fallback (no BLAS available), threaded
+        // over frames. Each filterbank row is zero outside a few bins, so
+        // only its nonzero span is visited, in the same 4-term groups as a
+        // dense loop from bin 0: the skipped terms add exact zeros, so the
+        // sums are unchanged.
+        const int        vec_end  = n_freq - 3;
+        const int        tail     = vec_end > 0 ? (vec_end + 3) / 4 * 4 : 0;
+        std::vector<int> span_lo(static_cast<size_t>(n_mels), 0);
+        std::vector<int> span_hi(static_cast<size_t>(n_mels), 0);
+        for (int m = 0; m < n_mels; ++m) {
+            const float * fb_row = mel_fb_.data() + static_cast<size_t>(m) * n_freq;
+            int           lo     = 0;
+            int           hi     = n_freq;
+            while (lo < hi && fb_row[lo] == 0.0f) {
+                ++lo;
             }
+            while (hi > lo && fb_row[hi - 1] == 0.0f) {
+                --hi;
+            }
+            span_lo[static_cast<size_t>(m)] = lo;
+            span_hi[static_cast<size_t>(m)] = hi;
         }
+        auto mel_worker = [&](int tid) {
+            for (int t = tid; t < n_frames; t += stft_threads) {
+                const float * pwr = power.data() + static_cast<size_t>(t) * n_freq;
+                for (int m = 0; m < n_mels; ++m) {
+                    const float * fb_row = mel_fb_.data() + static_cast<size_t>(m) * n_freq;
+                    const int     lo     = span_lo[static_cast<size_t>(m)];
+                    const int     hi     = span_hi[static_cast<size_t>(m)];
+                    double        sum    = 0.0;
+                    for (int k = lo / 4 * 4; k < vec_end && k < hi; k += 4) {
+                        sum += static_cast<double>(fb_row[k]) * static_cast<double>(pwr[k]) +
+                               static_cast<double>(fb_row[k + 1]) * static_cast<double>(pwr[k + 1]) +
+                               static_cast<double>(fb_row[k + 2]) * static_cast<double>(pwr[k + 2]) +
+                               static_cast<double>(fb_row[k + 3]) * static_cast<double>(pwr[k + 3]);
+                    }
+                    for (int k = std::max(tail, lo); k < hi; ++k) {
+                        sum += static_cast<double>(fb_row[k]) * static_cast<double>(pwr[k]);
+                    }
+                    float result;
+                    if (whisper_mode) {
+                        if (sum < 1.0e-10) {
+                            sum = 1.0e-10;
+                        }
+                        result = static_cast<float>(std::log10(sum));
+                    } else if (cfg_.log_clamp_min > 0.0f) {
+                        const double clamp = static_cast<double>(cfg_.log_clamp_min);
+                        if (sum < clamp) {
+                            sum = clamp;
+                        }
+                        result = static_cast<float>(std::log(sum));
+                    } else {
+                        result = static_cast<float>(std::log(sum + static_cast<double>(kLogEps)));
+                    }
+                    log_mel[static_cast<size_t>(m) * n_frames + t] = result;
+                }
+            }
+        };
+        run_threaded(mel_worker);
 #endif
     }
 
