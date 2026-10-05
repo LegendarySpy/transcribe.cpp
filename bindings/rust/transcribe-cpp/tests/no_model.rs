@@ -35,6 +35,9 @@ fn abi_struct_sizes_are_live() {
         AbiStruct::SpeakerSegment,
         AbiStruct::SessionLimits,
         AbiStruct::BackendInitParams,
+        AbiStruct::DiarizeInfo,
+        AbiStruct::DiarizeSessionParams,
+        AbiStruct::DiarizeParams,
     ] {
         assert!(abi_struct_size(which) > 0, "{which:?} reported size 0");
     }
@@ -138,5 +141,6 @@ fn handles_are_send_sync() {
     fn assert_send<T: Send>() {}
     assert_send_sync::<Model>();
     assert_send::<transcribe_cpp::Session>();
-    // Session is intentionally NOT Sync (single-threaded use).
+    assert_send::<transcribe_cpp::DiarizeSession>();
+    // Sessions are intentionally NOT Sync (single-threaded use).
 }

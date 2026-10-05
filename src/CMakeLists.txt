@@ -12,6 +12,8 @@
 
 add_library(transcribe
     transcribe.cpp
+    transcribe-asr.cpp
+    transcribe-diarize.cpp
     transcribe-loader.cpp
     transcribe-arch.cpp
     transcribe-meta.cpp
@@ -63,7 +65,6 @@ add_library(transcribe
     arch/moss/decoder.cpp
     arch/sortformer/model.cpp
     arch/sortformer/stream.cpp
-    arch/sortformer/capabilities.cpp
     arch/sortformer/weights.cpp
     arch/voxtral/model.cpp
     arch/voxtral/capabilities.cpp
