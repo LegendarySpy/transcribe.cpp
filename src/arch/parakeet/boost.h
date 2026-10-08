@@ -23,9 +23,11 @@
 
 namespace transcribe::parakeet {
 
-constexpr float k_boost_c0           = 1.0f;         // NeMo context_score
-constexpr float k_boost_beta         = 2.0f;         // NeMo depth_scaling for TDT / RNN-T
-constexpr float k_boost_floor        = 1e-5f;        // min unboosted probability of a swapped-in token
+constexpr float k_boost_c0           = 1.0f;  // NeMo context_score
+constexpr float k_boost_beta         = 2.0f;  // NeMo depth_scaling for TDT / RNN-T
+// 1e-5 blocked words a fine-tuned model spells another way (Parakeet Ultra hears
+// Tauri as T|ari, so the boosted T|au|ri needed "au" below 1e-5).
+constexpr float k_boost_floor        = 1e-7f;        // min unboosted probability of a swapped-in token
 constexpr int   k_boost_fork_tokens  = 24;           // boosted branch token budget before rejection
 constexpr int   k_boost_guard_frames = 6;            // deletion check after a completed phrase (~0.5 s)
 constexpr int   k_boost_beam         = 4;            // beam width of the offline boosted decode
