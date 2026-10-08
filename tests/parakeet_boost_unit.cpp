@@ -108,14 +108,14 @@ void test_pick() {
     })
                      .data(),
                  k_n_cls, k_u, false) == k_u);
-    // Floor: after token 10, z = -3 is below p = 1e-5 (the floor sits near
-    // 10 - 11.5) and z = -1 is above it.
+    // Floor: after token 10, z = -8 is below p = 1e-7 (the floor sits near
+    // 10 - 16.1) and z = -5 is above it.
     const BoostTrie strong = make_trie(10.0f);
     const int       s10    = strong.child(0, 10);
     CHECK(strong.pick(s10,
                       logits_with({
                                       { 10, -20.0f },
-                                      { 11, -3.0f  },
+                                      { 11, -8.0f  },
                                       { 13, -20.0f },
                                       { 20, -20.0f }
     })
@@ -124,7 +124,7 @@ void test_pick() {
     CHECK(strong.pick(s10,
                       logits_with({
                                       { 10, -20.0f },
-                                      { 11, -1.0f  },
+                                      { 11, -5.0f  },
                                       { 13, -20.0f },
                                       { 20, -20.0f }
     })

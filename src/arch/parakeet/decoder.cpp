@@ -1041,15 +1041,36 @@ int argmax_range(const float * data, int n) {
 // Computed in closed form without the +1e-10 epsilon, which moves the
 // result by well under 1e-6.
 float token_confidence(const float * token_logits, int n_token_classes) {
-    // Numerically stable softmax: subtract max before exp.
+    const double max_entropy = std::log(static_cast<double>(n_token_classes));
+    if (max_entropy <= 0.0) {
+        return 1.0f;
+    }
+    // With e_i = exp(x_i - max) and S = sum e_i, log p_i = (x_i - max) - log S,
+    // so entropy = log S - sum e_i (x_i - max) / S: one exp per class, no log.
+#if TRANSCRIBE_HAS_BLAS && defined(__APPLE__)
+    // Vectorized (max, shift, exp, sum, dot): the scalar version was ~21 us
+    // per emitted token over 8193 classes, a seventh of the decoder.
+    thread_local std::vector<float> xs, es;
+    xs.resize(static_cast<size_t>(n_token_classes));
+    es.resize(static_cast<size_t>(n_token_classes));
+    const vDSP_Length n         = static_cast<vDSP_Length>(n_token_classes);
+    float             max_logit = 0.0f;
+    vDSP_maxv(token_logits, 1, &max_logit, n);
+    const float neg_max = -max_logit;
+    vDSP_vsadd(token_logits, 1, &neg_max, xs.data(), 1, n);
+    vvexpf(es.data(), xs.data(), &n_token_classes);
+    float sum_exp = 0.0f;
+    float sum_ex  = 0.0f;
+    vDSP_sve(es.data(), 1, &sum_exp, n);
+    vDSP_dotpr(es.data(), 1, xs.data(), 1, &sum_ex, n);
+    const double entropy = std::log(static_cast<double>(sum_exp)) - static_cast<double>(sum_ex) / sum_exp;
+#else
     float max_logit = token_logits[0];
     for (int i = 1; i < n_token_classes; ++i) {
         if (token_logits[i] > max_logit) {
             max_logit = token_logits[i];
         }
     }
-    // With e_i = exp(x_i - max) and S = sum e_i, log p_i = (x_i - max) - log S,
-    // so entropy = log S - sum e_i (x_i - max) / S: one exp per class, no log.
     double sum_exp = 0.0;
     double sum_ex  = 0.0;
     for (int i = 0; i < n_token_classes; ++i) {
@@ -1058,11 +1079,8 @@ float token_confidence(const float * token_logits, int n_token_classes) {
         sum_exp += static_cast<double>(e);
         sum_ex += static_cast<double>(e * x);
     }
-    const double entropy     = std::log(sum_exp) - sum_ex / sum_exp;
-    const double max_entropy = std::log(static_cast<double>(n_token_classes));
-    if (max_entropy <= 0.0) {
-        return 1.0f;
-    }
+    const double entropy = std::log(sum_exp) - sum_ex / sum_exp;
+#endif
     return static_cast<float>(1.0 - entropy / max_entropy);
 }
 
@@ -1780,12 +1798,13 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
         return decode_beam_offline(w, enc_out, T_enc, d_enc, n_threads, *boost, out_tokens);
     }
 
-    const int nt          = resolve_decode_threads(n_threads);
-    const int n_layers    = static_cast<int>(w.predictor.lstm.size());
-    const int H           = w.predictor.pred_hidden;
-    const int n_token_cls = w.predictor.pred_vocab;  // == vocab_size + 1
-    const int n_dur       = static_cast<int>(w.tdt_durations.size());
-    const int blank_id    = w.blank_id;
+    const int64_t t_setup_start = ggml_time_us();
+    const int     nt            = resolve_decode_threads(n_threads);
+    const int     n_layers      = static_cast<int>(w.predictor.lstm.size());
+    const int     H             = w.predictor.pred_hidden;
+    const int     n_token_cls   = w.predictor.pred_vocab;  // == vocab_size + 1
+    const int     n_dur         = static_cast<int>(w.tdt_durations.size());
+    const int     blank_id      = w.blank_id;
 
     // All-ggml decode on ONE shared threadpool: PredGraph owns the
     // backend + pool; enc_proj and the joint graph borrow it. pg is
@@ -1802,6 +1821,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: ggml decode graph build failed");
         return TRANSCRIBE_ERR_BACKEND;
     }
+    const int64_t t_setup_us = ggml_time_us() - t_setup_start;
 
     // Two LSTM states, both pre-sized: `state` is the committed
     // state we read from each iteration; `next_state` is where the
@@ -1958,10 +1978,11 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
 
     log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
             "decoder: %d iters, %d tokens, T_enc=%d  "
-            "enc_proj=%.1f ms  pred=%.1f ms  joint=%.1f ms  conf=%.1f ms  "
+            "setup=%.1f ms  enc_proj=%.1f ms  pred=%.1f ms  joint=%.1f ms  conf=%.1f ms  "
             "total=%.1f ms  per_iter=%.0f us",
-            iter, static_cast<int>(out_tokens.size()), T_enc, t_enc_proj_us / 1000.0, t_pred_us / 1000.0,
-            t_joint_us / 1000.0, t_conf_us / 1000.0, (t_enc_proj_us + t_pred_us + t_joint_us + t_conf_us) / 1000.0,
+            iter, static_cast<int>(out_tokens.size()), T_enc, t_setup_us / 1000.0, t_enc_proj_us / 1000.0,
+            t_pred_us / 1000.0, t_joint_us / 1000.0, t_conf_us / 1000.0,
+            (t_setup_us + t_enc_proj_us + t_pred_us + t_joint_us + t_conf_us) / 1000.0,
             static_cast<double>(t_pred_us + t_joint_us) / std::max(iter, 1));
 
     if (iter >= max_iters) {
