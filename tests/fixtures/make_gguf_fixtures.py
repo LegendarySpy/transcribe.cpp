@@ -1406,11 +1406,13 @@ TOY_VOCAB: list[str] = [
 # Sentinel scores. The values are not interesting; the test only checks
 # that read-back round-trips and that length-must-match is enforced.
 TOY_SCORES = [-float(i) for i in range(len(TOY_VOCAB))]
-# Token types: 1 == NORMAL, 3 == CONTROL (matches the llama.cpp /
-# whisper.cpp convention). The test does not assert specific values, only
-# that the array survives the round trip.
+# Token types: 1 == NORMAL, 2 == UNKNOWN, 3 == CONTROL (matches the
+# llama.cpp / whisper.cpp convention). <unk> is UNKNOWN-typed, matching
+# the real parakeet converter output (scripts/convert-parakeet.py marks it
+# via sp.is_unknown), so the token-type accessors are exercised against
+# realistic metadata.
 TOY_TOKEN_TYPES = [
-    3, 3, 3,        # <unk> <s> </s>
+    2, 3, 3,        # <unk> <s> </s>
     1, 1, 1, 1, 1,  # ▁hello ▁world ▁foo ▁bar ▁baz
     1, 1, 1,        # s ed ing
     1, 1, 1,        # ▁the ▁a ▁of
@@ -1757,11 +1759,7 @@ def emit_fixtures(out_dir: Path) -> None:
                 _pack_kv_string("stt.variant",          "qwen3-asr-toy"),
                 _pack_kv_string("tokenizer.chat_template",
                                 QWEN3_ASR_CHAT_TEMPLATE),
-                # Capabilities: match the family note. The loader reads
-                # general.languages as factual detection coverage; the
-                # run() handler rejects any explicit language hint with
-                # TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE until the prompt
-                # renderer honors them (Phase 1.1 Option A).
+                # Capabilities: match the family note.
                 _pack_kv_bool("stt.capability.lang_detect", True),
                 _pack_kv_array_string(
                     "general.languages",

@@ -152,8 +152,8 @@
  * exactly and refuses to load a native provider that does not match.
  */
 #define TRANSCRIBE_VERSION_MAJOR 0
-#define TRANSCRIBE_VERSION_MINOR 2
-#define TRANSCRIBE_VERSION_PATCH 4
+#define TRANSCRIBE_VERSION_MINOR 3
+#define TRANSCRIBE_VERSION_PATCH 1
 
 #define TRANSCRIBE_VERSION_STRINGIZE_(x) #x
 #define TRANSCRIBE_VERSION_STRINGIZE(x)  TRANSCRIBE_VERSION_STRINGIZE_(x)
@@ -313,6 +313,8 @@ typedef enum {
      * the check. See docs/input-limits.md.
      */
     TRANSCRIBE_ERR_OUTPUT_REPETITION      = 19,
+    /* The model does not serve the role this call needs; see transcribe_model_roles(). */
+    TRANSCRIBE_ERR_UNSUPPORTED_ROLE       = 20,
 } transcribe_status;
 
 /*
@@ -369,21 +371,27 @@ TRANSCRIBE_API const char * transcribe_version_commit(void);
  * is append-only; do not renumber existing values.
  */
 typedef enum {
-    TRANSCRIBE_ABI_MODEL_LOAD_PARAMS = 0,
-    TRANSCRIBE_ABI_SESSION_PARAMS    = 1,
-    TRANSCRIBE_ABI_RUN_PARAMS        = 2,
-    TRANSCRIBE_ABI_STREAM_PARAMS     = 3,
-    TRANSCRIBE_ABI_CAPABILITIES      = 4,
-    TRANSCRIBE_ABI_TIMINGS           = 5,
-    TRANSCRIBE_ABI_SEGMENT           = 6,
-    TRANSCRIBE_ABI_WORD              = 7,
-    TRANSCRIBE_ABI_TOKEN             = 8,
-    TRANSCRIBE_ABI_STREAM_UPDATE     = 9,
-    TRANSCRIBE_ABI_STREAM_TEXT       = 10,
-    TRANSCRIBE_ABI_SESSION_LIMITS    = 11,
-    TRANSCRIBE_ABI_EXT               = 12,
-    TRANSCRIBE_ABI_DEVICE_INFO       = 13,
-    TRANSCRIBE_ABI_SPEAKER_SEGMENT   = 14,
+    TRANSCRIBE_ABI_MODEL_LOAD_PARAMS      = 0,
+    TRANSCRIBE_ABI_SESSION_PARAMS         = 1,
+    TRANSCRIBE_ABI_RUN_PARAMS             = 2,
+    TRANSCRIBE_ABI_STREAM_PARAMS          = 3,
+    TRANSCRIBE_ABI_CAPABILITIES           = 4,
+    TRANSCRIBE_ABI_TIMINGS                = 5,
+    TRANSCRIBE_ABI_SEGMENT                = 6,
+    TRANSCRIBE_ABI_WORD                   = 7,
+    TRANSCRIBE_ABI_TOKEN                  = 8,
+    TRANSCRIBE_ABI_STREAM_UPDATE          = 9,
+    TRANSCRIBE_ABI_STREAM_TEXT            = 10,
+    TRANSCRIBE_ABI_SESSION_LIMITS         = 11,
+    TRANSCRIBE_ABI_EXT                    = 12,
+    TRANSCRIBE_ABI_DEVICE_INFO            = 13,
+    TRANSCRIBE_ABI_SPEAKER_SEGMENT        = 14,
+    TRANSCRIBE_ABI_BACKEND_INIT_PARAMS    = 15,
+    /* include/transcribe/diarize.h */
+    TRANSCRIBE_ABI_DIARIZE_INFO           = 16,
+    TRANSCRIBE_ABI_DIARIZE_SESSION_PARAMS = 17,
+    TRANSCRIBE_ABI_DIARIZE_PARAMS         = 18,
+    TRANSCRIBE_ABI_DIARIZE_STREAM_PARAMS  = 19,
 } transcribe_abi_struct;
 
 /* sizeof / alignof of the selected public struct, or 0 for an unknown id.
@@ -446,9 +454,12 @@ TRANSCRIBE_API void transcribe_log_set(transcribe_log_callback cb, void * userda
 /* Task / timestamps                                                       */
 /* ----------------------------------------------------------------------- */
 
+/* INSTRUCT: transcribe_run_params::prompt is the instruction and the output
+ * is free text (only full_text / raw_text are guaranteed). Offline only. */
 typedef enum {
     TRANSCRIBE_TASK_TRANSCRIBE = 0,
     TRANSCRIBE_TASK_TRANSLATE  = 1,
+    TRANSCRIBE_TASK_INSTRUCT   = 2,
 } transcribe_task;
 
 /*
@@ -664,9 +675,13 @@ TRANSCRIBE_API transcribe_status transcribe_ext_check(const struct transcribe_ex
  */
 typedef enum {
     /* transcribe_run_params::family */
-    TRANSCRIBE_EXT_SLOT_RUN    = 0,
+    TRANSCRIBE_EXT_SLOT_RUN            = 0,
     /* transcribe_stream_params::family */
-    TRANSCRIBE_EXT_SLOT_STREAM = 1,
+    TRANSCRIBE_EXT_SLOT_STREAM         = 1,
+    /* transcribe_diarize_params::family (include/transcribe/diarize.h) */
+    TRANSCRIBE_EXT_SLOT_DIARIZE_RUN    = 2,
+    /* transcribe_diarize_stream_params::family (include/transcribe/diarize.h) */
+    TRANSCRIBE_EXT_SLOT_DIARIZE_STREAM = 3,
 } transcribe_ext_slot;
 
 /*
@@ -821,6 +836,47 @@ TRANSCRIBE_API transcribe_status transcribe_init_backends(const char * artifact_
  * no-op returning TRANSCRIBE_OK.
  */
 TRANSCRIBE_API transcribe_status transcribe_init_backends_default(void);
+
+/*
+ * Allowed-backend mask. Registering a GPU backend runs driver code, so a
+ * broken driver can crash the process before any model loads. A backend
+ * outside the mask is never registered: its module is never opened and its
+ * registration function never runs. CPU (incl. BLAS/ZenDNN) is always
+ * allowed; OTHER covers backends without a bit (SYCL, OpenCL, RPC, ...).
+ *
+ * TRANSCRIBE_BACKENDS=cpu,vulkan,... (also metal, cuda, rocm, other, all)
+ * can only narrow the mask, and applies even if _ex() is never called.
+ *
+ * The mask is fixed at first backend registration (first init call, or in
+ * static builds the first device query / model load). A later call with a
+ * different effective mask returns TRANSCRIBE_ERR_BACKEND. Call once, first.
+ */
+#define TRANSCRIBE_BACKEND_MASK_CPU    0x00000001u
+#define TRANSCRIBE_BACKEND_MASK_METAL  0x00000002u
+#define TRANSCRIBE_BACKEND_MASK_VULKAN 0x00000004u
+#define TRANSCRIBE_BACKEND_MASK_CUDA   0x00000008u
+#define TRANSCRIBE_BACKEND_MASK_ROCM   0x00000010u
+#define TRANSCRIBE_BACKEND_MASK_OTHER  0x80000000u
+#define TRANSCRIBE_BACKEND_MASK_ALL    0xFFFFFFFFu
+
+struct transcribe_backend_init_params {
+    uint64_t     struct_size;      /* sizeof(*this); set by _init() */
+    const char * artifact_dir;     /* NULL: package-local default */
+    uint32_t     allowed_backends; /* TRANSCRIBE_BACKEND_MASK_*; default ALL */
+};
+
+TRANSCRIBE_API void transcribe_backend_init_params_init(struct transcribe_backend_init_params * p);
+
+/*
+ * Fix the mask, then behave as transcribe_init_backends(artifact_dir), or
+ * _default() when artifact_dir is NULL. NULL params means all defaults.
+ * Also returns TRANSCRIBE_ERR_BACKEND if the mask was already fixed to a
+ * different value or no device is registered afterwards.
+ */
+TRANSCRIBE_API transcribe_status transcribe_init_backends_ex(const struct transcribe_backend_init_params * params);
+
+/* The effective mask: the host's (ALL until _ex()) narrowed by the env. */
+TRANSCRIBE_API uint32_t transcribe_allowed_backends(void);
 
 /*
  * Opaque process-local compute-device handle. Handles are owned by the
@@ -1050,8 +1106,9 @@ TRANSCRIBE_API void transcribe_session_params_init(struct transcribe_session_par
  * caller-declared input rate, at which point TRANSCRIBE_ERR_SAMPLE_RATE
  * (currently reserved) will become observable.
  *
- * task:        TRANSCRIBE or TRANSLATE. The model must declare support
- *              for translate via its capabilities; otherwise the run
+ * task:        TRANSCRIBE, TRANSLATE or INSTRUCT. The model must declare
+ *              support for translate via its capabilities, and for
+ *              INSTRUCT via TRANSCRIBE_FEATURE_INSTRUCT; otherwise the run
  *              returns TRANSCRIBE_ERR_UNSUPPORTED_TASK.
  *
  * timestamps:  requested granularity. Default params request AUTO,
@@ -1084,8 +1141,9 @@ TRANSCRIBE_API void transcribe_session_params_init(struct transcribe_session_par
  *
  * target_language: target language for translation tasks, or NULL.
  *
- * String-pointer lifetime (language / target_language): caller-owned, and
- * the library copies what it needs before the API call returns. This holds
+ * String-pointer lifetime (language / target_language / vocabulary /
+ * prompt / prefix): caller-owned, and the library copies what it needs
+ * before the API call returns. This holds
  * for transcribe_run / transcribe_run_batch (synchronous) AND for
  * transcribe_stream_begin: the dispatcher copies these strings into
  * session-owned storage at begin, so the caller may free its params —
@@ -1114,6 +1172,29 @@ TRANSCRIBE_API void transcribe_session_params_init(struct transcribe_session_par
  *              ext` as field 0. Use transcribe_model_accepts_ext_kind
  *              to probe whether the loaded model accepts a given kind
  *              before pointing `family` at it.
+ *
+ * spec_k_drafts: speculative-decode draft length for offline runs: -1 is
+ *              the model default, 0 disables it, >0 drafts K tokens per
+ *              verify pass. Ignored unless the model reports
+ *              transcribe_capabilities::supports_spec_decode.
+ *
+ * Generic prompting (vocabulary, prompt, prefix): NULL / 0 / "" means
+ * unused. Each field is gated by the TRANSCRIBE_FEATURE_* bit in
+ * parentheses; limits are in docs/prompting.md.
+ *
+ * vocabulary / n_vocabulary: custom terms in priority order, formatted for
+ *              the family (VOCABULARY). Ignored with a WARN when
+ *              unsupported.
+ *
+ * prompt:      context text under TRANSCRIBE / TRANSLATE (CONTEXT_PROMPT),
+ *              ignored with a WARN when unsupported; the required
+ *              instruction under INSTRUCT. Plain text only: control-token
+ *              literals are rejected.
+ *
+ * prefix:      transcript text the model continues from
+ *              (TRANSCRIPT_PREFIX). Results hold only the continuation,
+ *              except raw_text. An error when unsupported, and under
+ *              INSTRUCT, batch or streaming.
  */
 struct transcribe_run_params {
     uint64_t struct_size;
@@ -1127,29 +1208,12 @@ struct transcribe_run_params {
     const char *                  target_language;
     bool                          keep_special_tags;
     const struct transcribe_ext * family;
+    int32_t                       spec_k_drafts;
 
-    /*
-     * spec_k_drafts: n-gram-lookup speculative-decode draft length for the
-     *   offline autoregressive decode step. Family-portable strategy knob;
-     *   the family decides how K maps to its internal verify graph.
-     *
-     *   Convention:
-     *     -1: family default (each family picks its tuned K).
-     *      0: spec decoding explicitly disabled — standard 1-token-per-step
-     *         autoregression. Use this for byte-equal reproduction of
-     *         pre-spec behavior or when measuring baseline performance.
-     *     >0: draft K tokens per verify pass. Practical range is 1..8;
-     *         optimal K is hardware-dependent (compute-bound hardware
-     *         prefers small K, bandwidth-bound prefers larger K — see
-     *         docs/models/<family>.md for per-family guidance).
-     *
-     *   Families gate this via transcribe_capabilities::supports_spec_decode.
-     *   Setting spec_k_drafts != -1 on a family with
-     *   supports_spec_decode == false is silently ignored (the run proceeds
-     *   as ordinary autoregression). Probe the capability bit if you want
-     *   to know whether the field will take effect.
-     */
-    int32_t spec_k_drafts;
+    const char * const * vocabulary;
+    int32_t              n_vocabulary;
+    const char *         prompt;
+    const char *         prefix;
 };
 
 TRANSCRIBE_API void transcribe_run_params_init(struct transcribe_run_params * params);
@@ -1229,14 +1293,8 @@ struct transcribe_capabilities {
     bool supports_streaming;
 
     /*
-     * supports_spec_decode: gates transcribe_run_params::spec_k_drafts.
-     *   True means the family's offline (transcribe_run / transcribe_run_batch)
-     *   path implements n-gram-lookup speculative decoding. A non-zero
-     *   spec_k_drafts on a model with supports_spec_decode == false is
-     *   silently ignored — the run proceeds as ordinary autoregression. This
-     *   is a soft gate (no error) because spec is purely a performance
-     *   strategy; callers can probe this bit if they want to know whether
-     *   passing K will actually do anything.
+     * supports_spec_decode: the offline path honors
+     *   transcribe_run_params::spec_k_drafts; elsewhere it is ignored.
      */
     bool supports_spec_decode;
 
@@ -1311,15 +1369,37 @@ struct transcribe_capabilities {
 TRANSCRIBE_API void transcribe_capabilities_init(struct transcribe_capabilities * out);
 
 /*
+ * Roles: the kinds of work a loaded model can do. ASR is this header's
+ * transcribe_session_* / transcribe_run* API. The other roles each have
+ * their own header under include/transcribe/ and their own session type.
+ * A model may serve more than one role. Values are bits; append-only.
+ */
+typedef enum {
+    TRANSCRIBE_ROLE_ASR     = 1u << 0,
+    TRANSCRIBE_ROLE_DIARIZE = 1u << 1,
+} transcribe_role;
+
+/*
+ * Bitmask of transcribe_role values the loaded model serves. Fixed at load
+ * and never changes for the model's lifetime. Returns 0 for NULL. Entry
+ * points that need a role the model lacks return
+ * TRANSCRIBE_ERR_UNSUPPORTED_ROLE.
+ */
+TRANSCRIBE_API uint32_t transcribe_model_roles(const struct transcribe_model * model);
+
+/*
  * Read model capabilities into caller-owned storage. The caller
  * initializes *out_caps via transcribe_capabilities_init() (zero-fill);
  * the library writes only the fields that fit and leaves tail bytes
  * beyond the caller's struct_size untouched.
  *
  * Returns:
- *   TRANSCRIBE_ERR_INVALID_ARG     model or out_caps is NULL.
- *   TRANSCRIBE_ERR_BAD_STRUCT_SIZE out_caps->struct_size is 0 or
- *                                  smaller than the library's minimum.
+ *   TRANSCRIBE_ERR_INVALID_ARG      model or out_caps is NULL.
+ *   TRANSCRIBE_ERR_BAD_STRUCT_SIZE  out_caps->struct_size is 0 or
+ *                                   smaller than the library's minimum.
+ *   TRANSCRIBE_ERR_UNSUPPORTED_ROLE the model does not serve
+ *                                   TRANSCRIBE_ROLE_ASR. These are ASR
+ *                                   capabilities; *out_caps is untouched.
  *
  * Pointer fields written by the library (e.g. `languages`) point at
  * model-owned storage and remain valid until transcribe_model_free().
@@ -1337,9 +1417,10 @@ TRANSCRIBE_API transcribe_status transcribe_model_get_capabilities(const struct 
  *
  * Feature meanings:
  *
- *   INITIAL_PROMPT       The model accepts a free-text or token
- *                        prompt to bias decoding. Whisper and Qwen3-ASR expose
- *                        this through their family run extensions.
+ *   INITIAL_PROMPT       The Whisper run extension's initial_prompt /
+ *                        prompt_tokens (transcribe_whisper_run_ext).
+ *                        For portable prompting use the generic
+ *                        fields and the four bits below.
  *
  *   TEMPERATURE_FALLBACK The model runs a multi-tier temperature loop
  *                        with metric-driven fallback. Today: whisper.
@@ -1378,6 +1459,15 @@ TRANSCRIBE_API transcribe_status transcribe_model_get_capabilities(const struct 
  *                        against a model where this returns false emits
  *                        a WARN and proceeds.
  *
+ *   VOCABULARY           transcribe_run_params::vocabulary takes effect.
+ *
+ *   CONTEXT_PROMPT       transcribe_run_params::prompt conditions
+ *                        TRANSCRIBE / TRANSLATE.
+ *
+ *   INSTRUCT             TRANSCRIBE_TASK_INSTRUCT is available.
+ *
+ *   TRANSCRIPT_PREFIX    transcribe_run_params::prefix is honored.
+ *
  * Returns false on NULL model or unknown feature enum.
  */
 typedef enum {
@@ -1388,6 +1478,10 @@ typedef enum {
     TRANSCRIBE_FEATURE_PNC                  = 4,
     TRANSCRIBE_FEATURE_ITN                  = 5,
     TRANSCRIBE_FEATURE_DIARIZATION          = 6,
+    TRANSCRIBE_FEATURE_VOCABULARY           = 7,
+    TRANSCRIBE_FEATURE_CONTEXT_PROMPT       = 8,
+    TRANSCRIBE_FEATURE_INSTRUCT             = 9,
+    TRANSCRIBE_FEATURE_TRANSCRIPT_PREFIX    = 10,
 } transcribe_feature;
 
 TRANSCRIBE_API bool transcribe_model_supports(const struct transcribe_model * model, transcribe_feature feature);
@@ -1488,6 +1582,10 @@ TRANSCRIBE_API void transcribe_model_free(struct transcribe_model * model);
  *
  * params may be NULL for library defaults, or initialize a struct with
  * transcribe_session_params_init(). See transcribe_model_load_file.
+ *
+ * Returns TRANSCRIBE_ERR_UNSUPPORTED_ROLE when the model does not serve
+ * TRANSCRIBE_ROLE_ASR (see transcribe_model_roles); transcribe_open
+ * returns the same and frees the model it loaded.
  */
 TRANSCRIBE_API transcribe_status transcribe_session_init(struct transcribe_model *                model,
                                                          const struct transcribe_session_params * params,
@@ -1555,7 +1653,10 @@ TRANSCRIBE_API const struct transcribe_model * transcribe_get_model(const struct
 /*
  * Run one batch transcription.
  *
- * pcm:        mono float32 PCM samples in [-1.0, 1.0] at 16 kHz.
+ * pcm:        mono float32 PCM samples in [-1.0, 1.0] at 16 kHz. Every
+ *             sample must be finite: NaN or +-Inf returns
+ *             TRANSCRIBE_ERR_INVALID_ARG and leaves the previous result
+ *             in place. Silence is valid.
  * n_samples:  number of samples in pcm. Must be strictly positive;
  *             a non-positive count returns TRANSCRIBE_ERR_INVALID_ARG
  *             (same rule as transcribe_stream_feed).
@@ -1634,7 +1735,10 @@ TRANSCRIBE_API transcribe_status transcribe_run(struct transcribe_session *     
  *                                  or n_samples[i] <= 0) fails only that
  *                                  utterance and is reported there.
  *   TRANSCRIBE_ERR_INVALID_ARG     session / pcm / n_samples NULL, n <= 0,
- *                                  or the session is in an ACTIVE stream.
+ *                                  any utterance holds a non-finite sample
+ *                                  (NaN / +-Inf; the previous result is
+ *                                  preserved), or the session is in an
+ *                                  ACTIVE stream.
  *   TRANSCRIBE_ERR_BAD_STRUCT_SIZE params->struct_size below the minimum.
  *   TRANSCRIBE_ERR_NOT_IMPLEMENTED the model has no run path at all.
  *   ... plus the same shared-param rejections as transcribe_run
@@ -2178,8 +2282,10 @@ TRANSCRIBE_API transcribe_status transcribe_stream_begin(struct transcribe_sessi
  * Feed PCM into the active stream. 16 kHz mono float32, same as
  * transcribe_run.
  *
- * pcm must be non-null and n_samples must be strictly greater than
- * zero. Polling the stream without supplying audio is unsupported —
+ * pcm must be non-null, n_samples must be strictly greater than zero,
+ * and every sample must be finite (NaN / +-Inf returns
+ * TRANSCRIBE_ERR_INVALID_ARG and the stream stays ACTIVE, unchanged).
+ * Polling the stream without supplying audio is unsupported —
  * use the stream accessors (transcribe_stream_revision,
  * transcribe_stream_get_text, transcribe_stream_n_committed_*,
  * transcribe_stream_last_status, transcribe_stream_get_state) to inspect

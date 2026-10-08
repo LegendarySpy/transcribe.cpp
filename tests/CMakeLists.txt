@@ -69,6 +69,29 @@ if(TRANSCRIBE_COREML AND TRANSCRIBE_BUILD_EXAMPLES)
 endif()
 
 
+# Allowed-backend mask (transcribe_init_backends_ex). The mask is fixed per
+# process, so each scenario is its own test invocation.
+add_executable(transcribe_backend_mask_unit
+    backend_mask_unit.c
+)
+
+set_target_properties(transcribe_backend_mask_unit PROPERTIES
+    C_STANDARD          11
+    C_STANDARD_REQUIRED ON
+    LINKER_LANGUAGE     C
+)
+
+target_link_libraries(transcribe_backend_mask_unit PRIVATE transcribe)
+
+foreach(mode cpu default env-cpu late)
+    add_test(NAME transcribe_backend_mask_unit_${mode}
+        COMMAND transcribe_backend_mask_unit ${mode})
+    set_tests_properties(transcribe_backend_mask_unit_${mode} PROPERTIES
+        ENVIRONMENT "TRANSCRIBE_TEST_BACKEND_DIR=$<TARGET_FILE_DIR:transcribe_backend_mask_unit>")
+endforeach()
+set_tests_properties(transcribe_backend_mask_unit_env-cpu PROPERTIES
+    ENVIRONMENT "TRANSCRIBE_TEST_BACKEND_DIR=$<TARGET_FILE_DIR:transcribe_backend_mask_unit>;TRANSCRIBE_BACKENDS=cpu")
+
 add_test(
     NAME transcribe_extension_umbrella_check
     COMMAND ${CMAKE_COMMAND}
@@ -185,6 +208,31 @@ transcribe_apply_warnings(transcribe_parakeet_chunked_limited_with_rc_mask_unit)
 add_test(NAME transcribe_parakeet_chunked_limited_with_rc_mask_unit
     COMMAND transcribe_parakeet_chunked_limited_with_rc_mask_unit)
 
+# Compact offline ChunkedLimited attention mask. Proves that the bounded
+# [window,chunk,n_chunks] representation reconstructs the original dense
+# [T,T] chunk topology and relative-position offsets for ragged geometries.
+
+add_executable(transcribe_parakeet_chunked_limited_window_mask_unit
+    parakeet_chunked_limited_window_mask_unit.cpp)
+
+target_link_libraries(transcribe_parakeet_chunked_limited_window_mask_unit
+    PRIVATE transcribe ggml)
+
+target_include_directories(transcribe_parakeet_chunked_limited_window_mask_unit
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_parakeet_chunked_limited_window_mask_unit)
+
+add_test(NAME transcribe_parakeet_chunked_limited_window_mask_unit
+    COMMAND transcribe_parakeet_chunked_limited_window_mask_unit)
+
+# Long-form pause segmenter vs kestrel-generated expected cut points.
+add_executable(transcribe_parakeet_longform_unit parakeet_longform_unit.cpp)
+target_link_libraries(transcribe_parakeet_longform_unit PRIVATE transcribe ggml)
+target_include_directories(transcribe_parakeet_longform_unit PRIVATE ${CMAKE_SOURCE_DIR}/src)
+transcribe_apply_warnings(transcribe_parakeet_longform_unit)
+add_test(NAME transcribe_parakeet_longform_unit COMMAND transcribe_parakeet_longform_unit)
+
 # -----------------------------------------------------------------------------
 # Variable-length batch mask and causal subsampling unit test
 # -----------------------------------------------------------------------------
@@ -200,6 +248,22 @@ target_include_directories(transcribe_batch_mask_unit PRIVATE
 transcribe_apply_warnings(transcribe_batch_mask_unit)
 
 add_test(NAME transcribe_batch_mask_unit COMMAND transcribe_batch_mask_unit)
+
+# -----------------------------------------------------------------------------
+# Tekken (Mistral / Voxtral) pretokenizer split (pure host, no model)
+# -----------------------------------------------------------------------------
+
+add_executable(transcribe_tekken_pretok_unit
+    tekken_pretok_unit.cpp)
+
+target_link_libraries(transcribe_tekken_pretok_unit PRIVATE transcribe)
+
+target_include_directories(transcribe_tekken_pretok_unit PRIVATE
+    ${CMAKE_SOURCE_DIR}/src)
+
+transcribe_apply_warnings(transcribe_tekken_pretok_unit)
+
+add_test(NAME transcribe_tekken_pretok_unit COMMAND transcribe_tekken_pretok_unit)
 
 # -----------------------------------------------------------------------------
 # Chunked-prefill causal mask geometry (pure host, no model)
@@ -316,6 +380,19 @@ transcribe_apply_warnings(transcribe_run_dispatch_unit)
 
 add_test(NAME transcribe_run_dispatch_unit
     COMMAND transcribe_run_dispatch_unit)
+
+# -----------------------------------------------------------------------------
+# Dispatcher units against fake arches: roles, host thread pool, non-finite
+# input, throwing stream hooks, DIARIZE role
+# -----------------------------------------------------------------------------
+
+foreach(_t role_resolve run_on_threads nonfinite_input stream_hook_throw diarize_dispatch)
+    add_executable(transcribe_${_t}_unit ${_t}_unit.cpp)
+    target_link_libraries(transcribe_${_t}_unit PRIVATE transcribe)
+    target_include_directories(transcribe_${_t}_unit PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    transcribe_apply_warnings(transcribe_${_t}_unit)
+    add_test(NAME transcribe_${_t}_unit COMMAND transcribe_${_t}_unit)
+endforeach()
 
 # -----------------------------------------------------------------------------
 # Dispatcher-level streaming entry-point behavior
@@ -1176,6 +1253,22 @@ if(TRANSCRIBE_BUILD_REAL_MODEL_TESTS)
         COMMAND transcribe_whisper_tokenize_parity)
     set_tests_properties(transcribe_whisper_tokenize_parity PROPERTIES
         SKIP_RETURN_CODE 77)
+
+    # Voxtral: token ids match mistral-common's Tekkenizer (Tekken
+    # pretokenizer + converter-rebuilt merges). Gated by
+    # TRANSCRIBE_VOXTRAL_GGUF.
+    add_executable(transcribe_voxtral_tokenize_parity
+        voxtral_tokenize_parity.cpp)
+
+    target_link_libraries(transcribe_voxtral_tokenize_parity
+        PRIVATE transcribe)
+
+    transcribe_apply_warnings(transcribe_voxtral_tokenize_parity)
+
+    add_test(NAME transcribe_voxtral_tokenize_parity
+        COMMAND transcribe_voxtral_tokenize_parity)
+    set_tests_properties(transcribe_voxtral_tokenize_parity PROPERTIES
+        SKIP_RETURN_CODE 77)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -1260,6 +1353,23 @@ if(TRANSCRIBE_BUILD_REAL_MODEL_TESTS)
     set_tests_properties(transcribe_qwen3_asr_bpe_parity PROPERTIES
         SKIP_RETURN_CODE 77)
 
+    # SentencePiece BPE encoder parity (canary2 transcript prefix),
+    # gated on TRANSCRIBE_CANARY_1B_V2_GGUF / TRANSCRIBE_CANARY_FLASH_GGUF.
+    # Expected ids come from the reference sentencepiece library via
+    # scripts/gen_sentencepiece_bpe_fixture.py.
+    add_executable(transcribe_sentencepiece_bpe_parity
+        sentencepiece_bpe_parity.cpp)
+    target_link_libraries(transcribe_sentencepiece_bpe_parity PRIVATE transcribe ggml)
+    target_include_directories(transcribe_sentencepiece_bpe_parity PRIVATE
+        ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(transcribe_sentencepiece_bpe_parity PRIVATE
+        "TRANSCRIBE_TEST_FIXTURES_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/fixtures\"")
+    transcribe_apply_warnings(transcribe_sentencepiece_bpe_parity)
+    add_test(NAME transcribe_sentencepiece_bpe_parity
+        COMMAND transcribe_sentencepiece_bpe_parity)
+    set_tests_properties(transcribe_sentencepiece_bpe_parity PROPERTIES
+        SKIP_RETURN_CODE 77)
+
     add_executable(transcribe_qwen3_asr_e2e_smoke
         qwen3_asr_e2e_smoke.cpp)
 
@@ -1276,24 +1386,19 @@ if(TRANSCRIBE_BUILD_REAL_MODEL_TESTS)
     set_tests_properties(transcribe_qwen3_asr_e2e_smoke PROPERTIES
         SKIP_RETURN_CODE 77)
 
-    # Sortformer streaming operating-point run ext (SFST, RUN slot).
-    # Kind/slot probe, init stamping, pre-clear rejection with snapshot
-    # preservation, and ext-vs-env preset parity on the committed 2-spk
-    # oracle mix. Gated by TRANSCRIBE_SORTFORMER_GGUF (RC 77 skip).
-    add_executable(transcribe_sortformer_stream_ext_unit
-        sortformer_stream_ext_unit.cpp)
-
-    target_link_libraries(transcribe_sortformer_stream_ext_unit
+    # Sortformer on the DIARIZE role: golden segments per preset and pre-clear
+    # rejection.
+    # Gated by TRANSCRIBE_SORTFORMER_GGUF (RC 77 skip).
+    add_executable(transcribe_sortformer_diarize_unit
+        sortformer_diarize_unit.cpp)
+    target_link_libraries(transcribe_sortformer_diarize_unit
         PRIVATE transcribe transcribe-common-example)
-
-    target_compile_definitions(transcribe_sortformer_stream_ext_unit PRIVATE
+    target_compile_definitions(transcribe_sortformer_diarize_unit PRIVATE
         "TRANSCRIBE_TEST_SAMPLES_DIR=\"${CMAKE_SOURCE_DIR}/samples\"")
-
-    transcribe_apply_warnings(transcribe_sortformer_stream_ext_unit)
-
-    add_test(NAME transcribe_sortformer_stream_ext_unit
-        COMMAND transcribe_sortformer_stream_ext_unit)
-    set_tests_properties(transcribe_sortformer_stream_ext_unit PROPERTIES
+    transcribe_apply_warnings(transcribe_sortformer_diarize_unit)
+    add_test(NAME transcribe_sortformer_diarize_unit
+        COMMAND transcribe_sortformer_diarize_unit)
+    set_tests_properties(transcribe_sortformer_diarize_unit PROPERTIES
         SKIP_RETURN_CODE 77)
 
     # Nemotron-3 Diarization through the same SFST run ext: preset menu,
@@ -1587,4 +1692,13 @@ if(TRANSCRIBE_BUILD_EXAMPLES)
             -DCLI=$<TARGET_FILE:transcribe-cli>
             -DWAV=${CMAKE_SOURCE_DIR}/samples/jfk.wav
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_device_arg_smoke.cmake)
+
+    add_test(NAME transcribe_cli_diarize_smoke
+        COMMAND ${CMAKE_COMMAND}
+            -DCLI=$<TARGET_FILE:transcribe-cli>
+            -DWAV=${CMAKE_SOURCE_DIR}/samples/sortformer-2spk-mix.wav
+            -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli-diarize-smoke
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_diarize_smoke.cmake)
+    set_tests_properties(transcribe_cli_diarize_smoke PROPERTIES
+        SKIP_REGULAR_EXPRESSION "SKIP:")
 endif()

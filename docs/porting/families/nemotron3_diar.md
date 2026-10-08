@@ -14,11 +14,12 @@ Transformer over 8-frame mel stacking (no FastConformer, no second
 Transformer), the head upsamples back to the mel rate with a sub-pixel
 convolution, the speaker cache stores embedder outputs and uses a learned
 silence embedding, and cache probabilities are pooled from the 10 ms output.
-The public surface is shared: the `SFST` run extension, its preset enum,
-and the transcript-independent `transcribe_speaker_segment` output, so a
-caller that drives Sortformer v2.1 drives this model unchanged. On top of
-that, this family implements push-audio live diarization
-(`transcribe_stream_*` with the `SFLV` stream extension).
+The public surface is shared: the DIARIZE role (`docs/roles.md`), the
+`SFDR` diarize extension, its preset enum, and the
+`transcribe_speaker_segment` output, so a caller that drives Sortformer v2.1
+drives this model unchanged. On top of that, this family implements
+push-audio live diarization (`transcribe_diarize_stream_*` with the `SFLV`
+extension).
 
 ## Identity
 
@@ -84,13 +85,13 @@ stream path.
 
 ### Push-audio streaming
 
-`transcribe_stream_begin` / `feed` / `finalize` with
-`transcribe_sortformer_live_ext` (`SFLV`, STREAM slot) on
-`transcribe_stream_params::family`. Accepted presets: `LOW_LATENCY` (the
+`transcribe_diarize_stream_begin` / `feed` / `finalize` with
+`transcribe_sortformer_live_ext` (`SFLV`, DIARIZE_STREAM slot) on
+`transcribe_diarize_stream_params::family`. Accepted presets: `LOW_LATENCY` (the
 init default, and the preset of a stream begun without an extension),
 `VERY_LOW_LATENCY`, `ULTRA_LOW_LATENCY`. `DEFAULT`, `VERY_HIGH_LATENCY` and
 `HIGH_LATENCY` are rejected pre-clear: a 30 s lookahead is a file workload,
-and `transcribe_run` already serves it.
+and `transcribe_diarize_run` already serves it.
 
 Feeds take any piece size. Each stage runs only on input that can no longer
 change (`model.cpp`, "Push-audio streaming"):
@@ -106,7 +107,7 @@ change (`model.cpp`, "Push-audio streaming"):
   the same step input the batch run builds. Finalize flushes the tail with
   the batch run's short lookahead, trailing padding frame and key mask.
 
-The stream therefore reproduces `transcribe_run` at the same preset, bit for
+The stream therefore reproduces `transcribe_diarize_run` at the same preset, bit for
 bit. Mid-stream rows follow the rule in `sortformer.h`: the processed
 frontier is `transcribe_stream_update::audio_committed_ms`; a row with
 `t1_ms < audio_committed_ms` is final, a row with `t1_ms ==
@@ -178,7 +179,7 @@ Diarization substitutes for the forced transcription rows, as for
 | Cache compression | `small` preset (cache 24) | `VALIDATE_NEMOTRON3_DIAR_PRESET=small` | prob parity through compression | MUST PASS | PASS — 3.6e-6, zero flips |
 | Speaker-activity tensor | debug dump | `diar.probs` [T, 8] | parity with the reference | MUST PASS | PASS |
 | Full-context forward | offline dump | `diar.preds_offline` + per-stage `enc.*` | parity with the reference | MUST PASS | PASS — 9/9 tensors |
-| Push-audio live streaming | `transcribe_stream_*`, `SFLV` | `transcribe_nemotron3_diar_stream_unit` + AMI DER (`--stream-chunk-ms`) | stream rows == batch rows at the same preset; final-only mid-stream rows | MUST PASS | PASS — bit-identical to the batch run (CPU/Metal, F32/Q8_0, all stream presets + `small`, 1 sample to 1 s feeds); AMI below |
+| Push-audio live streaming | `transcribe_diarize_stream_*`, `SFLV` | `transcribe_nemotron3_diar_stream_unit` + AMI DER (`--stream-chunk-ms`) | stream rows == batch rows at the same preset; final-only mid-stream rows | MUST PASS | PASS — bit-identical to the batch run (CPU/Metal, F32/Q8_0, all stream presets + `small`, 1 sample to 1 s feeds); AMI below |
 | Batch (`run_batch`) | n/a | n/a | n/a | ACCEPTED GAP — single-session runs only, as `sortformer` | N/A |
 | Transcription / translation / timestamps | n/a | n/a | no text output | OUT OF SCOPE — not a transcription model | N/A |
 

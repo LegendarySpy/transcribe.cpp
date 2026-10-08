@@ -27,7 +27,8 @@
 //! - [`Session`] is `Send` but not `Sync`; its mutating calls take `&mut self`,
 //!   so the type system enforces one-call-at-a-time.
 //! - **0.x concurrency:** the C library permits at most one in-flight
-//!   `run`/stream across all sessions of a model. This crate enforces that with
+//!   `run`/stream across all sessions of a model, [`DiarizeSession`]s
+//!   included. This crate enforces that with
 //!   a per-model mutex (held only for the native compute call), so concurrent
 //!   calls from many sessions queue rather than race. For real parallelism, use
 //!   one [`Model`] per worker today.
@@ -47,6 +48,7 @@ pub use transcribe_cpp_sys as sys;
 
 mod backend;
 mod cancel;
+mod diarize;
 mod error;
 mod family;
 mod logging;
@@ -58,16 +60,20 @@ mod types;
 mod version;
 
 pub use backend::{
-    backend_available, device_count, devices, init_backends, init_backends_default, Device,
-    DeviceType,
+    allowed_backends, backend_available, device_count, devices, init_backends,
+    init_backends_default, init_backends_with, BackendMask, Device, DeviceType,
 };
 pub use cancel::CancelToken;
-pub use error::{Error, Result};
+pub use diarize::{
+    DiarizeInfo, DiarizeOptions, DiarizeSession, DiarizeSessionOptions, DiarizeStream,
+    DiarizeStreamOptions, OwnedDiarizeStream,
+};
+pub use error::{Error, ErrorKind, ErrorReport, Result};
 pub use family::{
-    MoonshineStreamingOptions, ParakeetBufferedStreamOptions, ParakeetRunOptions,
-    ParakeetStreamOptions, Qwen3AsrRunOptions, RunExtension, SortformerLiveOptions,
-    SortformerPreset, SortformerStreamOptions, StreamExtension, VoxtralRealtimeStreamOptions,
-    WhisperRunOptions,
+    DiarizeExtension, DiarizeStreamExtension, MoonshineStreamingOptions,
+    ParakeetBufferedStreamOptions, ParakeetRunOptions, ParakeetStreamOptions, Qwen3AsrRunOptions,
+    RunExtension, SortformerDiarizeOptions, SortformerLiveOptions, SortformerPreset,
+    StreamExtension, VoxtralRealtimeStreamOptions, WhisperRunOptions,
 };
 pub use logging::{disable_logging, init_logging};
 pub use model::{Capabilities, Model, ModelOptions, SessionLimits, SessionOptions};
@@ -75,8 +81,8 @@ pub use result::{Segment, SpeakerSegment, Timings, Token, Transcript, Word};
 pub use session::{OwnedStream, RunOptions, Session, Stream};
 pub use streaming::{StreamOptions, StreamText, StreamUpdate};
 pub use types::{
-    AbiStruct, Backend, CommitPolicy, Diarize, ExtSlot, Feature, Itn, KvType, Pnc, StreamState,
-    Task, TimestampKind,
+    AbiStruct, Backend, CommitPolicy, Diarize, ExtSlot, Feature, Itn, KvType, Pnc, Role, Roles,
+    StreamState, Task, TimestampKind,
 };
 pub use version::{
     abi_struct_align, abi_struct_size, compiled_version, header_hash, version, version_commit,

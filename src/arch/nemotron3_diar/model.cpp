@@ -51,12 +51,10 @@ Model::~Model() {
 
 Session::~Session() = default;
 
+// A DIARIZE-role model (transcribe_model_roles): no ASR capabilities; the
+// abort callback is honored (transcribe_diarize_set_abort_callback).
 void apply_family_invariants(transcribe_model & model) {
-    transcribe_capabilities & caps = model.caps;
-    caps.native_sample_rate        = 16000;
-    caps.supports_translate        = false;
-    caps.max_timestamp_kind        = TRANSCRIBE_TIMESTAMPS_NONE;
-    transcribe::set_feature(&model, TRANSCRIBE_FEATURE_DIARIZATION, true);
+    model.roles = TRANSCRIBE_ROLE_DIARIZE;
     transcribe::set_feature(&model, TRANSCRIBE_FEATURE_CANCELLATION, true);
 }
 
@@ -397,26 +395,6 @@ transcribe_status run_chunks(Session *            s,
     return TRANSCRIBE_OK;
 }
 
-void emit_segments(Session * s, int n_frames, int n_spk, double ms_per_frame) {
-    for (int spk = 0; spk < n_spk; ++spk) {
-        int run_start = -1;
-        for (int t = 0; t <= n_frames; ++t) {
-            const bool active = t < n_frames && s->probs[static_cast<size_t>(t) * n_spk + spk] > 0.5f;
-            if (active && run_start < 0) {
-                run_start = t;
-            } else if (!active && run_start >= 0) {
-                transcribe_session::SpeakerSegmentEntry row;
-                row.t0_ms      = static_cast<int64_t>(std::llround(run_start * ms_per_frame));
-                row.t1_ms      = static_cast<int64_t>(std::llround(t * ms_per_frame));
-                row.speaker_id = spk + 1;
-                row.p          = std::numeric_limits<float>::quiet_NaN();
-                s->speaker_segments.push_back(row);
-                run_start = -1;
-            }
-        }
-    }
-}
-
 transcribe_status load(Loader & loader, const transcribe_model_load_params * params, transcribe_model ** out_model) {
     const int64_t t_start = ggml_time_us();
     auto          m       = std::make_unique<Model>();
@@ -424,14 +402,6 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     m->variant            = loader.variant().empty() ? k_default_variant : loader.variant();
 
     apply_family_invariants(*m);
-    m->caps.n_languages = 0;
-    m->caps.languages   = nullptr;
-    if (const transcribe_status st = read_capability_kv(loader.gguf(), m->caps); st != TRANSCRIBE_OK) {
-        return st;
-    }
-    if (const transcribe_status st = read_languages_kv(loader.gguf(), *m); st != TRANSCRIBE_OK) {
-        return st;
-    }
     if (const transcribe_status st = read_hparams(loader.gguf(), m->hparams); st != TRANSCRIBE_OK) {
         return st;
     }
@@ -494,48 +464,62 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     return TRANSCRIBE_OK;
 }
 
-transcribe_status init_context(transcribe_model *                model,
-                               const transcribe_session_params * params,
-                               transcribe_session **             out_ctx) {
-    if (model->arch != &arch) {
-        return TRANSCRIBE_ERR_INVALID_ARG;
-    }
-    auto s       = std::make_unique<Session>();
-    s->model     = model;
-    s->n_threads = params->n_threads;
-    s->kv_type   = params->kv_type;
-    *out_ctx     = s.release();
-    return TRANSCRIBE_OK;
+transcribe_diarize_session * new_session() {
+    return new Session();
 }
 
-transcribe_sortformer_preset requested_preset(const transcribe_run_params * params) {
-    if (params == nullptr || params->family == nullptr) {
-        return TRANSCRIBE_SORTFORMER_PRESET_DEFAULT;
-    }
-    return reinterpret_cast<const transcribe_sortformer_stream_ext *>(params->family)->preset;
+int max_speakers(const transcribe_model * model) {
+    return static_cast<const Model *>(model)->hparams.max_speakers;
 }
 
-transcribe_status run(transcribe_session *          session,
-                      const float *                 pcm,
-                      int                           n_samples,
-                      const transcribe_run_params * params) {
+// The caller's preset as a raw int (see transcribe::enum_field_raw): an
+// out-of-range value must be rejected before it is loaded as the enum.
+int preset_raw(const transcribe_ext * family) {
+    return transcribe::enum_field_raw(&reinterpret_cast<const transcribe_sortformer_diarize_ext *>(family)->preset);
+}
+
+// The v3 operating points (no HIGH_LATENCY point); the geometry itself is
+// resolved against the GGUF in run.
+bool known_preset(int preset) {
+    switch (preset) {
+        case TRANSCRIBE_SORTFORMER_PRESET_DEFAULT:
+        case TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY:
+        case TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY:
+        case TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY:
+        case TRANSCRIBE_SORTFORMER_PRESET_ULTRA_LOW_LATENCY:
+            return true;
+        default:
+            return false;
+    }
+}
+
+transcribe_status run_validate(const transcribe_diarize_params * params) {
+    if (const transcribe_status st = transcribe_ext_check(params->family, TRANSCRIBE_EXT_KIND_SORTFORMER_DIARIZE,
+                                                          sizeof(struct transcribe_sortformer_diarize_ext));
+        st != TRANSCRIBE_OK || params->family == nullptr) {
+        return st;
+    }
+    return known_preset(preset_raw(params->family)) ? TRANSCRIBE_OK : TRANSCRIBE_ERR_INVALID_ARG;
+}
+
+transcribe_status run(transcribe_diarize_session *      session,
+                      const float *                     pcm,
+                      int                               n_samples,
+                      const transcribe_diarize_params * params,
+                      DiarizeProbs &                    out) {
     auto * s = static_cast<Session *>(session);
     auto * m = static_cast<Model *>(session->model);
     if (s->poll_abort()) {
         return TRANSCRIBE_ERR_ABORTED;
     }
-    if (params != nullptr && params->family != nullptr) {
-        if (const transcribe_status st = transcribe_ext_check(params->family, TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM,
-                                                              sizeof(struct transcribe_sortformer_stream_ext));
-            st != TRANSCRIBE_OK) {
-            return st;
-        }
-    }
+    // Range-checked by run_validate before the dispatcher got here.
+    const auto   preset = params != nullptr && params->family != nullptr ?
+                              static_cast<transcribe_sortformer_preset>(preset_raw(params->family)) :
+                              TRANSCRIBE_SORTFORMER_PRESET_DEFAULT;
     StreamParams sp{};
-    if (!resolve_stream_params(m->hparams, requested_preset(params), sp)) {
+    if (!resolve_stream_params(m->hparams, preset, sp)) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
-    s->clear_result();
     transcribe::debug::init();
     if (!m->mel.has_value()) {
         return TRANSCRIBE_ERR_INVALID_ARG;
@@ -590,11 +574,10 @@ transcribe_status run(transcribe_session *          session,
         transcribe::debug::dump_host_f32("diar.probs", s->probs.data(), static_cast<long long>(s->probs.size()), shape,
                                          2, "diarize");
     }
-    const double ms_per_frame = 1000.0 * m->hparams.frame_hop / m->hparams.fe_sample_rate;
-    emit_segments(s, n_frames, S, ms_per_frame);
-
-    s->result_kind = TRANSCRIBE_TIMESTAMPS_NONE;
-    s->has_result  = true;
+    out.probs      = s->probs;
+    out.n_frames   = n_frames;
+    out.n_speakers = S;
+    out.frame_ms   = 1000.0 * m->hparams.frame_hop / m->hparams.fe_sample_rate;
     return TRANSCRIBE_OK;
 }
 
@@ -602,22 +585,8 @@ bool accepts_ext_kind(const transcribe_model * model, transcribe_ext_slot slot, 
     if (model == nullptr) {
         return false;
     }
-    return (slot == TRANSCRIBE_EXT_SLOT_RUN && kind == TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM) ||
-           (slot == TRANSCRIBE_EXT_SLOT_STREAM && kind == TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE);
-}
-
-transcribe_status run_validate(const transcribe_session * session, const transcribe_run_params * params) {
-    if (params == nullptr || params->family == nullptr) {
-        return TRANSCRIBE_OK;
-    }
-    if (const transcribe_status st = transcribe_ext_check(params->family, TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM,
-                                                          sizeof(struct transcribe_sortformer_stream_ext));
-        st != TRANSCRIBE_OK) {
-        return st;
-    }
-    const auto * m = static_cast<const Model *>(session->model);
-    StreamParams sp{};
-    return resolve_stream_params(m->hparams, requested_preset(params), sp) ? TRANSCRIBE_OK : TRANSCRIBE_ERR_INVALID_ARG;
+    return (slot == TRANSCRIBE_EXT_SLOT_DIARIZE_RUN && kind == TRANSCRIBE_EXT_KIND_SORTFORMER_DIARIZE) ||
+           (slot == TRANSCRIBE_EXT_SLOT_DIARIZE_STREAM && kind == TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE);
 }
 
 // ---- Push-audio streaming -------------------------------------------------
@@ -632,16 +601,19 @@ transcribe_status run_validate(const transcribe_session * session, const transcr
 // the pre-emphasis carry of that frame come from already-received audio.
 constexpr int k_live_mel_guard = 2;
 
-transcribe_status resolve_live_params(const Model * m, const transcribe_stream_params * sp, StreamParams & out) {
+transcribe_status resolve_live_params(const Model *                            m,
+                                      const transcribe_diarize_stream_params * sp,
+                                      StreamParams &                           out) {
     const transcribe_ext * fam = sp != nullptr ? sp->family : nullptr;
     if (const transcribe_status st = transcribe_ext_check(fam, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE,
                                                           sizeof(struct transcribe_sortformer_live_ext));
         st != TRANSCRIBE_OK) {
         return st;
     }
-    const transcribe_sortformer_preset preset =
-        fam != nullptr ? reinterpret_cast<const transcribe_sortformer_live_ext *>(fam)->preset :
-                         TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY;
+    const int preset =
+        fam != nullptr ?
+            transcribe::enum_field_raw(&reinterpret_cast<const transcribe_sortformer_live_ext *>(fam)->preset) :
+            TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY;
     switch (preset) {
         case TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY:
         case TRANSCRIBE_SORTFORMER_PRESET_VERY_LOW_LATENCY:
@@ -650,7 +622,9 @@ transcribe_status resolve_live_params(const Model * m, const transcribe_stream_p
         default:
             return TRANSCRIBE_ERR_INVALID_ARG;
     }
-    return resolve_stream_params(m->hparams, preset, out) ? TRANSCRIBE_OK : TRANSCRIBE_ERR_INVALID_ARG;
+    return resolve_stream_params(m->hparams, static_cast<transcribe_sortformer_preset>(preset), out) ?
+               TRANSCRIBE_OK :
+               TRANSCRIBE_ERR_INVALID_ARG;
 }
 
 // Mel frames up to the final count (all frames at finalize, zeroing the
@@ -775,7 +749,7 @@ bool live_rows(Session * s, Model * m, bool final) {
             if (active && run_start < 0) {
                 run_start = t;
             } else if (!active && run_start >= 0) {
-                transcribe_session::SpeakerSegmentEntry row;
+                transcribe::SpeakerSegmentEntry row;
                 row.t0_ms      = to_ms(run_start);
                 row.t1_ms      = to_ms(t);
                 row.speaker_id = spk + 1;
@@ -787,12 +761,12 @@ bool live_rows(Session * s, Model * m, bool final) {
     }
     lv.n_scanned = n_frames;
 
-    std::vector<transcribe_session::SpeakerSegmentEntry> rows;
+    std::vector<transcribe::SpeakerSegmentEntry> rows;
     for (int spk = 0; spk < S; ++spk) {
         const auto & closed = lv.closed[static_cast<size_t>(spk)];
         rows.insert(rows.end(), closed.begin(), closed.end());
         if (const int run_start = lv.open_start[static_cast<size_t>(spk)]; run_start >= 0) {
-            transcribe_session::SpeakerSegmentEntry row;
+            transcribe::SpeakerSegmentEntry row;
             row.t0_ms      = to_ms(run_start);
             row.t1_ms      = to_ms(n_frames);
             row.speaker_id = spk + 1;
@@ -800,12 +774,11 @@ bool live_rows(Session * s, Model * m, bool final) {
             rows.push_back(row);
         }
     }
-    const bool changed =
-        !std::equal(rows.begin(), rows.end(), s->speaker_segments.begin(), s->speaker_segments.end(),
-                    [](const auto & a, const auto & b) {
-                        return a.t0_ms == b.t0_ms && a.t1_ms == b.t1_ms && a.speaker_id == b.speaker_id;
-                    });
-    s->speaker_segments.swap(rows);
+    const bool changed = !std::equal(
+        rows.begin(), rows.end(), s->segments.begin(), s->segments.end(), [](const auto & a, const auto & b) {
+            return a.t0_ms == b.t0_ms && a.t1_ms == b.t1_ms && a.speaker_id == b.speaker_id;
+        });
+    s->segments.swap(rows);
     return changed;
 }
 
@@ -849,16 +822,14 @@ transcribe_status live_process(Session * s, Model * m, bool final, transcribe_st
     return TRANSCRIBE_OK;
 }
 
-transcribe_status stream_validate(const transcribe_session * session,
-                                  const transcribe_run_params * /*run_params*/,
-                                  const transcribe_stream_params * stream_params) {
+transcribe_status stream_validate(const transcribe_diarize_session *       session,
+                                  const transcribe_diarize_stream_params * stream_params) {
     StreamParams sp{};
     return resolve_live_params(static_cast<const Model *>(session->model), stream_params, sp);
 }
 
-transcribe_status stream_begin(transcribe_session * session,
-                               const transcribe_run_params * /*run_params*/,
-                               const transcribe_stream_params * stream_params) {
+transcribe_status stream_begin(transcribe_diarize_session *             session,
+                               const transcribe_diarize_stream_params * stream_params) {
     auto * s = static_cast<Session *>(session);
     auto * m = static_cast<Model *>(session->model);
     if (!m->mel.has_value()) {
@@ -877,15 +848,13 @@ transcribe_status stream_begin(transcribe_session * session,
     s->live.closed.assign(S, {});
     s->cache.reset();
     s->probs.clear();
-    s->result_kind = TRANSCRIBE_TIMESTAMPS_NONE;
-    s->has_result  = true;
     return TRANSCRIBE_OK;
 }
 
-transcribe_status stream_feed(transcribe_session *       session,
-                              const float *              pcm,
-                              int                        n_samples,
-                              transcribe_stream_update * update) {
+transcribe_status stream_feed(transcribe_diarize_session * session,
+                              const float *                pcm,
+                              int                          n_samples,
+                              transcribe_stream_update *   update) {
     auto * s = static_cast<Session *>(session);
     if (s->poll_abort()) {
         return TRANSCRIBE_ERR_ABORTED;
@@ -895,7 +864,7 @@ transcribe_status stream_feed(transcribe_session *       session,
     return live_process(s, static_cast<Model *>(session->model), false, update);
 }
 
-transcribe_status stream_finalize(transcribe_session * session, transcribe_stream_update * update) {
+transcribe_status stream_finalize(transcribe_diarize_session * session, transcribe_stream_update * update) {
     auto * s = static_cast<Session *>(session);
     if (s->poll_abort()) {
         return TRANSCRIBE_ERR_ABORTED;
@@ -903,28 +872,41 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
     return live_process(s, static_cast<Model *>(session->model), true, update);
 }
 
-void stream_reset(transcribe_session * session) {
+void stream_reset(transcribe_diarize_session * session) {
     auto * s = static_cast<Session *>(session);
     s->live.reset();
     s->cache.reset();
     s->probs.clear();
 }
 
+const DiarizeOps k_diarize_ops = {
+    /* .max_speakers    = */ max_speakers,
+    /* .new_session     = */ new_session,
+    /* .run_validate    = */ run_validate,
+    /* .run             = */ run,
+    /* .stream_validate = */ stream_validate,
+    /* .stream_begin    = */ stream_begin,
+    /* .stream_feed     = */ stream_feed,
+    /* .stream_finalize = */ stream_finalize,
+    /* .stream_reset    = */ stream_reset,
+};
+
 }  // namespace
 
 extern const Arch arch = {
     /* .name             = */ "nemotron3_diar",
     /* .load             = */ load,
-    /* .init_context     = */ init_context,
-    /* .run              = */ run,
+    /* .init_context     = */ nullptr,
+    /* .run              = */ nullptr,
     /* .run_batch        = */ nullptr,
-    /* .stream_validate  = */ stream_validate,
-    /* .stream_begin     = */ stream_begin,
-    /* .stream_feed      = */ stream_feed,
-    /* .stream_finalize  = */ stream_finalize,
-    /* .stream_reset     = */ stream_reset,
+    /* .stream_validate  = */ nullptr,
+    /* .stream_begin     = */ nullptr,
+    /* .stream_feed      = */ nullptr,
+    /* .stream_finalize  = */ nullptr,
+    /* .stream_reset     = */ nullptr,
     /* .accepts_ext_kind = */ accepts_ext_kind,
-    /* .run_validate     = */ run_validate,
+    /* .run_validate     = */ nullptr,
+    /* .diarize          = */ &k_diarize_ops,
 };
 
 }  // namespace transcribe::nemotron3_diar

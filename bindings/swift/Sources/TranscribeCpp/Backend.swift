@@ -110,6 +110,10 @@ public enum AbiStruct: Sendable {
     case sessionLimits
     case ext
     case deviceInfo
+    case diarizeInfo
+    case diarizeSessionParams
+    case diarizeParams
+    case diarizeStreamParams
 
     var cValue: transcribe_abi_struct {
         switch self {
@@ -127,6 +131,10 @@ public enum AbiStruct: Sendable {
         case .sessionLimits: return TRANSCRIBE_ABI_SESSION_LIMITS
         case .ext: return TRANSCRIBE_ABI_EXT
         case .deviceInfo: return TRANSCRIBE_ABI_DEVICE_INFO
+        case .diarizeInfo: return TRANSCRIBE_ABI_DIARIZE_INFO
+        case .diarizeSessionParams: return TRANSCRIBE_ABI_DIARIZE_SESSION_PARAMS
+        case .diarizeParams: return TRANSCRIBE_ABI_DIARIZE_PARAMS
+        case .diarizeStreamParams: return TRANSCRIBE_ABI_DIARIZE_STREAM_PARAMS
         }
     }
 }

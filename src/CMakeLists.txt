@@ -12,6 +12,8 @@
 
 add_library(transcribe
     transcribe.cpp
+    transcribe-asr.cpp
+    transcribe-diarize.cpp
     transcribe-loader.cpp
     transcribe-arch.cpp
     transcribe-meta.cpp
@@ -19,6 +21,7 @@ add_library(transcribe
     transcribe-mel.cpp
     transcribe-model.cpp
     transcribe-tokenizer.cpp
+    transcribe-prompting.cpp
     transcribe-unicode.cpp
     transcribe-unicode-data.cpp
     transcribe-debug.cpp
@@ -34,6 +37,7 @@ add_library(transcribe
     causal_lm/causal_lm.cpp
     granite_conformer/shaw_attn.cpp
     arch/parakeet/model.cpp
+    arch/parakeet/longform.cpp
     arch/parakeet/multitalker.cpp
     arch/parakeet/capabilities.cpp
     arch/parakeet/weights.cpp
@@ -63,7 +67,6 @@ add_library(transcribe
     arch/moss/decoder.cpp
     arch/sortformer/model.cpp
     arch/sortformer/stream.cpp
-    arch/sortformer/capabilities.cpp
     arch/sortformer/weights.cpp
     arch/nemotron3_diar/model.cpp
     arch/nemotron3_diar/stream.cpp

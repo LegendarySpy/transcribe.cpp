@@ -50,6 +50,20 @@ let result = session.run(&pcm, &options)?;
 # Ok::<(), transcribe_cpp::Error>(())
 ```
 
+### Prompting
+
+`RunOptions::vocabulary` (custom terms), `prompt` (context, or the instruction
+under `Task::Instruct`) and `prefix` (text the model continues from) take
+effect where `model.supports()` reports `Feature::Vocabulary`,
+`ContextPrompt`, `Instruct` or `TranscriptPrefix`.
+
+```rust
+use transcribe_cpp::RunOptions;
+let options = RunOptions { vocabulary: vec!["Kubernetes".into()], ..Default::default() };
+let result = session.run(&pcm, &options)?;
+# Ok::<(), transcribe_cpp::Error>(())
+```
+
 Streaming exposes both UI-stable text and a fully materialized structured
 snapshot:
 
@@ -65,6 +79,23 @@ let transcript = stream.snapshot(); // language, segments, words, tokens, timing
 `Stream` borrows its session. To keep a stream across calls (for example in a
 struct field), `session.into_stream(..)` returns an `OwnedStream` with the same
 methods; `into_session()` hands the idle session back.
+
+### Diarization (who spoke when)
+
+A model whose `roles()` contain `Role::Diarize` (e.g. Sortformer) opens a
+`DiarizeSession` that returns speaker turns; calls for a role the model lacks
+return `Error::UnsupportedRole`.
+
+```rust
+use transcribe_cpp::{DiarizeOptions, Model, Role};
+let model = Model::load("diarizer.gguf")?;
+assert!(model.roles().contains(Role::Diarize));
+let mut diarize = model.diarize_session()?;
+for turn in diarize.run(&pcm, &DiarizeOptions::default())? {
+    println!("speaker {}: {}..{} ms", turn.speaker_id, turn.t0_ms, turn.t1_ms);
+}
+# Ok::<(), transcribe_cpp::Error>(())
+```
 
 Runnable examples:
 
@@ -99,9 +130,10 @@ README if you need runtime-loaded backend modules or custom
 
 `devices()` returns process-local `Device` handles. Leave
 `ModelOptions::device` as `None` for the backend's automatic policy, or pass
-`Some(device)` to select that exact primary device with no fallback. Persist
-`device_id` and resolve a fresh handle after backend initialization; registry
-indices and handles are not stable across processes. In dynamic-backend builds,
+`Some(device)` to select that exact primary device with no fallback. Handles
+are not stable across processes; persist `device_id` when it is `Some`,
+otherwise `kind` + `name` + `description` (e.g. Metal), and later re-find the
+device in `devices()` after backend initialization. In dynamic-backend builds,
 finish `init_backends()` or `init_backends_default()` before any thread
 enumerates devices, queries backend availability, or loads a model; native
 registry mutation is a startup-only operation and must not race those calls.
@@ -187,6 +219,7 @@ fn main() {
 - `Session` is `Send` but not `Sync`; mutating calls take `&mut self`.
 - In 0.x the C library allows at most one in-flight run across all sessions of a
   model; this crate enforces it with a per-model mutex, so concurrent calls
-  queue rather than race. For real parallelism, use one `Model` per worker.
+  queue rather than race. `DiarizeSession`s share the same lock. For real
+  parallelism, use one `Model` per worker.
 
 - License: MIT

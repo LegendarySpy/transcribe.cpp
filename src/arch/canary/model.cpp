@@ -22,6 +22,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-prompting.h"
 #include "transcribe-repetition-guard.h"
 #include "weights.h"
 
@@ -383,6 +384,11 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     if (const transcribe_status st = read_canary_hparams(loader.gguf(), m->hparams); st != TRANSCRIBE_OK) {
         return st;
     }
+    // Transcript prefix: canary2's user_prefix (measured clean on all three
+    // canary2 checkpoints). Needs a sub-vocab range for aggregate tokenizers.
+    transcribe::set_feature(m.get(), TRANSCRIBE_FEATURE_TRANSCRIPT_PREFIX,
+                            m->hparams.prompt_format == "canary2" &&
+                                (m->hparams.tokenizer_single_sp || !m->hparams.tok_lang_codes.empty()));
 
     // Publish the input-length ceiling now that the encoder positional span
     // and frontend rate are known (apply_family_invariants ran before the
@@ -593,18 +599,55 @@ std::vector<int32_t> build_prompt_canary(const CanaryHParams & hp,
     return ids;
 }
 
+// Ids the canary2 template emits besides the transcript prefix (see
+// build_prompt_canary2): nine task slots, plus the empty decoder-context
+// marker on single-SP tokenizers.
+int canary2_base_prompt_tokens(const CanaryHParams & hp) {
+    return hp.tokenizer_single_sp ? 10 : 9;
+}
+
+// The decoder prompt is prefilled into the self-KV cache, so it must fit the
+// decoder context ceiling. Only the prompt is gated: k_gen_reserve is a
+// decode-budget floor, not a required margin (canary-1b's whole context is
+// 512 tokens), and a decode that runs out of room is kept as a partial and
+// flagged truncated (see (b) above k_gen_reserve). The prompt grows with a
+// transcript prefix or shrinks against a lowered n_ctx knob.
+transcribe_status check_prompt_fits(int prompt_len, int ceiling) {
+    if (prompt_len > ceiling) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                "canary run: a %d-token decoder prompt does not fit the %d-token decoder context; "
+                "shorten the transcript prefix or raise transcribe_session_params.n_ctx",
+                prompt_len, ceiling);
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    return TRANSCRIBE_OK;
+}
+
+// Target language of a run: the explicit target when translating, else the
+// source language (default "en").
+const char * canary_target_language(const transcribe_run_params * params) {
+    const char * lang = (params && params->language) ? params->language : "en";
+    if (params != nullptr && params->task == TRANSCRIBE_TASK_TRANSLATE && params->target_language) {
+        return params->target_language;
+    }
+    return lang;
+}
+
 std::vector<int32_t> build_prompt_canary2(const CanaryModel &   cm,
                                           const CanaryHParams & hp,
                                           int                   src_lang_id,
                                           int                   tgt_lang_id,
                                           const char * /*task*/,
-                                          bool pnc) {
+                                          bool                         pnc,
+                                          const std::vector<int32_t> & prefix_ids) {
     // canary2 prompt template:
     //   <|startofcontext|> [decodercontext] <|startoftranscript|>
     //   <|emo:?|> <|src_lang|> <|tgt_lang|> <|pnc|> <|itn|> <|timestamp|> <|diarize|>
-    // ASR with empty decoder context realizes 9 tokens.
+    //   [user_prefix]
+    // ASR with empty decoder context realizes 9 tokens. `prefix_ids` (the
+    // transcript prefix, NeMo's user_prefix turn) follows the last slot.
     std::vector<int32_t> ids;
-    ids.reserve(9);
+    ids.reserve(static_cast<size_t>(canary2_base_prompt_tokens(hp)) + prefix_ids.size());
 
     if (hp.startofcontext_id < 0 || hp.startoftranscript_id < 0 || src_lang_id < 0 || tgt_lang_id < 0) {
         return {};
@@ -654,8 +697,45 @@ std::vector<int32_t> build_prompt_canary2(const CanaryModel &   cm,
         return {};
     }
     ids.push_back(hp.nodiarize_id);
+    ids.insert(ids.end(), prefix_ids.begin(), prefix_ids.end());
 
     return ids;
+}
+
+// Transcript prefix ids for canary2: NeMo tokenizes the user_prefix turn on
+// its own with the target language's SentencePiece (BPE) tokenizer, so it
+// carries the dummy-prefix space. Aggregate tokenizers encode within that language's
+// sub-vocab; single-SP (canary-1b-v2) over the whole vocab.
+transcribe_status encode_canary2_prefix(const CanaryModel &    cm,
+                                        const char *           prefix,
+                                        const char *           tgt_lang,
+                                        std::vector<int32_t> & out) {
+    out.clear();
+    if (prefix == nullptr || prefix[0] == '\0') {
+        return TRANSCRIBE_OK;
+    }
+    if (const transcribe_status st = transcribe::prompting::check_plain_text(cm.tok, prefix, "prefix");
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    int lo = 0, hi = -1;
+    if (!cm.hparams.tokenizer_single_sp) {
+        lo = hi = -1;
+        for (size_t i = 0; i < cm.hparams.tok_lang_codes.size(); ++i) {
+            if (cm.hparams.tok_lang_codes[i] == tgt_lang) {
+                lo = cm.hparams.tok_lang_offsets[i];
+                hi = lo + cm.hparams.tok_lang_sizes[i];
+            }
+        }
+        if (lo < 0) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "canary run: no tokenizer for prefix language '%s'", tgt_lang);
+            return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
+        }
+    }
+    // canary-1b-v2's normalizer keeps extra whitespace; the flash models'
+    // per-language tokenizers collapse it (their SentencePiece model specs).
+    return cm.tok.encode_sentencepiece_bpe(prefix, out, lo, hi,
+                                           /*remove_extra_whitespaces=*/!cm.hparams.tokenizer_single_sp);
 }
 
 int find_language_id(const CanaryHParams & hp, const char * lang) {
@@ -871,11 +951,8 @@ transcribe_status run(transcribe_session *          session,
     // Build multitask prompt.
     const char * lang         = (params && params->language) ? params->language : "en";
     const bool   is_translate = (params != nullptr && params->task == TRANSCRIBE_TASK_TRANSLATE);
-    const char * tgt_lang     = lang;
-    if (is_translate && params && params->target_language) {
-        tgt_lang = params->target_language;
-    }
-    const char * task = is_translate ? "translate" : "asr";
+    const char * tgt_lang     = canary_target_language(params);
+    const char * task         = is_translate ? "translate" : "asr";
 
     const int src_id = find_language_id(cm->hparams, lang);
     const int tgt_id = find_language_id(cm->hparams, tgt_lang);
@@ -921,8 +998,14 @@ transcribe_status run(transcribe_session *          session,
     }
 
     std::vector<int32_t> prompt_ids;
+    std::vector<int32_t> prefix_ids;
     if (cm->hparams.prompt_format == "canary2") {
-        prompt_ids = build_prompt_canary2(*cm, cm->hparams, src_id, tgt_id, task, pnc);
+        if (const transcribe_status st =
+                encode_canary2_prefix(*cm, params != nullptr ? params->prefix : nullptr, tgt_lang, prefix_ids);
+            st != TRANSCRIBE_OK) {
+            return st;
+        }
+        prompt_ids = build_prompt_canary2(*cm, cm->hparams, src_id, tgt_id, task, pnc, prefix_ids);
     } else if (cm->hparams.prompt_format == "canary") {
         prompt_ids = build_prompt_canary(cm->hparams, src_id, tgt_id, task, pnc);
     }
@@ -932,6 +1015,11 @@ transcribe_status run(transcribe_session *          session,
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     const int prompt_len = static_cast<int>(prompt_ids.size());
+    // Backstop for run_validate's pre-clear bound: never prefill past the KV.
+    if (const transcribe_status st = check_prompt_fits(prompt_len, canary_context_ceiling(cc->n_ctx, cm->hparams));
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
 
     // Init KV cache.
     {
@@ -1148,14 +1236,18 @@ transcribe_status run(transcribe_session *          session,
             // carries language/task/PNC control tokens at CONTROL type.
             // They shouldn't appear after the prompt is consumed, but the
             // strip is defensive — and only applied when the caller wants
-            // clean text. --raw-tokens / keep_special_tags=true exposes
-            // whatever the decoder emitted.
+            // clean text. <unk> is stripped too: the vocabs lack some
+            // characters (e.g. … everywhere, « „ in de, ¡ in es), so the
+            // decoder can emit it -- for aggregate-tokenizer variants at
+            // a per-language offset, not only id 0 (see
+            // Tokenizer::is_strippable_special). --raw-tokens /
+            // keep_special_tags=true exposes whatever the decoder emitted.
             const bool       strip = (params == nullptr) ? true : !params->keep_special_tags;
             std::vector<int> text_ids;
             if (strip) {
                 text_ids.reserve(generated_ids.size());
                 for (int id : generated_ids) {
-                    if (tok.is_control(id)) {
+                    if (tok.is_strippable_special(id)) {
                         continue;
                     }
                     text_ids.push_back(id);
@@ -1179,8 +1271,11 @@ transcribe_status run(transcribe_session *          session,
             seg.text        = full;
 
             cc->segments.push_back(std::move(seg));
-            cc->raw_text =
-                tok.decode(generated_ids.data(), static_cast<int>(generated_ids.size()));  // unfiltered decode
+            // Unfiltered decode, led by the transcript prefix when one was
+            // forced (full_text / segments hold only the continuation).
+            std::vector<int32_t> raw_ids = prefix_ids;
+            raw_ids.insert(raw_ids.end(), generated_ids.begin(), generated_ids.end());
+            cc->raw_text    = tok.decode(raw_ids.data(), static_cast<int>(raw_ids.size()));
             cc->full_text   = std::move(full);
             cc->result_kind = TRANSCRIBE_TIMESTAMPS_NONE;
             cc->has_result  = true;
@@ -1536,13 +1631,10 @@ transcribe_status run_batch(transcribe_session *          session,
     // Shared multitask prompt (identical across the batch).
     const char * lang         = (params && params->language) ? params->language : "en";
     const bool   is_translate = (params != nullptr && params->task == TRANSCRIBE_TASK_TRANSLATE);
-    const char * tgt_lang     = lang;
-    if (is_translate && params && params->target_language) {
-        tgt_lang = params->target_language;
-    }
-    const char * task   = is_translate ? "translate" : "asr";
-    const int    src_id = find_language_id(hp, lang);
-    const int    tgt_id = find_language_id(hp, tgt_lang);
+    const char * tgt_lang     = canary_target_language(params);
+    const char * task         = is_translate ? "translate" : "asr";
+    const int    src_id       = find_language_id(hp, lang);
+    const int    tgt_id       = find_language_id(hp, tgt_lang);
     if (src_id < 0 || tgt_id < 0) {
         return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
     }
@@ -1555,7 +1647,7 @@ transcribe_status run_batch(transcribe_session *          session,
     }
     std::vector<int32_t> prompt_ids;
     if (hp.prompt_format == "canary2") {
-        prompt_ids = build_prompt_canary2(*cm, hp, src_id, tgt_id, task, pnc);
+        prompt_ids = build_prompt_canary2(*cm, hp, src_id, tgt_id, task, pnc, {});
     } else if (hp.prompt_format == "canary") {
         prompt_ids = build_prompt_canary(hp, src_id, tgt_id, task, pnc);
     }
@@ -1563,6 +1655,12 @@ transcribe_status run_batch(transcribe_session *          session,
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     const int prompt_len = static_cast<int>(prompt_ids.size());
+    // The batched prompt feed writes one KV row per prompt token, capped at
+    // the context ceiling, so a longer prompt would write past the cache.
+    // Go serial instead: run() rejects each row, as on the CPU path.
+    if (prompt_len > canary_context_ceiling(cc->n_ctx, hp)) {
+        return run_batch_serial(cc, pcm, n_samples, n, params);
+    }
 
     // Pass 0: parallel mel.
     std::vector<char>               valid(n, 0);
@@ -1777,7 +1875,7 @@ transcribe_status run_batch(transcribe_session *          session,
     }
     const int64_t dec_us = ggml_time_us() - t_dec0;
 
-    // Capture (strip control tokens like serial commit_result).
+    // Capture (strip control / <unk> tokens like serial commit_result).
     const bool strip       = (params == nullptr) ? true : !params->keep_special_tags;
     const int  valid_count = std::max(1, static_cast<int>(std::count(valid.begin(), valid.end(), char(1))));
     for (int b = 0; b < n; ++b) {
@@ -1790,7 +1888,7 @@ transcribe_status run_batch(transcribe_session *          session,
         std::vector<int> text_ids;
         if (strip) {
             for (int id : generated[b]) {
-                if (!cm->tok.is_control(id)) {
+                if (!cm->tok.is_strippable_special(id)) {
                     text_ids.push_back(id);
                 }
             }
@@ -1838,6 +1936,27 @@ transcribe_status run_batch(transcribe_session *          session,
     return TRANSCRIBE_OK;
 }
 
+// Pre-clear gate for the transcript prefix (canary2): it must encode in the
+// target language's tokenizer and the prompt it extends must fit the decoder
+// context, checked before the dispatcher clears the previous result.
+transcribe_status run_validate(const transcribe_session * session, const transcribe_run_params * params) {
+    if (session == nullptr || session->model == nullptr || params == nullptr || params->prefix == nullptr) {
+        return TRANSCRIBE_OK;
+    }
+    const auto * cm = static_cast<const CanaryModel *>(session->model);
+    if (cm->hparams.prompt_format != "canary2") {
+        return TRANSCRIBE_OK;
+    }
+    std::vector<int32_t> prefix_ids;
+    if (const transcribe_status st =
+            encode_canary2_prefix(*cm, params->prefix, canary_target_language(params), prefix_ids);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    return check_prompt_fits(canary2_base_prompt_tokens(cm->hparams) + static_cast<int>(prefix_ids.size()),
+                             canary_context_ceiling(session->n_ctx, cm->hparams));
+}
+
 }  // namespace
 
 extern const Arch arch = {
@@ -1852,6 +1971,7 @@ extern const Arch arch = {
     /* .stream_finalize  = */ nullptr,
     /* .stream_reset     = */ nullptr,
     /* .accepts_ext_kind = */ nullptr,
+    /* .run_validate     = */ run_validate,
 };
 
 }  // namespace transcribe::canary

@@ -18,6 +18,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-prompting.h"
 #include "transcribe-repetition-guard.h"
 #include "transcribe/qwen3_asr.h"
 #include "weights.h"
@@ -416,9 +417,12 @@ transcribe_status resolve_chat_tokens(const transcribe::Tokenizer & tok, ChatTok
     return TRANSCRIBE_OK;
 }
 
-transcribe_status encode_context(const Tokenizer &             tok,
-                                 const transcribe_run_params * params,
-                                 std::vector<int32_t> &        ids) {
+// The fork's QWRN run extension context: borrowed UTF-8 text for the system
+// turn, at most 4096 bytes and 1024 tokens (excess is INVALID_ARG). It feeds
+// the same system slot as the generic prompting fields (encode_system_context)
+// and is validated here so a bad value is rejected before the run clears.
+transcribe_status ext_context(const Tokenizer & tok, const transcribe_run_params * params, std::string & out) {
+    out.clear();
     const auto * ext = params != nullptr ? params->family : nullptr;
     const auto   status =
         transcribe_ext_check(ext, TRANSCRIBE_EXT_KIND_QWEN3_ASR_RUN, sizeof(transcribe_qwen3_asr_run_ext));
@@ -436,18 +440,33 @@ transcribe_status encode_context(const Tokenizer &             tok,
     if (length > 4096) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
-    const auto encoded = tok.encode(std::string(context, length), ids);
+    std::vector<int32_t> ids;
+    const auto           encoded = tok.encode(std::string(context, length), ids);
     if (encoded != TRANSCRIBE_OK) {
         return encoded;
     }
-    return ids.size() <= 1024 ? TRANSCRIBE_OK : TRANSCRIBE_ERR_INVALID_ARG;
+    if (ids.size() > 1024) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    out.assign(context, length);
+    return TRANSCRIBE_OK;
 }
 
-// Match the upstream chat template; context belongs in the system turn.
+// Build the prompt token sequence + audio-position list, mirroring the
+// Qwen3-ASR chat template at the token level:
+//
+//   <|im_start|>system\n<|im_end|>\n
+//   <|im_start|>user\n<|audio_start|><|audio_pad|>*T_enc<|audio_end|><|im_end|>\n
+//   <|im_start|>assistant\n[language {Name}<asr_text>]?
+//
+// The system message carries the generic prompting context (`system_ids`,
+// empty by default). A non-null `lang_prefix_ids` (resolved via
+// encode_language_prefix) is appended after the trailing newline to force an
+// output language; kept out of here so this stays a pure token-id assembler.
 void build_prompt_tokens(const QwenAsrHParams &       hp,
                          const ChatTokens &           ct,
-                         const std::vector<int32_t> & context_ids,
                          int                          T_enc,
+                         const std::vector<int32_t> & system_ids,
                          const std::vector<int32_t> * lang_prefix_ids,
                          std::vector<int32_t> &       out_ids,
                          std::vector<int64_t> &       out_audio_positions) {
@@ -457,7 +476,7 @@ void build_prompt_tokens(const QwenAsrHParams &       hp,
     out_ids.push_back(ct.im_start);
     out_ids.push_back(ct.role_system);
     out_ids.push_back(ct.newline);
-    out_ids.insert(out_ids.end(), context_ids.begin(), context_ids.end());
+    out_ids.insert(out_ids.end(), system_ids.begin(), system_ids.end());
     out_ids.push_back(ct.im_end);
     out_ids.push_back(ct.newline);
 
@@ -483,6 +502,52 @@ void build_prompt_tokens(const QwenAsrHParams &       hp,
     if (lang_prefix_ids != nullptr && !lang_prefix_ids->empty()) {
         out_ids.insert(out_ids.end(), lang_prefix_ids->begin(), lang_prefix_ids->end());
     }
+}
+
+// Ids build_prompt_tokens emits besides the system ids, the audio pads and
+// the language prefix (the role / newline / audio-boundary tokens above).
+constexpr int k_chat_frame_tokens = 15;
+
+// Length build_prompt_tokens produces with an empty system message, so the
+// system context can be budgeted before the prompt is built.
+int prompt_tokens_without_system(int T_enc, const std::vector<int32_t> * lang_prefix_ids) {
+    return k_chat_frame_tokens + T_enc + (lang_prefix_ids != nullptr ? static_cast<int>(lang_prefix_ids->size()) : 0);
+}
+
+// Generic prompting -> system-message ids: vocabulary joined " " (measured
+// better than ", ": fewer whole-dictionary dumps into the output), then
+// " " + prompt verbatim. `budget` is the room the context window leaves
+// after the rest of the prompt and the generation reserve; overflow trims
+// the context first, then terms (see fit_terms_and_context).
+transcribe_status encode_system_context(const transcribe::Tokenizer & tok,
+                                        const transcribe_run_params * params,
+                                        int                           budget,
+                                        std::vector<int32_t> &        out) {
+    out.clear();
+    if (params == nullptr) {
+        return TRANSCRIBE_OK;
+    }
+    const std::vector<std::string> terms = transcribe::prompting::terms(params);
+    std::string                    ctx   = params->prompt != nullptr ? params->prompt : "";
+    std::string                    ext;
+    if (const transcribe_status st = ext_context(tok, params, ext); st != TRANSCRIBE_OK) {
+        return st;
+    }
+    if (!ext.empty()) {
+        ctx = ctx.empty() ? ext : ext + " " + ctx;
+    }
+    if (!terms.empty() && !ctx.empty()) {
+        ctx = " " + ctx;
+    }
+    transcribe::prompting::FittedPrompt fit;
+    if (const transcribe_status st = transcribe::prompting::fit_terms_and_context(
+            tok, terms, { "", " ", "" }, ctx, std::max(budget, 0), "qwen3_asr run", fit);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    out = std::move(fit.term_ids);
+    out.insert(out.end(), fit.ctx_ids.begin(), fit.ctx_ids.end());
+    return TRANSCRIBE_OK;
 }
 
 }  // namespace
@@ -635,10 +700,6 @@ transcribe_status run(transcribe_session *          session,
     // "language X<asr_text>" prefix, stripped by the output parser below). A
     // non-null code is resolved to "language {Name}<asr_text>" tokens that seed
     // the assistant turn; a resolve failure surfaces as UNSUPPORTED_LANGUAGE.
-    std::vector<int32_t> context_ids;
-    if (const auto status = encode_context(cm->tok, params, context_ids); status != TRANSCRIBE_OK) {
-        return status;
-    }
     std::vector<int32_t>         lang_prefix_ids;
     const std::vector<int32_t> * lang_prefix_ptr = nullptr;
     if (params != nullptr && params->language != nullptr && params->language[0] != '\0') {
@@ -839,7 +900,15 @@ transcribe_status run(transcribe_session *          session,
     // Prompt construction.
     std::vector<int32_t> prompt_ids;
     std::vector<int64_t> audio_positions;
-    build_prompt_tokens(cm->hparams, cm->chat_tokens, context_ids, T_enc, lang_prefix_ptr, prompt_ids, audio_positions);
+    const int            ceiling = qwen3_context_ceiling(cc->n_ctx, cm->hparams);
+    std::vector<int32_t> system_ids;
+    if (const transcribe_status st = encode_system_context(
+            cm->tok, params, ceiling - k_gen_reserve - prompt_tokens_without_system(T_enc, lang_prefix_ptr),
+            system_ids);
+        st != TRANSCRIBE_OK) {
+        return st;
+    }
+    build_prompt_tokens(cm->hparams, cm->chat_tokens, T_enc, system_ids, lang_prefix_ptr, prompt_ids, audio_positions);
     const int T_prompt   = static_cast<int>(prompt_ids.size());
     const int prefix_len = audio_positions.empty() ? 0 : static_cast<int>(audio_positions.front());
     const int suffix_len = T_prompt - prefix_len - T_enc;
@@ -847,7 +916,6 @@ transcribe_status run(transcribe_session *          session,
 
     // Input-length gate: audio + prompt + generation must fit the decoder
     // context window. Reject an over-length clip here, before prefill/decode.
-    const int ceiling = qwen3_context_ceiling(cc->n_ctx, cm->hparams);
     if (T_prompt + k_gen_reserve > ceiling) {
         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                             "qwen3_asr run: input too long — %d audio + %d prompt tokens "
@@ -1632,10 +1700,6 @@ transcribe_status run_batch(transcribe_session *          session,
     transcribe::debug::init();
 
     // Shared language hint (v1: one run_params across the batch).
-    std::vector<int32_t> context_ids;
-    if (const auto status = encode_context(cm->tok, params, context_ids); status != TRANSCRIBE_OK) {
-        return status;
-    }
     std::vector<int32_t>         lang_prefix_ids;
     const std::vector<int32_t> * lang_prefix_ptr = nullptr;
     if (params != nullptr && params->language != nullptr && params->language[0] != '\0') {
@@ -1643,6 +1707,19 @@ transcribe_status run_batch(transcribe_session *          session,
             return TRANSCRIBE_ERR_UNSUPPORTED_LANGUAGE;
         }
         lang_prefix_ptr = &lang_prefix_ids;
+    }
+
+    // Shared system context (vocabulary / prompt), one run_params per batch,
+    // fitted as if there were no audio. A row whose own budget is smaller than
+    // that fit would get a different system context from run(), so the batch
+    // then goes serial (see fit_terms_and_context: otherwise the fits match).
+    const int ceiling       = qwen3_context_ceiling(cc->n_ctx, cm->hparams);
+    auto      system_budget = [&](int T_enc) {
+        return std::max(ceiling - k_gen_reserve - prompt_tokens_without_system(T_enc, lang_prefix_ptr), 0);
+    };
+    std::vector<int32_t> system_ids;
+    if (encode_system_context(cm->tok, params, system_budget(0), system_ids) != TRANSCRIBE_OK) {
+        return run_batch_serial(cc, pcm, n_samples, n, params);
     }
 
     // Pass 1: per-utterance encoder + prefill into KV slabs.
@@ -1672,15 +1749,17 @@ transcribe_status run_batch(transcribe_session *          session,
     int                               prefix_len   = 0;
     // Per-utterance terminal status for rejected rows. Defaults to INVALID_ARG;
     // over-length rows below are upgraded to INPUT_TOO_LONG.
-    const int                         ceiling      = qwen3_context_ceiling(cc->n_ctx, cm->hparams);
     std::vector<transcribe_status>    fail_status(n, TRANSCRIBE_ERR_INVALID_ARG);
     std::vector<std::vector<int32_t>> prompt_ids(n);
     for (int b = 0; b < n; ++b) {
         if (!valid[b]) {
             continue;
         }
+        if (static_cast<int>(system_ids.size()) > system_budget(T_enc[b])) {
+            return run_batch_serial(cc, pcm, n_samples, n, params);
+        }
         std::vector<int64_t> ap;
-        build_prompt_tokens(cm->hparams, cm->chat_tokens, context_ids, T_enc[b], lang_prefix_ptr, prompt_ids[b], ap);
+        build_prompt_tokens(cm->hparams, cm->chat_tokens, T_enc[b], system_ids, lang_prefix_ptr, prompt_ids[b], ap);
         T_prompt[b] = static_cast<int>(prompt_ids[b].size());
         prefix_len  = ap.empty() ? 0 : static_cast<int>(ap.front());
         // Same gate as single-shot run(); the rest of the batch still runs.
@@ -1838,9 +1917,9 @@ static bool accepts_ext_kind(const transcribe_model *, transcribe_ext_slot slot,
 }
 
 static transcribe_status run_validate(const transcribe_session * session, const transcribe_run_params * params) {
-    const auto *         model = static_cast<const QwenAsrModel *>(session->model);
-    std::vector<int32_t> ids;
-    return encode_context(model->tok, params, ids);
+    const auto * model = static_cast<const QwenAsrModel *>(session->model);
+    std::string  context;
+    return ext_context(model->tok, params, context);
 }
 
 extern const Arch arch = {
