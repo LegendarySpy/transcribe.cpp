@@ -730,11 +730,24 @@ static bool is_lang_tag_piece(const std::string & p) {
     return i == end;  // interior consumed exactly up to '>'
 }
 
+// SentencePiece markers the multilingual vocab stores as NORMAL pieces:
+// <pad> and the <|...|> family (<|en|>, <|nospeech|>, ...). Hugging Face
+// decoders skip them as special tokens; a rare emission must not reach text.
+static bool is_marker_piece(const std::string & p) {
+    if (p == "<pad>") {
+        return true;
+    }
+    return p.size() >= 5 && p.compare(0, 2, "<|") == 0 && p.compare(p.size() - 2, 2, "|>") == 0;
+}
+
 // Drop this piece from the public result when keep_special_tags is off:
-// stripped if CONTROL-typed or matching the <ll-RR> locale-tag pattern
-// (transitional fallback). Shared by the offline and streaming builders.
+// stripped if CONTROL-typed, <unk> (post-trained checkpoints emit it for
+// out-of-vocab characters such as the Greek final sigma), a marker piece,
+// or matching the <ll-RR> locale-tag pattern (transitional fallback).
+// Shared by the offline and streaming builders.
 static bool is_strippable_special(const transcribe::Tokenizer & tok, int id) {
-    return tok.is_control(id) || is_lang_tag_piece(tok.token(id));
+    const std::string & piece = tok.token(id);
+    return tok.is_control(id) || id == tok.unk_id() || is_marker_piece(piece) || is_lang_tag_piece(piece);
 }
 
 constexpr int32_t k_boost_max_phrases      = 1024;
