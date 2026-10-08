@@ -369,12 +369,12 @@ def doc_for(record: dict) -> pathlib.Path | None:
 
 def block_family_index(records: dict[str, dict], attrs: dict[str, str]) -> list[str]:
     """The root README's supported-models table: one row per documentation
-    page, listing the variants it covers. `transcribe=false` selects the
-    models that only diarize."""
-    want = as_bool(attrs.get("transcribe"), True)
+    page, listing the variants it covers, for one role (`role=`, default
+    asr)."""
+    want = attrs.get("role", "asr")
     groups: dict[str, dict] = {}
     for variant, record in records.items():
-        if bool(record.get("capabilities", {}).get("transcribe", {}).get("supported")) != want:
+        if record.get("role", "asr") != want:
             continue
         doc = doc_for(record)
         if doc is not None:
@@ -386,13 +386,15 @@ def block_family_index(records: dict[str, dict], attrs: dict[str, str]) -> list[
             title = record["display_name"]
             link = f"[{record['published_repo']}](https://huggingface.co/{record['published_repo']})"
         group = groups.setdefault(key, {"title": title, "link": link, "variants": [], "caps": set()})
-        group["variants"].append(variant)
+        # Variants named after the family sort first; third-party names
+        # (orukeet under parakeet) go after them instead of leading the row.
+        group["variants"].append((0 if variant.startswith(record.get("family", "")) else 1, variant))
         group["caps"].update(c for c in common.capabilities_summary(record).split(", ") if c != "-")
     if not groups:
         raise RenderError("no models matched")
     body = []
     for group in sorted(groups.values(), key=lambda g: g["title"].lower()):
-        body.append([group["title"], ", ".join(f"`{v}`" for v in sorted(group["variants"])),
+        body.append([group["title"], ", ".join(f"`{v}`" for _, v in sorted(group["variants"])),
                      ", ".join(sorted(group["caps"])) or "-", group["link"]])
     return common.render_table(["Family", "Variants", "Available capabilities", "Docs"],
                                ["l", "l", "l", "l"], body)

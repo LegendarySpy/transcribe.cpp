@@ -1,9 +1,11 @@
-// nemotron3_diar_ext_unit.cpp - Nemotron-3 Diarization through the shared
-// Sortformer streaming operating-point run extension (SFST, RUN slot).
+// nemotron3_diar_ext_unit.cpp - Nemotron-3 Diarization on the DIARIZE role
+// through the shared Sortformer operating-point extension (SFDR,
+// DIARIZE_RUN slot).
 //
 // Covers, against a real GGUF (env-gated, RC 77 skip):
 //
-//   1. The model accepts SFST on the RUN slot only.
+//   1. The model serves DIARIZE only and accepts SFDR on DIARIZE_RUN and
+//      SFLV on DIARIZE_STREAM only.
 //   2. The 2-speaker oracle mix yields rows for exactly speakers 1 and 2.
 //   3. Pre-clear rejection: HIGH_LATENCY (no v3 operating point) and an
 //      out-of-range preset fail with INVALID_ARG and keep the previous rows.
@@ -14,6 +16,7 @@
 // Gated by TRANSCRIBE_NEMOTRON3_DIAR_GGUF.
 
 #include "transcribe.h"
+#include "transcribe/diarize.h"
 #include "transcribe/sortformer.h"
 #include "wav.h"
 
@@ -42,13 +45,13 @@ bool file_exists(const std::string & path) {
     return ::stat(path.c_str(), &st) == 0;
 }
 
-std::vector<transcribe_speaker_segment> read_segments(const transcribe_session * session) {
+std::vector<transcribe_speaker_segment> read_segments(const transcribe_diarize_session * session) {
     std::vector<transcribe_speaker_segment> rows;
-    const int                               n = transcribe_n_speaker_segments(session);
+    const int                               n = transcribe_diarize_n_segments(session);
     for (int i = 0; i < n; ++i) {
         transcribe_speaker_segment row;
         transcribe_speaker_segment_init(&row);
-        if (transcribe_get_speaker_segment(session, i, &row) == TRANSCRIBE_OK) {
+        if (transcribe_diarize_get_segment(session, i, &row) == TRANSCRIBE_OK) {
             rows.push_back(row);
         }
     }
@@ -68,17 +71,17 @@ bool same_segments(const std::vector<transcribe_speaker_segment> & a,
     return true;
 }
 
-std::vector<transcribe_speaker_segment> run_preset(transcribe_session *         session,
+std::vector<transcribe_speaker_segment> run_preset(transcribe_diarize_session * session,
                                                    const std::vector<float> &   pcm,
                                                    transcribe_sortformer_preset preset,
                                                    transcribe_status            expected) {
-    transcribe_sortformer_stream_ext ext;
-    transcribe_sortformer_stream_ext_init(&ext);
+    transcribe_sortformer_diarize_ext ext;
+    transcribe_sortformer_diarize_ext_init(&ext);
     ext.preset = preset;
-    transcribe_run_params rp;
-    transcribe_run_params_init(&rp);
+    transcribe_diarize_params rp;
+    transcribe_diarize_params_init(&rp);
     rp.family = &ext.ext;
-    CHECK(transcribe_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == expected);
+    CHECK(transcribe_diarize_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == expected);
     return read_segments(session);
 }
 
@@ -116,20 +119,30 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    CHECK(transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_RUN, TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM));
-    CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_STREAM, TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM));
+    CHECK(transcribe_model_roles(model) == TRANSCRIBE_ROLE_DIARIZE);
+    CHECK(transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_DIARIZE_RUN,
+                                            TRANSCRIBE_EXT_KIND_SORTFORMER_DIARIZE));
+    CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_DIARIZE_STREAM,
+                                             TRANSCRIBE_EXT_KIND_SORTFORMER_DIARIZE));
+    CHECK(transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_DIARIZE_STREAM,
+                                            TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
     CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_RUN, 0x4E524857u /* WHRN */));
+    transcribe_diarize_info info;
+    transcribe_diarize_info_init(&info);
+    CHECK(transcribe_diarize_get_info(model, &info) == TRANSCRIBE_OK);
+    CHECK(info.max_speakers == 8);
 
-    struct transcribe_session * session = nullptr;
-    if (transcribe_session_init(model, nullptr, &session) != TRANSCRIBE_OK || session == nullptr) {
+    struct transcribe_session * asr = nullptr;
+    CHECK(transcribe_session_init(model, nullptr, &asr) == TRANSCRIBE_ERR_UNSUPPORTED_ROLE);
+
+    struct transcribe_diarize_session * session = nullptr;
+    if (transcribe_diarize_session_init(model, nullptr, &session) != TRANSCRIBE_OK || session == nullptr) {
         std::fprintf(stderr, "FAIL: session create\n");
         transcribe_model_free(model);
         return EXIT_FAILURE;
     }
 
-    transcribe_run_params rp;
-    transcribe_run_params_init(&rp);
-    CHECK(transcribe_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_OK);
+    CHECK(transcribe_diarize_run(session, pcm.data(), static_cast<int>(pcm.size()), nullptr) == TRANSCRIBE_OK);
     const std::vector<transcribe_speaker_segment> base = read_segments(session);
     std::set<int>                                 speakers;
     for (const auto & row : base) {
@@ -144,7 +157,7 @@ int main() {
 
     CHECK(same_segments(run_preset(session, pcm, TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY, TRANSCRIBE_OK), base));
     ::setenv("TRANSCRIBE_NEMOTRON3_DIAR_PRESET", "offline", 1);
-    CHECK(transcribe_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_OK);
+    CHECK(transcribe_diarize_run(session, pcm.data(), static_cast<int>(pcm.size()), nullptr) == TRANSCRIBE_OK);
     CHECK(same_segments(read_segments(session), base));
     ::unsetenv("TRANSCRIBE_NEMOTRON3_DIAR_PRESET");
 
@@ -154,7 +167,7 @@ int main() {
         CHECK(!run_preset(session, pcm, preset, TRANSCRIBE_OK).empty());
     }
 
-    transcribe_session_free(session);
+    transcribe_diarize_session_free(session);
     transcribe_model_free(model);
 
     if (g_failures != 0) {

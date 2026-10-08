@@ -43,6 +43,17 @@ and the one-shot `transcribe()` helper.
 result = session.run(pcm, pnc="off", itn="on")
 ```
 
+### Prompting
+
+`vocabulary` (custom terms), `prompt` (context, or the instruction under
+`task="instruct"`) and `prefix` (text the model continues from) take effect
+where `model.supports()` reports `"vocabulary"`, `"context_prompt"`,
+`"instruct"` or `"transcript_prefix"`.
+
+```python
+result = session.run(pcm, vocabulary=["Kubernetes", "gRPC"])
+```
+
 Streaming models expose incremental transcription with committed/tentative
 text views — see `examples/stream_wav.py`:
 
@@ -58,6 +69,24 @@ with model.session() as session, session.stream() as stream:
 Long transcriptions can be cancelled from another thread with
 `session.cancel()` — the run raises `Aborted` with the partial transcript on
 `exc.partial_result` (same for `OutputTruncated`).
+
+### Diarization
+
+Models whose `model.roles` include `Role.DIARIZE` (Sortformer) answer "who
+spoke when" through a diarize session. `run()` returns `SpeakerSegment`
+rows (`speaker_id` in `1..model.diarize_info.max_speakers`), grouped by
+speaker. Locking, `Busy`, `cancel()` and `close()` work as on `Session`. A
+model without the role raises `UnsupportedRole`, as `model.session()` and
+`model.capabilities` do on a model without `Role.ASR` (Sortformer serves only
+`Role.DIARIZE`).
+
+```python
+with model.diarize_session() as diarizer:
+    turns = diarizer.run(pcm, family=transcribe_cpp.SortformerDiarizeOptions(
+        preset="very_high_latency"))
+    for turn in turns:
+        print(turn.speaker_id, turn.t0_ms, turn.t1_ms)
+```
 
 ## Backends
 
@@ -109,9 +138,10 @@ TRANSCRIBE_LIBRARY=../../build-shared/src/libtranscribe.dylib \
 
 ## Notes
 
-- One run/stream at a time per `Model` in 0.x: sessions share the model's
-  compute backend, so serialize runs across sessions (or load one model per
-  worker). See the `Model` docstring.
+- One compute call at a time per `Model`: the binding serializes calls across
+  all sessions of a model with a model-wide lock (load one model per worker
+  for parallelism). While a stream is active, other runs and stream begins on
+  that model raise `transcribe_cpp.Busy`. See the `Model` docstring.
 - Import package: `transcribe_cpp`
 - Distribution: `transcribe-cpp`
 - License: MIT

@@ -5,7 +5,9 @@
 //! every field is an `Option`, and only the fields you set override the
 //! defaults the C `*_init()` stamps. A [`RunExtension`] attaches to
 //! [`RunOptions`](crate::RunOptions); a [`StreamExtension`] attaches to
-//! [`StreamOptions`](crate::StreamOptions).
+//! [`StreamOptions`](crate::StreamOptions); a [`DiarizeExtension`] attaches to
+//! [`DiarizeOptions`](crate::DiarizeOptions); a [`DiarizeStreamExtension`]
+//! attaches to [`DiarizeStreamOptions`](crate::DiarizeStreamOptions).
 //!
 //! Probe [`Model::accepts_ext`](crate::Model::accepts_ext) to learn whether a
 //! loaded model accepts a given kind on a slot; an unaccepted extension is
@@ -17,15 +19,27 @@ use transcribe_cpp_sys as sys;
 
 use crate::error::Result;
 
-/// Qwen3-ASR vocabulary/background context for recognition.
+/// Qwen3-ASR vocabulary/background context for recognition (run slot). It
+/// goes in the system turn, ahead of any `RunOptions::prompt`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct Qwen3AsrRunOptions {
     pub context: Option<String>,
 }
 
 /// Whisper run-extension knobs (run slot): initial prompt, temperature
 /// fallback, and decode thresholds. `None` keeps the family default.
+/// `initial_prompt` cannot be combined with `RunOptions::vocabulary` / `prompt`.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct WhisperRunOptions {
     pub initial_prompt: Option<String>,
     pub condition_on_prev_tokens: Option<bool>,
@@ -52,6 +66,11 @@ pub struct WhisperRunOptions {
 /// are matched as typed (casing matters). `boost_score: None` keeps the
 /// library default (3.0); an empty list disables boosting.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct ParakeetRunOptions {
     pub boost_phrases: Vec<String>,
     pub boost_score: Option<f32>,
@@ -59,18 +78,33 @@ pub struct ParakeetRunOptions {
 
 /// Moonshine-streaming stream-extension knobs (stream slot).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct MoonshineStreamingOptions {
     pub min_decode_interval_ms: Option<i32>,
 }
 
 /// Parakeet cache-aware streaming knobs (stream slot).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct ParakeetStreamOptions {
     pub att_context_right: Option<i32>,
 }
 
 /// Parakeet chunked-attention buffered streaming knobs (stream slot).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct ParakeetBufferedStreamOptions {
     pub left_ms: Option<i32>,
     pub chunk_ms: Option<i32>,
@@ -79,6 +113,11 @@ pub struct ParakeetBufferedStreamOptions {
 
 /// Voxtral-realtime streaming knobs (stream slot).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct VoxtralRealtimeStreamOptions {
     pub num_delay_tokens: Option<i32>,
     pub min_decode_interval_ms: Option<i32>,
@@ -88,6 +127,7 @@ pub struct VoxtralRealtimeStreamOptions {
 /// The menu is discrete (jointly-tuned bundles), not a latency dial;
 /// `Default` keeps the GGUF-shipped checkpoint configuration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SortformerPreset {
     #[default]
     Default,
@@ -129,48 +169,133 @@ impl SortformerPreset {
     }
 }
 
-/// Sortformer diarizer run-extension knobs (run slot). Sortformer produces
-/// speaker segments, no text; read results via the speaker-segment
-/// accessors. `None` keeps the family default (the GGUF-shipped cfg).
+/// Sortformer diarize-extension knobs (diarize-run slot). `None` keeps the
+/// family default (the GGUF-shipped cfg).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SortformerStreamOptions {
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
+pub struct SortformerDiarizeOptions {
     pub preset: Option<SortformerPreset>,
 }
 
-/// Push-audio live diarization knobs (stream slot, Nemotron-3 Diarization).
-/// Accepts `LowLatency` (the default when `None`), `VeryLowLatency` and
-/// `UltraLowLatency`; other presets are rejected at `stream` with
+/// Push-audio live diarization knobs (diarize-stream slot, Nemotron-3
+/// Diarization). Accepts `LowLatency` (the default when `None`),
+/// `VeryLowLatency` and `UltraLowLatency`; other presets are rejected at
+/// [`DiarizeSession::stream`](crate::DiarizeSession::stream) with
 /// [`Error::InvalidArgument`](crate::Error). Read rows from
-/// [`Stream::snapshot`](crate::Stream::snapshot)`.speaker_segments` after each
+/// [`DiarizeStream::segments`](crate::DiarizeStream::segments) after each
 /// feed: a row whose `t1_ms` equals the feed's
 /// [`StreamUpdate::audio_committed_ms`](crate::StreamUpdate) is still open
 /// (the speaker is talking at the processed frontier); every other row is
-/// final. After `finalize` all rows are final and equal a `run` at the same
-/// preset.
+/// final. After `finalize` all rows are final and equal a
+/// [`DiarizeSession::run`](crate::DiarizeSession::run) at the same preset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default)
+)]
 pub struct SortformerLiveOptions {
     pub preset: Option<SortformerPreset>,
+}
+
+/// A family extension for the diarize-run slot
+/// ([`DiarizeSession::run`](crate::DiarizeSession::run)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DiarizeExtension {
+    Sortformer(SortformerDiarizeOptions),
+}
+
+/// Owns a materialized diarize-slot C extension struct.
+pub(crate) enum DiarizeExtRaw {
+    Sortformer(Box<sys::transcribe_sortformer_diarize_ext>),
+}
+
+impl DiarizeExtRaw {
+    pub(crate) fn ext_ptr(&self) -> *const sys::transcribe_ext {
+        match self {
+            DiarizeExtRaw::Sortformer(e) => {
+                (&**e) as *const sys::transcribe_sortformer_diarize_ext
+                    as *const sys::transcribe_ext
+            }
+        }
+    }
+}
+
+impl DiarizeExtension {
+    pub(crate) fn materialize(&self) -> DiarizeExtRaw {
+        match self {
+            DiarizeExtension::Sortformer(o) => {
+                let mut e: sys::transcribe_sortformer_diarize_ext = unsafe { std::mem::zeroed() };
+                unsafe { sys::transcribe_sortformer_diarize_ext_init(&mut e) };
+                set(&mut e.preset, o.preset.map(SortformerPreset::to_sys));
+                DiarizeExtRaw::Sortformer(Box::new(e))
+            }
+        }
+    }
+}
+
+/// A family extension for the diarize-stream slot
+/// ([`DiarizeSession::stream`](crate::DiarizeSession::stream)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DiarizeStreamExtension {
+    SortformerLive(SortformerLiveOptions),
+}
+
+/// Owns a materialized diarize-stream-slot C extension struct.
+pub(crate) enum DiarizeStreamExtRaw {
+    SortformerLive(Box<sys::transcribe_sortformer_live_ext>),
+}
+
+impl DiarizeStreamExtRaw {
+    pub(crate) fn ext_ptr(&self) -> *const sys::transcribe_ext {
+        match self {
+            DiarizeStreamExtRaw::SortformerLive(e) => {
+                (&**e) as *const sys::transcribe_sortformer_live_ext as *const sys::transcribe_ext
+            }
+        }
+    }
+}
+
+impl DiarizeStreamExtension {
+    pub(crate) fn materialize(&self) -> DiarizeStreamExtRaw {
+        match self {
+            DiarizeStreamExtension::SortformerLive(o) => {
+                let mut e: sys::transcribe_sortformer_live_ext = unsafe { std::mem::zeroed() };
+                unsafe { sys::transcribe_sortformer_live_ext_init(&mut e) };
+                set(&mut e.preset, o.preset.map(SortformerPreset::to_sys));
+                DiarizeStreamExtRaw::SortformerLive(Box::new(e))
+            }
+        }
+    }
 }
 
 /// A family extension for the run slot (offline `run`/`run_batch`).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RunExtension {
     Parakeet(ParakeetRunOptions),
     Qwen3Asr(Qwen3AsrRunOptions),
     Whisper(WhisperRunOptions),
-    Sortformer(SortformerStreamOptions),
 }
 
 /// A family extension for the stream slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum StreamExtension {
     ParakeetStream(ParakeetStreamOptions),
     ParakeetBuffered(ParakeetBufferedStreamOptions),
     MoonshineStreaming(MoonshineStreamingOptions),
     VoxtralRealtime(VoxtralRealtimeStreamOptions),
-    SortformerLive(SortformerLiveOptions),
 }
 
 /// Owns a materialized run-slot C extension struct (and any strings it points
@@ -191,7 +316,6 @@ pub(crate) enum RunExtRaw {
         ext: Box<sys::transcribe_whisper_run_ext>,
         _prompt: Option<CString>,
     },
-    Sortformer(Box<sys::transcribe_sortformer_stream_ext>),
 }
 
 impl RunExtRaw {
@@ -206,9 +330,6 @@ impl RunExtRaw {
             }
             RunExtRaw::Whisper { ext, .. } => {
                 (&**ext) as *const sys::transcribe_whisper_run_ext as *const sys::transcribe_ext
-            }
-            RunExtRaw::Sortformer(e) => {
-                (&**e) as *const sys::transcribe_sortformer_stream_ext as *const sys::transcribe_ext
             }
         }
     }
@@ -281,12 +402,6 @@ impl RunExtension {
                     _prompt: prompt,
                 })
             }
-            RunExtension::Sortformer(o) => {
-                let mut ext: sys::transcribe_sortformer_stream_ext = unsafe { std::mem::zeroed() };
-                unsafe { sys::transcribe_sortformer_stream_ext_init(&mut ext) };
-                set(&mut ext.preset, o.preset.map(SortformerPreset::to_sys));
-                Ok(RunExtRaw::Sortformer(Box::new(ext)))
-            }
         }
     }
 }
@@ -297,7 +412,6 @@ pub(crate) enum StreamExtRaw {
     ParakeetBuffered(Box<sys::transcribe_parakeet_buffered_stream_ext>),
     MoonshineStreaming(Box<sys::transcribe_moonshine_streaming_stream_ext>),
     VoxtralRealtime(Box<sys::transcribe_voxtral_realtime_stream_ext>),
-    SortformerLive(Box<sys::transcribe_sortformer_live_ext>),
 }
 
 impl StreamExtRaw {
@@ -317,9 +431,6 @@ impl StreamExtRaw {
             StreamExtRaw::VoxtralRealtime(e) => {
                 (&**e) as *const sys::transcribe_voxtral_realtime_stream_ext
                     as *const sys::transcribe_ext
-            }
-            StreamExtRaw::SortformerLive(e) => {
-                (&**e) as *const sys::transcribe_sortformer_live_ext as *const sys::transcribe_ext
             }
         }
     }
@@ -357,12 +468,6 @@ impl StreamExtension {
                 set(&mut e.num_delay_tokens, o.num_delay_tokens);
                 set(&mut e.min_decode_interval_ms, o.min_decode_interval_ms);
                 StreamExtRaw::VoxtralRealtime(Box::new(e))
-            }
-            StreamExtension::SortformerLive(o) => {
-                let mut e: sys::transcribe_sortformer_live_ext = unsafe { std::mem::zeroed() };
-                unsafe { sys::transcribe_sortformer_live_ext_init(&mut e) };
-                set(&mut e.preset, o.preset.map(SortformerPreset::to_sys));
-                StreamExtRaw::SortformerLive(Box::new(e))
             }
         }
     }

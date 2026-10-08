@@ -24,6 +24,7 @@ of tests.
 
 | Variable | Effect |
 | --- | --- |
+| `TRANSCRIBE_BACKENDS=<list>` | Restrict which backends may register: a comma-separated list of `cpu`, `metal`, `vulkan`, `cuda`, `rocm`, `other`, `all` (case-insensitive). An excluded backend never runs any code (no module load, no driver init). It can only narrow the mask a host passes to `transcribe_init_backends_ex()`, applies even if the host never calls it, and CPU is always kept. Unknown names are dropped and logged as an error naming what is still allowed, so a typo narrows rather than widens (`vulcan` means CPU-only). Unset or empty means `all`. Read once per process. |
 | `TRANSCRIBE_NO_FLASH` | Disable flash attention on encoder and decoder (forces the manual F32 path). |
 | `TRANSCRIBE_FORCE_FLASH` | Force flash attention on. Wins over `TRANSCRIBE_NO_FLASH` if both are set. |
 | `TRANSCRIBE_CONV_DIRECT_DW` / `TRANSCRIBE_CONV_NO_DIRECT_DW` | Force the depthwise-conv dispatch to the direct `conv_2d_dw` path / the im2col path, overriding the per-family backend default. |
@@ -85,7 +86,7 @@ its var is unset. Convention: `TRANSCRIBE_<FAMILY>_GGUF`.
 | `TRANSCRIBE_PARAKEET_UNIFIED_GGUF` | `parakeet_buffered_stream_eos_smoke`, `stream_offline_interleave_smoke` |
 | `TRANSCRIBE_GIGAAM_GGUF` | `gigaam_workspace_release_smoke` |
 | `TRANSCRIBE_MULTITALKER_BUNDLE_GGUF` | `parakeet_multitalker_e2e_smoke` |
-| `TRANSCRIBE_SORTFORMER_GGUF` | `sortformer_stream_ext_unit` |
+| `TRANSCRIBE_SORTFORMER_GGUF` | `sortformer_diarize_unit`, `cli_diarize_smoke` |
 | `TRANSCRIBE_COHERE_GGUF` | `cohere_real_smoke`, `cohere_e2e_smoke` |
 | `TRANSCRIBE_GRANITE5_CTC_GGUF` | `granite5_ctc_real_smoke`, `granite5_ctc_e2e_smoke` |
 | `TRANSCRIBE_WHISPER_GGUF` | `whisper_e2e_smoke`, `whisper_tokenize_parity` |

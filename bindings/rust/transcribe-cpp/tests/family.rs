@@ -22,9 +22,10 @@ use transcribe_cpp::sys::{
     TRANSCRIBE_EXT_KIND_VOXTRAL_REALTIME_STREAM,
 };
 use transcribe_cpp::{
-    Error, ExtSlot, Model, ParakeetBufferedStreamOptions, ParakeetRunOptions,
-    ParakeetStreamOptions, RunExtension, RunOptions, SortformerLiveOptions, SortformerPreset,
-    SortformerStreamOptions, Stream, StreamExtension, StreamOptions, VoxtralRealtimeStreamOptions,
+    DiarizeExtension, DiarizeOptions, DiarizeStreamExtension, DiarizeStreamOptions, Error, ExtSlot,
+    Model, ParakeetBufferedStreamOptions, ParakeetRunOptions, ParakeetStreamOptions, RunExtension,
+    RunOptions, SortformerDiarizeOptions, SortformerLiveOptions, SortformerPreset, Stream,
+    StreamExtension, StreamOptions, StreamState, VoxtralRealtimeStreamOptions,
 };
 
 /// Feed the first ~2 s of `pcm` in 100 ms chunks, finalize, and return
@@ -259,29 +260,30 @@ fn nemotron3_diar_live_rows_match_run() {
         return;
     };
     let model = Model::load(&model_path).unwrap();
-    assert!(model.accepts_ext(ExtSlot::Stream, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
-    let mut session = model.session().unwrap();
+    assert!(model.accepts_ext(ExtSlot::DiarizeStream, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
+    assert!(!model.accepts_ext(ExtSlot::Stream, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
+    let mut session = model.diarize_session().unwrap();
 
-    let run = RunOptions {
-        family: Some(RunExtension::Sortformer(SortformerStreamOptions {
+    let run = DiarizeOptions {
+        family: Some(DiarizeExtension::Sortformer(SortformerDiarizeOptions {
             preset: Some(SortformerPreset::LowLatency),
         })),
-        ..Default::default()
     };
-    let want = session.run(&pcm, &run).unwrap().speaker_segments;
+    let want = session.run(&pcm, &run).unwrap();
     assert!(!want.is_empty());
 
-    let opts = StreamOptions {
-        family: Some(StreamExtension::SortformerLive(SortformerLiveOptions {
-            preset: Some(SortformerPreset::LowLatency),
-        })),
-        ..Default::default()
+    let opts = DiarizeStreamOptions {
+        family: Some(DiarizeStreamExtension::SortformerLive(
+            SortformerLiveOptions {
+                preset: Some(SortformerPreset::LowLatency),
+            },
+        )),
     };
-    let mut stream = session.stream(&RunOptions::default(), &opts).unwrap();
+    let mut stream = session.into_stream(&opts).map_err(|(e, _)| e).unwrap();
     let mut saw_rows = false;
     for piece in pcm.chunks(8_000) {
         let update = stream.feed(piece).unwrap();
-        for row in stream.snapshot().speaker_segments {
+        for row in stream.segments() {
             saw_rows = true;
             // Closed rows are final rows; an open row (t1 == frontier) is the
             // start of one.
@@ -297,11 +299,15 @@ fn nemotron3_diar_live_rows_match_run() {
     }
     assert!(saw_rows, "no rows before finalize");
     assert!(stream.finalize().unwrap().is_final);
+    assert_eq!(stream.state(), StreamState::Finished);
     // `p` is NaN (no confidence), so compare the timing and speaker fields.
     let key = |rows: &[transcribe_cpp::SpeakerSegment]| {
         rows.iter()
             .map(|r| (r.t0_ms, r.t1_ms, r.speaker_id))
             .collect::<Vec<_>>()
     };
-    assert_eq!(key(&stream.snapshot().speaker_segments), key(&want));
+    assert_eq!(key(&stream.segments()), key(&want));
+    // The session comes back idle and runs batch again.
+    let mut session = stream.into_session();
+    assert_eq!(key(&session.run(&pcm, &run).unwrap()), key(&want));
 }

@@ -11,10 +11,10 @@
 #pragma once
 
 #include "transcribe-backend.h"
+#include "transcribe-diarize.h"
 #include "transcribe-mel.h"
 #include "transcribe-model.h"
-#include "transcribe-session.h"
-#include "transcribe/sortformer.h"  // shared public preset enum + run ext
+#include "transcribe/sortformer.h"  // shared public preset enum + diarize exts
 
 #include <cstdint>
 #include <optional>
@@ -170,7 +170,7 @@ void update_speaker_cache(SpeakerCache &             sc,
                           const float *              logits,
                           int                        n_chunk);
 
-// Push-audio stream state (transcribe_stream_*). Frame and sample indices
+// Push-audio stream state (transcribe_diarize_stream_*). Frame and sample indices
 // count from stream begin. Each stage only runs on input that can no longer
 // change, so the stream reproduces the batch run at the same preset.
 struct LiveState {
@@ -185,7 +185,7 @@ struct LiveState {
     int                next_chunk = 0;  // first encoder frame of the next chunk
     int                n_scanned  = 0;  // output frames turned into rows
     std::vector<int>   open_start;      // per speaker: first frame of the open run, or -1
-    std::vector<std::vector<transcribe_session::SpeakerSegmentEntry>> closed;  // per speaker
+    std::vector<std::vector<transcribe::SpeakerSegmentEntry>> closed;  // per speaker
 
     void reset() {
         params = {};
@@ -203,7 +203,7 @@ struct LiveState {
     }
 };
 
-struct Session final : public transcribe_session {
+struct Session final : public transcribe_diarize_session {
     std::vector<float> mel_buf;
     std::vector<float> embeds_host;  // [T_enc * D] embedder output for the whole clip
     std::vector<float> input_host;   // [n_input * D] per-step encoder input

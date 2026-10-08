@@ -1,14 +1,15 @@
 // nemotron3_diar_stream_unit.cpp - Nemotron-3 Diarization push-audio live
-// diarization through the Sortformer live stream extension (SFLV, STREAM
-// slot).
+// diarization through the Sortformer live stream extension (SFLV,
+// DIARIZE_STREAM slot).
 //
 // Covers, against a real GGUF (env-gated, RC 77 skip):
 //
-//   1. The model accepts SFLV on the STREAM slot only, SFST on RUN only.
+//   1. The model accepts SFLV on DIARIZE_STREAM only, SFDR on DIARIZE_RUN
+//      only.
 //   2. Pre-clear rejection at begin: DEFAULT / VERY_HIGH / HIGH_LATENCY, an
-//      out-of-range preset and the RUN-slot kind fail with INVALID_ARG and
+//      out-of-range preset and the DIARIZE_RUN kind fail with INVALID_ARG and
 //      keep the previous rows.
-//   3. Streamed rows after finalize equal transcribe_run at the same preset
+//   3. Streamed rows after finalize equal transcribe_diarize_run at the same preset
 //      for feeds of 1 sample to 1 s, for every accepted preset and for the
 //      cache-compressing `small` validation geometry.
 //   4. Mid-stream: rows only ever report final output. Closed rows
@@ -21,6 +22,7 @@
 // Gated by TRANSCRIBE_NEMOTRON3_DIAR_GGUF.
 
 #include "transcribe.h"
+#include "transcribe/diarize.h"
 #include "transcribe/sortformer.h"
 #include "wav.h"
 
@@ -49,13 +51,13 @@ bool file_exists(const std::string & path) {
     return ::stat(path.c_str(), &st) == 0;
 }
 
-std::vector<transcribe_speaker_segment> read_segments(const transcribe_session * session) {
+std::vector<transcribe_speaker_segment> read_segments(const transcribe_diarize_session * session) {
     std::vector<transcribe_speaker_segment> rows;
-    const int                               n = transcribe_n_speaker_segments(session);
+    const int                               n = transcribe_diarize_n_segments(session);
     for (int i = 0; i < n; ++i) {
         transcribe_speaker_segment row;
         transcribe_speaker_segment_init(&row);
-        if (transcribe_get_speaker_segment(session, i, &row) == TRANSCRIBE_OK) {
+        if (transcribe_diarize_get_segment(session, i, &row) == TRANSCRIBE_OK) {
             rows.push_back(row);
         }
     }
@@ -71,27 +73,27 @@ bool same_segments(const std::vector<transcribe_speaker_segment> & a,
     return std::equal(a.begin(), a.end(), b.begin(), b.end(), same_row);
 }
 
-std::vector<transcribe_speaker_segment> run_batch(transcribe_session *         session,
+std::vector<transcribe_speaker_segment> run_batch(transcribe_diarize_session * session,
                                                   const std::vector<float> &   pcm,
                                                   transcribe_sortformer_preset preset) {
-    transcribe_sortformer_stream_ext ext;
-    transcribe_sortformer_stream_ext_init(&ext);
+    transcribe_sortformer_diarize_ext ext;
+    transcribe_sortformer_diarize_ext_init(&ext);
     ext.preset = preset;
-    transcribe_run_params rp;
-    transcribe_run_params_init(&rp);
+    transcribe_diarize_params rp;
+    transcribe_diarize_params_init(&rp);
     rp.family = &ext.ext;
-    CHECK(transcribe_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_OK);
+    CHECK(transcribe_diarize_run(session, pcm.data(), static_cast<int>(pcm.size()), &rp) == TRANSCRIBE_OK);
     return read_segments(session);
 }
 
-transcribe_status begin(transcribe_session * session, const transcribe_ext * family) {
-    transcribe_stream_params sp;
-    transcribe_stream_params_init(&sp);
+transcribe_status begin(transcribe_diarize_session * session, const transcribe_ext * family) {
+    transcribe_diarize_stream_params sp;
+    transcribe_diarize_stream_params_init(&sp);
     sp.family = family;
-    return transcribe_stream_begin(session, nullptr, &sp);
+    return transcribe_diarize_stream_begin(session, &sp);
 }
 
-transcribe_status begin_preset(transcribe_session * session, transcribe_sortformer_preset preset) {
+transcribe_status begin_preset(transcribe_diarize_session * session, transcribe_sortformer_preset preset) {
     transcribe_sortformer_live_ext ext;
     transcribe_sortformer_live_ext_init(&ext);
     ext.preset = preset;
@@ -100,19 +102,19 @@ transcribe_status begin_preset(transcribe_session * session, transcribe_sortform
 
 // Feeds pcm in `piece`-sample pieces, checking every mid-stream snapshot
 // against the batch rows `want`, then finalizes.
-std::vector<transcribe_speaker_segment> stream_pieces(transcribe_session *                            session,
+std::vector<transcribe_speaker_segment> stream_pieces(transcribe_diarize_session *                    session,
                                                       const std::vector<float> &                      pcm,
                                                       size_t                                          piece,
                                                       const std::vector<transcribe_speaker_segment> & want) {
     int64_t                                 last_committed = 0;
-    int                                     last_revision  = transcribe_stream_revision(session);
+    int                                     last_revision  = 0;
     std::vector<transcribe_speaker_segment> last_rows;
     bool                                    saw_rows = false;
     for (size_t pos = 0; pos < pcm.size(); pos += piece) {
         const size_t             n = std::min(piece, pcm.size() - pos);
         transcribe_stream_update upd;
         transcribe_stream_update_init(&upd);
-        if (transcribe_stream_feed(session, pcm.data() + pos, static_cast<int>(n), &upd) != TRANSCRIBE_OK) {
+        if (transcribe_diarize_stream_feed(session, pcm.data() + pos, static_cast<int>(n), &upd) != TRANSCRIBE_OK) {
             CHECK(false);
             return {};
         }
@@ -139,9 +141,9 @@ std::vector<transcribe_speaker_segment> stream_pieces(transcribe_session *      
     CHECK(saw_rows);
     transcribe_stream_update fin;
     transcribe_stream_update_init(&fin);
-    CHECK(transcribe_stream_finalize(session, &fin) == TRANSCRIBE_OK);
+    CHECK(transcribe_diarize_stream_finalize(session, &fin) == TRANSCRIBE_OK);
     CHECK(fin.is_final);
-    CHECK(transcribe_stream_get_state(session) == TRANSCRIBE_STREAM_FINISHED);
+    CHECK(transcribe_diarize_stream_get_state(session) == TRANSCRIBE_STREAM_FINISHED);
     return read_segments(session);
 }
 
@@ -179,10 +181,15 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    CHECK(transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_STREAM, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
-    CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_RUN, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
-    CHECK(transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_RUN, TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM));
-    CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_STREAM, TRANSCRIBE_EXT_KIND_SORTFORMER_STREAM));
+    CHECK(transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_DIARIZE_STREAM,
+                                            TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
+    CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_STREAM, TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
+    CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_DIARIZE_RUN,
+                                             TRANSCRIBE_EXT_KIND_SORTFORMER_LIVE));
+    CHECK(transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_DIARIZE_RUN,
+                                            TRANSCRIBE_EXT_KIND_SORTFORMER_DIARIZE));
+    CHECK(!transcribe_model_accepts_ext_kind(model, TRANSCRIBE_EXT_SLOT_DIARIZE_STREAM,
+                                             TRANSCRIBE_EXT_KIND_SORTFORMER_DIARIZE));
 
     transcribe_sortformer_live_ext init;
     transcribe_sortformer_live_ext_init(&init);
@@ -190,8 +197,8 @@ int main() {
     CHECK(init.ext.size == sizeof(init));
     CHECK(init.preset == TRANSCRIBE_SORTFORMER_PRESET_LOW_LATENCY);
 
-    struct transcribe_session * session = nullptr;
-    if (transcribe_session_init(model, nullptr, &session) != TRANSCRIBE_OK || session == nullptr) {
+    struct transcribe_diarize_session * session = nullptr;
+    if (transcribe_diarize_session_init(model, nullptr, &session) != TRANSCRIBE_OK || session == nullptr) {
         std::fprintf(stderr, "FAIL: session create\n");
         transcribe_model_free(model);
         return EXIT_FAILURE;
@@ -206,11 +213,11 @@ int main() {
          { TRANSCRIBE_SORTFORMER_PRESET_DEFAULT, TRANSCRIBE_SORTFORMER_PRESET_VERY_HIGH_LATENCY,
            TRANSCRIBE_SORTFORMER_PRESET_HIGH_LATENCY, static_cast<transcribe_sortformer_preset>(99) }) {
         CHECK(begin_preset(session, preset) == TRANSCRIBE_ERR_INVALID_ARG);
-        CHECK(transcribe_stream_get_state(session) == TRANSCRIBE_STREAM_IDLE);
+        CHECK(transcribe_diarize_stream_get_state(session) == TRANSCRIBE_STREAM_IDLE);
         CHECK(same_segments(read_segments(session), low));
     }
-    transcribe_sortformer_stream_ext run_ext;
-    transcribe_sortformer_stream_ext_init(&run_ext);
+    transcribe_sortformer_diarize_ext run_ext;
+    transcribe_sortformer_diarize_ext_init(&run_ext);
     CHECK(begin(session, &run_ext.ext) == TRANSCRIBE_ERR_INVALID_ARG);
     CHECK(same_segments(read_segments(session), low));
 
@@ -240,20 +247,22 @@ int main() {
 
     // Reset mid-stream, then a fresh stream.
     CHECK(begin(session, nullptr) == TRANSCRIBE_OK);
-    CHECK(transcribe_stream_feed(session, pcm.data(), 48000, nullptr) == TRANSCRIBE_OK);
-    transcribe_stream_reset(session);
-    CHECK(transcribe_stream_get_state(session) == TRANSCRIBE_STREAM_IDLE);
-    CHECK(transcribe_n_speaker_segments(session) == 0);
+    // A batch run during an active stream is refused.
+    CHECK(transcribe_diarize_run(session, pcm.data(), 16000, nullptr) == TRANSCRIBE_ERR_INVALID_ARG);
+    CHECK(transcribe_diarize_stream_feed(session, pcm.data(), 48000, nullptr) == TRANSCRIBE_OK);
+    transcribe_diarize_stream_reset(session);
+    CHECK(transcribe_diarize_stream_get_state(session) == TRANSCRIBE_STREAM_IDLE);
+    CHECK(transcribe_diarize_n_segments(session) == 0);
     CHECK(begin(session, nullptr) == TRANSCRIBE_OK);
     CHECK(same_segments(stream_pieces(session, pcm, 3200, low), low));
 
     // Shorter than one mel hop: finishes with no rows.
     CHECK(begin(session, nullptr) == TRANSCRIBE_OK);
-    CHECK(transcribe_stream_feed(session, pcm.data(), 100, nullptr) == TRANSCRIBE_OK);
-    CHECK(transcribe_stream_finalize(session, nullptr) == TRANSCRIBE_OK);
-    CHECK(transcribe_n_speaker_segments(session) == 0);
+    CHECK(transcribe_diarize_stream_feed(session, pcm.data(), 100, nullptr) == TRANSCRIBE_OK);
+    CHECK(transcribe_diarize_stream_finalize(session, nullptr) == TRANSCRIBE_OK);
+    CHECK(transcribe_diarize_n_segments(session) == 0);
 
-    transcribe_session_free(session);
+    transcribe_diarize_session_free(session);
     transcribe_model_free(model);
 
     if (g_failures != 0) {

@@ -4,7 +4,9 @@ import type { TranscribeError } from "./errors.js";
 
 export type Backend = "auto" | "cpu" | "cpu_accel" | "cuda" | "rocm" | "vulkan" | "metal";
 export type KvType = "auto" | "f32" | "f16";
-export type Task = "transcribe" | "translate";
+/** "instruct": `prompt` replaces the task instruction and the output is free
+ *  text ("instruct" feature; offline only). */
+export type Task = "transcribe" | "translate" | "instruct";
 export type TimestampKind = "none" | "auto" | "segment" | "word" | "token";
 export type Pnc = "default" | "off" | "on";
 export type Itn = "default" | "off" | "on";
@@ -16,7 +18,11 @@ export type Feature =
   | "cancellation"
   | "pnc"
   | "itn"
-  | "diarization";
+  | "diarization"
+  | "vocabulary"
+  | "context_prompt"
+  | "instruct"
+  | "transcript_prefix";
 
 /** Mono float32 PCM at the model's native sample rate (16 kHz for v1). */
 export type PcmLike = Float32Array | number[] | ArrayBuffer | Buffer;
@@ -168,6 +174,16 @@ export interface TranscribeOptions {
   signal?: AbortSignal;
   /** A run-slot family extension (e.g. whisper). */
   family?: FamilyExtension;
+  /** Custom terms in priority order, formatted per family ("vocabulary"
+   *  feature; ignored with a warning elsewhere). */
+  vocabulary?: readonly string[];
+  /** Context text under transcribe/translate ("context_prompt" feature); the
+   *  required instruction under task "instruct". */
+  prompt?: string;
+  /** Transcript text the model continues from ("transcript_prefix" feature;
+   *  an error elsewhere, and in runBatch). `text` holds only the continuation;
+   *  `rawText` leads with the prefix. */
+  prefix?: string;
 }
 
 /** One result of a batch run: success carries the transcript, failure the error.
@@ -181,7 +197,7 @@ export type BatchItem =
 
 export type CommitPolicy = "auto" | "on_finalize" | "stable_prefix";
 export type StreamState = "idle" | "active" | "finished" | "failed";
-export type ExtSlot = "run" | "stream";
+export type ExtSlot = "run" | "stream" | "diarize_run" | "diarize_stream";
 
 export interface StreamUpdate {
   resultChanged: boolean;
@@ -214,6 +230,10 @@ export interface StreamOptions {
   keepSpecialTags?: boolean;
   commitPolicy?: CommitPolicy;
   stablePrefixAgreementN?: number;
+  /** Custom terms in priority order (see TranscribeOptions.vocabulary). */
+  vocabulary?: readonly string[];
+  /** Context text (see TranscribeOptions.prompt). */
+  prompt?: string;
   /** A stream-slot family extension (moonshine, parakeet, voxtral). */
   family?: FamilyExtension;
 }
@@ -262,9 +282,8 @@ export type SortformerPreset =
   | "low_latency"
   | "very_low_latency"
   | "ultra_low_latency";
-/** Sortformer diarizer options (run slot). A run produces speaker
- *  segments, no text. */
-export interface SortformerStreamOptions {
+/** Sortformer options for {@link DiarizeOptions.family} (diarize_run slot). */
+export interface SortformerDiarizeOptions {
   preset?: SortformerPreset;
 }
 
@@ -274,4 +293,28 @@ export type FamilyExtension =
   | ({ kind: "parakeet" } & ParakeetStreamOptions)
   | ({ kind: "parakeet_buffered" } & ParakeetBufferedStreamOptions)
   | ({ kind: "voxtral" } & VoxtralRealtimeStreamOptions)
-  | ({ kind: "sortformer" } & SortformerStreamOptions);
+  | ({ kind: "sortformer_diarize" } & SortformerDiarizeOptions);
+
+// ---- roles -----------------------------------------------------------------
+
+/** What a model serves: "asr" (transcription) and/or "diarize" (speaker turns). */
+export type Role = "asr" | "diarize";
+
+export interface DiarizeInfo {
+  /** Input PCM rate. */
+  sampleRate: number;
+  /** Speaker ids are in [1, maxSpeakers]. */
+  maxSpeakers: number;
+}
+
+export interface DiarizeSessionOptions {
+  /** CPU threads for CPU-side ops; 0 = library default. */
+  nThreads?: number;
+}
+
+export interface DiarizeOptions {
+  /** Cancel the run cooperatively. */
+  signal?: AbortSignal;
+  /** A diarize_run-slot family extension (e.g. sortformer_diarize). */
+  family?: FamilyExtension;
+}
